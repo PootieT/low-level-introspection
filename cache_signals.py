@@ -217,14 +217,19 @@ def build_split(
     return Dataset.from_list(rows)
 
 
-# ============================================================
-# Main
-# ============================================================
-
 def report_signal_statistics(dataset: Dataset):
     df = dataset.to_pandas()
     print(df.groupby(["signal_type", "signal_layer", "signal_index"])["activation"].describe())
     return
+
+def report_token_overlap(train_dataset: Dataset, test_dataset: Dataset):
+    train_tokens = set(train_dataset["token"])
+    test_tokens = set(test_dataset["token"])
+    overlap = len(train_tokens & test_tokens)
+    print(f"Total train data= {len(train_dataset)}, test data= {len(test_dataset)}")
+    print(f"Unique train tokens= {len(train_tokens)}, test tokens= {len(test_tokens)}, overlap= {overlap}")
+    return
+
 
 
 
@@ -297,6 +302,8 @@ def main():
     report_signal_statistics(train_dataset)
     print("Test data signal statistics:")
     report_signal_statistics(test_dataset)
+
+    report_token_overlap(train_dataset, test_dataset)
 
     output_dir = Path(config.cache_dir) / config.experiment_name
     train_path = output_dir / "train"

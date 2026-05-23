@@ -129,8 +129,8 @@ def load_spec(value: str):
         try:
             return json.loads(value)
         except json.decoder.JSONDecodeError:
-            print(f"{value} is not a valid JSON, assuming it is a single signal.")
-            return ExplicitSignalSpec(type="explicit", signals=[value])
+            print(f"{value} is not a valid JSON, assuming it is a single signal or comma separated list of signals.")
+            return ExplicitSignalSpec(type="explicit", signals=value.split(","))
 
 def load_token_selector(value: Union[int,str]):
     if isinstance(value, int):
@@ -150,15 +150,6 @@ def main() -> None:
 
     train_token_selector = load_token_selector(args.train_token_selector)
     test_token_selector = load_token_selector(args.test_token_selector)
-    # fix the max sizes
-    # if args.train_max_samples is None and ":" in args.train_dataset_split:
-    #     args.train_max_samples = args.train_dataset_split.split(":")[1].removesuffix("]")
-    # if args.test_max_samples is None and ":" in args.test_dataset_split:
-    #     args.test_max_samples = args.test_dataset_split.split(":")[1].removesuffix("]")
-    # if ":" not in args.train_dataset_split and args.train_max_samples is not None:
-    #     args.train_dataset_split = f"{args.train_dataset_split}[:{args.train_max_samples}]"
-    # if ":" not in args.test_dataset_split and args.test_max_samples is not None:
-    #     args.test_dataset_split = f"{args.test_dataset_split}[:{args.test_max_samples}]"
 
     config = ExperimentConfig(
         experiment_name=args.experiment_name,

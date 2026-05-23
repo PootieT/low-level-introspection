@@ -1,22 +1,22 @@
-# generate experiment config first as JSON
+## generate experiment config first as JSON
 python generate_experiment_config.py \
     --experiment-name single_mlp_l10_n24 \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 \
     --train-dataset-split "train" \
-    --train-max-samples 1000 \
+    --train-max-samples 3000 \
     --test-dataset allenai/c4 \
     --test-dataset-split "validation" \
-    --test-max-samples 200 \
+    --test-max-samples 100 \
     --max-seq-length 32 \
     --hf-data-kwargs '{"config": "en", "streaming": true}' \
     --train-signals N10.24 \
     --test-signals N10.24 \
     --precision 3 \
     --train-batch-size 2 \
-    --eval-batch-size 4 \
+    --eval-batch-size 2 \
     --learning-rate 1e-5 \
-    --num-epochs 3 \
+    --num-epochs 1 \
     --output experiment_configs/single_mlp_l10_n24.json
 
 # cache activations and generate dataset

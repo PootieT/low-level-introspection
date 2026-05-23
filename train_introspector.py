@@ -18,7 +18,9 @@ python scripts/train_introspector.py \
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import pdb
 from functools import partial
 from pathlib import Path
 from typing import Tuple
@@ -77,12 +79,9 @@ def preprocess_example(
     )
 
     input_ids = full_tokens["input_ids"]
-
     labels = input_ids.copy()
     prompt_len = len(prompt_tokens["input_ids"])
-
     labels[:prompt_len] = [-100] * prompt_len
-
     return {
         "input_ids": input_ids,
         "attention_mask": full_tokens["attention_mask"],
@@ -123,26 +122,57 @@ def main():
     )
 
     # load cached signal datasets
-    train_dataset = load_from_disk(str(train_path))
-    train_dataset = train_dataset.map(
+    train_dataset_raw = load_from_disk(str(train_path))
+    train_dataset = train_dataset_raw.map(
         lambda ex: preprocess_example(
             ex,
             tokenizer=tokenizer,
             prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
             max_length=config.training_config.max_seq_length,
         ),
-        remove_columns=train_dataset.column_names,
+        remove_columns=train_dataset_raw.column_names,
     )
-    test_dataset = load_from_disk(str(test_path))
-    test_dataset = test_dataset.map(
+    test_dataset_raw = load_from_disk(str(test_path))
+    test_dataset = test_dataset_raw.map(
         lambda ex: preprocess_example(
             ex,
             tokenizer=tokenizer,
             prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
             max_length=config.training_config.max_seq_length,
         ),
-        remove_columns=test_dataset.column_names,
+        remove_columns=test_dataset_raw.column_names,
     )
+
+    # split test into several versions controlling seen vs. unseen tokens
+    train_tokens = set(train_dataset_raw["token"])
+    test_dataset_unseen_raw = test_dataset_raw.filter(lambda ex: ex["token"] not in train_tokens)
+    test_dataset_seen_raw = test_dataset_raw.filter(lambda ex: ex["token"] in train_tokens)
+    test_dataset_unseen = test_dataset_unseen_raw.map(
+        lambda ex: preprocess_example(
+            ex,
+            tokenizer=tokenizer,
+            prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
+            max_length=config.training_config.max_seq_length,
+        ),
+        remove_columns=test_dataset_unseen_raw.column_names,
+    )
+    test_dataset_seen = test_dataset_seen_raw.map(
+        lambda ex: preprocess_example(
+            ex,
+            tokenizer=tokenizer,
+            prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
+            max_length=config.training_config.max_seq_length,
+        ),
+        remove_columns=test_dataset_seen_raw.column_names,
+    )
+
+    for i in range(3):
+        print(f"============= Training example row {i} =============")
+        print(tokenizer.decode(train_dataset[i]["input_ids"]))
+
+    for i in range(3):
+        print(f"============= Test example row {i} =============")
+        print(tokenizer.decode(test_dataset[i]["input_ids"]))
 
     # load model
     model = AutoModelForCausalLM.from_pretrained(
@@ -178,8 +208,9 @@ def main():
         per_device_train_batch_size=config.training_config.train_batch_size,
         per_device_eval_batch_size=config.training_config.eval_batch_size,
         num_train_epochs=config.training_config.num_epochs,
-        logging_steps=10,
-        eval_strategy="epoch",
+        logging_steps=50,
+        eval_strategy="steps",
+        eval_steps=200,
         save_strategy="epoch",
         bf16=torch.cuda.is_available(),
         remove_unused_columns=False,
@@ -194,8 +225,23 @@ def main():
         data_collator=collator,
         compute_metrics=partial(compute_metrics, tokenizer=tokenizer),
     )
+    train_results = trainer.train()
 
-    trainer.train()
+    trainer.save_metrics("train", train_results.metrics)
+    eval_results = trainer.evaluate()
+    trainer.save_metrics("test", eval_results)
+    history = trainer.state.log_history
+    with open(str(output_dir / "history.json"), "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+
+    # evaluate test split carefully by looking at instances with seen tokens vs not
+    other_eval_metrics = trainer.evaluate(
+        eval_dataset={
+            "test_seen_tokens": test_dataset_seen,
+            "test_unseen_tokens": test_dataset_unseen,
+        }
+    )
+    trainer.save_metrics("test_others", other_eval_metrics)
 
     final_dir = output_dir / "adapter_weights"
 

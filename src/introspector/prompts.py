@@ -26,10 +26,10 @@ def mlp_prompt(
     token_index: int,
 ) -> str:
     templates = [
-        "At token {TOKEN}, the MLP activation for neuron {SIGNAL_IDX} at layer {LAYER} is",
-        "The MLP activation for neuron {SIGNAL_IDX} at layer {LAYER} for {TOKEN} is",
-        "Neuron {SIGNAL_IDX} at layer {LAYER} and {TOKEN} has activation level of",
-        "Neuron {LAYER}.{SIGNAL_IDX} at {TOKEN} has activation of",
+        'At token "{TOKEN}", the MLP activation for neuron {SIGNAL_IDX} at layer {LAYER} is',
+        'The MLP activation for neuron {SIGNAL_IDX} at layer {LAYER} for token "{TOKEN}" is',
+        'Neuron {SIGNAL_IDX} at layer {LAYER} and token "{TOKEN}" has activation level of',
+        'Neuron {LAYER}.{SIGNAL_IDX} at token "{TOKEN}" has activation of',
     ]
     prompt = random.choice(templates).format(
         TOKEN=token, SIGNAL_IDX=signal_index, LAYER=layer
