@@ -254,10 +254,14 @@ def main():
         rest_kwargs = {k:v for k,v in config.train_dataset.hf_data_kwargs.items() if k != "config"}
         hf_dataset_train = load_dataset(config.train_dataset.name, config.train_dataset.hf_data_kwargs["config"],
                                         split=config.train_dataset.split, **rest_kwargs)
+        hf_dataset_dev = load_dataset(config.train_dataset.name, config.train_dataset.hf_data_kwargs["config"],
+                                        split=config.dev_dataset.split, **rest_kwargs)
         hf_dataset_test = load_dataset(config.test_dataset.name, config.test_dataset.hf_data_kwargs["config"],
                                        split=config.test_dataset.split, **rest_kwargs)
     else:
         hf_dataset_train = load_dataset(config.train_dataset.name, split=config.train_dataset.split,
+                                        **config.train_dataset.hf_data_kwargs)
+        hf_dataset_dev = load_dataset(config.train_dataset.name, split=config.dev_dataset.split,
                                         **config.train_dataset.hf_data_kwargs)
         hf_dataset_test = load_dataset(config.test_dataset.name, split=config.test_dataset.split,
                                        **config.test_dataset.hf_data_kwargs)
@@ -265,6 +269,7 @@ def main():
     # assume dataset is large and is not truncated so using streaming mode
     if isinstance(hf_dataset_train, IterableDataset):
         hf_dataset_train = hf_dataset_train.take(config.train_dataset.max_samples)
+        hf_dataset_dev = hf_dataset_train.skip(config.train_dataset.max_samples).take(config.dev_dataset.max_samples)
         hf_dataset_test = hf_dataset_test.take(config.test_dataset.max_samples)
 
 
@@ -288,6 +293,16 @@ def main():
         config=config,
     )
 
+    print("caching dev dataset ..")
+    dev_dataset = build_split(
+        hf_dataset=hf_dataset_dev,
+        signals=config.dev_signals,
+        model=model,
+        token_selector=config.dev_token_selector,
+        dataset_config=config.dev_dataset,
+        config=config,
+    )
+
     print("caching test dataset ..")
     test_dataset = build_split(
         hf_dataset=hf_dataset_test,
@@ -300,19 +315,28 @@ def main():
 
     print("Training data signal statistics:")
     report_signal_statistics(train_dataset)
+    print("Dev data signal statistics:")
+    report_signal_statistics(dev_dataset)
     print("Test data signal statistics:")
     report_signal_statistics(test_dataset)
 
+    print("Train dev overlap:")
+    report_token_overlap(train_dataset, dev_dataset)
+
+    print("Train test overlap:")
     report_token_overlap(train_dataset, test_dataset)
 
     output_dir = Path(config.cache_dir) / config.experiment_name
     train_path = output_dir / "train"
+    dev_path = output_dir / "dev"
     test_path = output_dir / "test"
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     train_dataset.save_to_disk(str(train_path))
     print(f"Saved train dataset to: {train_path}")
+    dev_dataset.save_to_disk(str(dev_path))
+    print(f"Saved dev dataset to: {dev_path}")
     test_dataset.save_to_disk(str(test_path))
     print(f"Saved test dataset to: {test_path}")
 

@@ -40,12 +40,15 @@ class ExperimentConfig(BaseModel):
     seed: int = 42
 
     train_dataset: DatasetConfig
+    dev_dataset: DatasetConfig
     test_dataset: DatasetConfig
 
     train_signals: List[SignalSpec]
+    dev_signals: List[SignalSpec]
     test_signals: List[SignalSpec]
 
     train_token_selector: TokenSelector
+    dev_token_selector: TokenSelector
     test_token_selector: TokenSelector
 
     training_config: TrainingConfig

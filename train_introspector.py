@@ -21,10 +21,12 @@ import argparse
 import json
 import math
 import pdb
+import threading
 from functools import partial
 from pathlib import Path
 from typing import Tuple
 
+import numpy as np
 import torch
 from datasets import load_from_disk
 from peft import LoraConfig, get_peft_model
@@ -36,6 +38,8 @@ from transformers import (
 )
 
 from src.introspector.config import ExperimentConfig
+from src.introspector.training.collator import LoRAGatingCollator
+from src.introspector.training.model import replace_model_with_gated_version, replace_lora_with_gated_version
 from src.introspector.training.metrics import compute_metrics
 from src.introspector.prompts import PROMPT_REGISTRY
 
@@ -47,8 +51,8 @@ def preprocess_example(
     tokenizer,
     prompt_fn,
     max_length,
+    return_frozen_input_len=False
 ):
-
     introspection_prompt = prompt_fn(
         signal_type=example["signal_type"],
         layer=example["signal_layer"],
@@ -56,13 +60,18 @@ def preprocess_example(
         token=example["token"],
         token_index=example["token_position"],
     )
-    full_prompt = (f"{example['text']} "
-                   f"{INTROSPECTION_SEPARATOR}"
-                   f"{introspection_prompt}")
+    full_prompt = f"{example['text']} {INTROSPECTION_SEPARATOR}{introspection_prompt}"
 
     target = example["target"]
 
     full_text = f"{full_prompt} {target}{tokenizer.eos_token}"
+
+    input_tokens = tokenizer(
+        example['text'],
+        truncation=True,
+        max_length=max_length,
+        add_special_tokens=False,
+    )
 
     full_tokens = tokenizer(
         full_text,
@@ -82,11 +91,17 @@ def preprocess_example(
     labels = input_ids.copy()
     prompt_len = len(prompt_tokens["input_ids"])
     labels[:prompt_len] = [-100] * prompt_len
-    return {
+    out =  {
         "input_ids": input_ids,
         "attention_mask": full_tokens["attention_mask"],
         "labels": labels,
     }
+    if return_frozen_input_len:
+        out["frozen_input_len"] = len(input_tokens["input_ids"])
+
+    return out
+
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -106,20 +121,15 @@ def main():
 
     cache_dir = Path(config.cache_dir) / config.experiment_name
     train_path = cache_dir / "train"
+    dev_path = cache_dir / "dev"
     test_path = cache_dir / "test"
 
     # load tokenizer, add special token
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    special_tokens = {
-        "additional_special_tokens": [
-            INTROSPECTION_SEPARATOR
-        ]
-    }
-    num_added = tokenizer.add_special_tokens(
-        special_tokens
-    )
+    special_tokens = {"additional_special_tokens": [INTROSPECTION_SEPARATOR]}
+    num_added = tokenizer.add_special_tokens(special_tokens)
 
     # load cached signal datasets
     train_dataset_raw = load_from_disk(str(train_path))
@@ -129,8 +139,20 @@ def main():
             tokenizer=tokenizer,
             prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
             max_length=config.training_config.max_seq_length,
+            return_frozen_input_len=config.training_config.disable_adapter_in_input,
         ),
         remove_columns=train_dataset_raw.column_names,
+    )
+    dev_dataset_raw = load_from_disk(str(dev_path))
+    dev_dataset = dev_dataset_raw.map(
+        lambda ex: preprocess_example(
+            ex,
+            tokenizer=tokenizer,
+            prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
+            max_length=config.training_config.max_seq_length,
+            return_frozen_input_len=config.training_config.disable_adapter_in_input,
+        ),
+        remove_columns=dev_dataset_raw.column_names,
     )
     test_dataset_raw = load_from_disk(str(test_path))
     test_dataset = test_dataset_raw.map(
@@ -139,32 +161,35 @@ def main():
             tokenizer=tokenizer,
             prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
             max_length=config.training_config.max_seq_length,
+            return_frozen_input_len=config.training_config.disable_adapter_in_input,
         ),
         remove_columns=test_dataset_raw.column_names,
     )
 
     # split test into several versions controlling seen vs. unseen tokens
-    train_tokens = set(train_dataset_raw["token"])
-    test_dataset_unseen_raw = test_dataset_raw.filter(lambda ex: ex["token"] not in train_tokens)
-    test_dataset_seen_raw = test_dataset_raw.filter(lambda ex: ex["token"] in train_tokens)
-    test_dataset_unseen = test_dataset_unseen_raw.map(
-        lambda ex: preprocess_example(
-            ex,
-            tokenizer=tokenizer,
-            prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
-            max_length=config.training_config.max_seq_length,
-        ),
-        remove_columns=test_dataset_unseen_raw.column_names,
-    )
-    test_dataset_seen = test_dataset_seen_raw.map(
-        lambda ex: preprocess_example(
-            ex,
-            tokenizer=tokenizer,
-            prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
-            max_length=config.training_config.max_seq_length,
-        ),
-        remove_columns=test_dataset_seen_raw.column_names,
-    )
+    # TODO better to just eval the whole split and save the results per instance
+    # TODO and aggregate metrics afterwards
+    # train_tokens = set(train_dataset_raw["token"])
+    # test_dataset_unseen_raw = test_dataset_raw.filter(lambda ex: ex["token"] not in train_tokens)
+    # test_dataset_seen_raw = test_dataset_raw.filter(lambda ex: ex["token"] in train_tokens)
+    # test_dataset_unseen = test_dataset_unseen_raw.map(
+    #     lambda ex: preprocess_example(
+    #         ex,
+    #         tokenizer=tokenizer,
+    #         prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
+    #         max_length=config.training_config.max_seq_length,
+    #     ),
+    #     remove_columns=test_dataset_unseen_raw.column_names,
+    # )
+    # test_dataset_seen = test_dataset_seen_raw.map(
+    #     lambda ex: preprocess_example(
+    #         ex,
+    #         tokenizer=tokenizer,
+    #         prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
+    #         max_length=config.training_config.max_seq_length,
+    #     ),
+    #     remove_columns=test_dataset_seen_raw.column_names,
+    # )
 
     for i in range(3):
         print(f"============= Training example row {i} =============")
@@ -192,13 +217,29 @@ def main():
     )
     model = get_peft_model(model, peft_config)
 
-    collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        model=model,
-        padding=True,
-        label_pad_token_id=-100,
-        return_tensors="pt",
-    )
+    if config.training_config.disable_adapter_in_input:
+        # monkey patch forward to take in mask
+        replace_model_with_gated_version(model)
+
+        # modify lora linear so it takes in mask and applies across tokens
+        replace_lora_with_gated_version(model)
+
+        collator = LoRAGatingCollator(
+            tokenizer=tokenizer,
+            model=model,
+            padding=True,
+            label_pad_token_id=-100,
+            return_tensors="pt",
+        )
+    else:
+        collator = DataCollatorForSeq2Seq(
+            tokenizer=tokenizer,
+            model=model,
+            padding=True,
+            label_pad_token_id=-100,
+            return_tensors="pt",
+        )
+
 
     output_dir = Path(config.output_dir) / config.experiment_name
 
@@ -221,27 +262,44 @@ def main():
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=test_dataset,
+        eval_dataset=dev_dataset,
         data_collator=collator,
         compute_metrics=partial(compute_metrics, tokenizer=tokenizer),
     )
     train_results = trainer.train()
 
     trainer.save_metrics("train", train_results.metrics)
-    eval_results = trainer.evaluate()
-    trainer.save_metrics("test", eval_results)
+
+    # get dev split final metrics
+    dev_results = trainer.evaluate()
+    trainer.save_metrics("dev", dev_results)
+
+    # for test split
+    pdb.set_trace()
+    test_outputs = trainer.predict(test_dataset)
+    test_predictions = np.ndarray(test_outputs.predictions)
+    test_label_ids = np.ndarray(test_outputs.label_ids)
+    full_test_results = compute_metrics([test_predictions, test_label_ids], tokenizer=tokenizer)
+    train_tokens = set(train_dataset_raw["token"])
+    seen_token_mask = test_dataset_raw.map(lambda ex: True if ex["token"] in train_tokens else False)
+    seen_token_test_results = compute_metrics([test_predictions[seen_token_mask], test_label_ids[seen_token_mask]], tokenizer=tokenizer)
+    unseen_token_test_results = compute_metrics([test_predictions[~seen_token_mask], test_label_ids[~seen_token_mask]], tokenizer=tokenizer)
+    trainer.save_metrics("test", full_test_results)
+    trainer.save_metrics("test_seen_token", seen_token_test_results)
+    trainer.save_metrics("test_unseen_token", unseen_token_test_results)
+
     history = trainer.state.log_history
     with open(str(output_dir / "history.json"), "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
     # evaluate test split carefully by looking at instances with seen tokens vs not
-    other_eval_metrics = trainer.evaluate(
-        eval_dataset={
-            "test_seen_tokens": test_dataset_seen,
-            "test_unseen_tokens": test_dataset_unseen,
-        }
-    )
-    trainer.save_metrics("test_others", other_eval_metrics)
+    # other_eval_metrics = trainer.evaluate(
+    #     eval_dataset={
+    #         "test_seen_tokens": test_dataset_seen,
+    #         "test_unseen_tokens": test_dataset_unseen,
+    #     }
+    # )
+    # trainer.save_metrics("test_others", other_eval_metrics)
 
     final_dir = output_dir / "adapter_weights"
 

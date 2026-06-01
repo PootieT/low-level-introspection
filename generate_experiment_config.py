@@ -54,6 +54,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-dataset", required=True)
     parser.add_argument("--train-dataset-split", default="train")
     parser.add_argument("--train-max-samples", type=int)
+    # for dev split we assume the same configuration as train, and just take samples from after the train split
+    parser.add_argument("--dev-dataset-split", default="train")
+    parser.add_argument("--dev-max-samples", type=int)
     parser.add_argument("--test-dataset", required=True)
     parser.add_argument("--test-dataset-split", default="test")
     parser.add_argument("--test-max-samples", type=int)
@@ -104,20 +107,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-adapter-in-input", action="store_true",
                         help="Whether to deactivate LoRA adaptor in input")
     parser.add_argument("--prompt-type", type=str, default="prompt_no_token_index")
+
     # ---- lora ----
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
 
     # ---- paths ----
-    parser.add_argument(
-        "--cache-dir",
-        default="data",
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        default="outputs/runs",
-    )
+    parser.add_argument("--cache-dir", default="data")
+    parser.add_argument("--output-dir", default="outputs/runs")
 
     return parser.parse_args()
 
@@ -146,9 +143,11 @@ def main() -> None:
 
     model_config = AutoConfig.from_pretrained(args.model)
     train_spec = resolve_signal_source(load_spec(args.train_signals), model_config=model_config, precision=args.precision)
+    dev_spec = resolve_signal_source(load_spec(args.train_signals), model_config=model_config, no_sample_signals=train_spec, precision=args.precision)
     test_spec = resolve_signal_source(load_spec(args.test_signals), model_config=model_config, no_sample_signals=train_spec, precision=args.precision)
 
     train_token_selector = load_token_selector(args.train_token_selector)
+    dev_token_selector = load_token_selector(args.train_token_selector)
     test_token_selector = load_token_selector(args.test_token_selector)
 
     config = ExperimentConfig(
@@ -168,6 +167,14 @@ def main() -> None:
             hf_data_kwargs=hf_data_kwargs,
             max_seq_length=args.max_seq_length,
         ),
+        dev_dataset=DatasetConfig(
+            name=args.train_dataset,
+            split=args.dev_dataset_split,
+            text_field=args.text_field,
+            max_samples=args.dev_max_samples,
+            hf_data_kwargs=hf_data_kwargs,
+            max_seq_length=args.max_seq_length,
+        ),
         test_dataset=DatasetConfig(
             name=args.test_dataset,
             split=args.test_dataset_split,
@@ -178,9 +185,11 @@ def main() -> None:
         ),
 
         train_signals=train_spec,
+        dev_signals=dev_spec,
         test_signals=test_spec,
 
         train_token_selector=train_token_selector,
+        dev_token_selector=dev_token_selector,
         test_token_selector=test_token_selector,
 
         training_config =TrainingConfig(
@@ -190,6 +199,7 @@ def main() -> None:
             num_epochs=args.num_epochs,
             max_seq_length=args.max_seq_length + 30, # input + introspection prefill
             prompt_type=args.prompt_type,
+            disable_adapter_in_input=args.disable_adapter_in_input,
         ),
 
         cache_dir=args.cache_dir,
