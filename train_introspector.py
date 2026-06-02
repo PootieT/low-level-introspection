@@ -245,6 +245,7 @@ def main():
 
     training_args = TrainingArguments(
         output_dir=str(output_dir),
+        run_name=config.experiment_name,
         learning_rate=config.training_config.learning_rate,
         per_device_train_batch_size=config.training_config.train_batch_size,
         per_device_eval_batch_size=config.training_config.eval_batch_size,
@@ -255,7 +256,7 @@ def main():
         save_strategy="epoch",
         bf16=torch.cuda.is_available(),
         remove_unused_columns=False,
-        # report_to="wandb",
+        report_to="wandb",
     )
 
     trainer = Trainer(
@@ -277,9 +278,9 @@ def main():
     # for test split
     pdb.set_trace()
     test_outputs = trainer.predict(test_dataset)
-    test_predictions = np.ndarray(test_outputs.predictions)
-    test_label_ids = np.ndarray(test_outputs.label_ids)
-    full_test_results = compute_metrics([test_predictions, test_label_ids], tokenizer=tokenizer)
+    test_predictions = test_outputs.predictions
+    test_label_ids = test_outputs.label_ids
+    full_test_results = compute_metrics((test_predictions, test_label_ids), tokenizer=tokenizer)
     train_tokens = set(train_dataset_raw["token"])
     seen_token_mask = test_dataset_raw.map(lambda ex: True if ex["token"] in train_tokens else False)
     seen_token_test_results = compute_metrics([test_predictions[seen_token_mask], test_label_ids[seen_token_mask]], tokenizer=tokenizer)
