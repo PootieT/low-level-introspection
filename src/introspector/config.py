@@ -17,6 +17,7 @@ class DatasetConfig(BaseModel):
     max_samples: int | None = None
     max_seq_length: int = 128
     hf_data_kwargs: dict[str, Any] = {}
+    offset: int = 0
 
 
 class TrainingConfig(BaseModel):

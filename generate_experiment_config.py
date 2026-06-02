@@ -57,6 +57,8 @@ def parse_args() -> argparse.Namespace:
     # for dev split we assume the same configuration as train, and just take samples from after the train split
     parser.add_argument("--dev-dataset-split", default="train")
     parser.add_argument("--dev-max-samples", type=int)
+    parser.add_argument("--dev-offset-from-train", type=int, default=0) # if we were to sweep data size, need to use this to keep dev split the same
+
     parser.add_argument("--test-dataset", required=True)
     parser.add_argument("--test-dataset-split", default="test")
     parser.add_argument("--test-max-samples", type=int)
@@ -174,6 +176,7 @@ def main() -> None:
             max_samples=args.dev_max_samples,
             hf_data_kwargs=hf_data_kwargs,
             max_seq_length=args.max_seq_length,
+            offset=args.dev_offset_from_train,
         ),
         test_dataset=DatasetConfig(
             name=args.test_dataset,
