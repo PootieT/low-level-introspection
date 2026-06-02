@@ -102,6 +102,9 @@ def preprocess_example(
     return out
 
 
+def get_argmax_from_logits(logits, labels):
+    return torch.argmax(logits, dim=-1)
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -205,6 +208,7 @@ def main():
         torch_dtype=torch.bfloat16,
         device_map="auto",
     )
+    model.resize_token_embeddings(len(tokenizer))
 
     # wrap model in lora config
     peft_config = LoraConfig(
@@ -216,6 +220,7 @@ def main():
         task_type="CAUSAL_LM"
     )
     model = get_peft_model(model, peft_config)
+    model.resize_token_embeddings(len(tokenizer)) # https://discuss.huggingface.co/t/resize-embeddings-on-peft-model/136761/3
 
     if config.training_config.disable_adapter_in_input:
         # monkey patch forward to take in mask
@@ -250,9 +255,9 @@ def main():
         per_device_train_batch_size=config.training_config.train_batch_size,
         per_device_eval_batch_size=config.training_config.eval_batch_size,
         num_train_epochs=config.training_config.num_epochs,
-        logging_steps=50,
+        logging_steps=100//config.training_config.train_batch_size,
         eval_strategy="steps",
-        eval_steps=200,
+        eval_steps=400//config.training_config.train_batch_size,
         save_strategy="epoch",
         bf16=torch.cuda.is_available(),
         remove_unused_columns=False,
@@ -266,6 +271,7 @@ def main():
         eval_dataset=dev_dataset,
         data_collator=collator,
         compute_metrics=partial(compute_metrics, tokenizer=tokenizer),
+        preprocess_logits_for_metrics=get_argmax_from_logits  # otherwise during test prediction it's too much mem
     )
     train_results = trainer.train()
 
@@ -282,7 +288,8 @@ def main():
     test_label_ids = test_outputs.label_ids
     full_test_results = compute_metrics((test_predictions, test_label_ids), tokenizer=tokenizer)
     train_tokens = set(train_dataset_raw["token"])
-    seen_token_mask = test_dataset_raw.map(lambda ex: True if ex["token"] in train_tokens else False)
+    seen_token_mask = test_dataset_raw.map(lambda ex: {"seen":True if ex["token"] in train_tokens else False}, remove_columns=test_dataset_raw.column_names)
+    seen_token_mask = np.array(list(seen_token_mask["seen"]))
     seen_token_test_results = compute_metrics([test_predictions[seen_token_mask], test_label_ids[seen_token_mask]], tokenizer=tokenizer)
     unseen_token_test_results = compute_metrics([test_predictions[~seen_token_mask], test_label_ids[~seen_token_mask]], tokenizer=tokenizer)
     trainer.save_metrics("test", full_test_results)

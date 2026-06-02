@@ -20,13 +20,13 @@ echo "=========================================================="
 nvidia-smi
 
 module load cuda/11.8   # 11.2
-module load torch/2.1  # using installed 2.2.1 instead
 module load miniconda/23.11.0
 conda activate /projectnb/llamagrp/peter/low-level-introspection/introspection_env
 
 ## environment setup
 export WANDB_PROJECT=low-level-introspection
 export WANDB_WATCH=all
+export CUDA_LAUNCH_BLOCKING=1  # for debugging cuda errors
 
 ### generate experiment config first as JSON
 python generate_experiment_config.py \
@@ -35,17 +35,17 @@ python generate_experiment_config.py \
     --train-dataset allenai/c4 \
     --train-dataset-split "train" \
     --train-max-samples 3000 \
-    --dev-max-samples 50 \
+    --dev-max-samples 100 \
     --test-dataset allenai/c4 \
     --test-dataset-split "validation" \
-    --test-max-samples 50 \
+    --test-max-samples 1000 \
     --max-seq-length 32 \
     --hf-data-kwargs '{"config": "en", "streaming": true}' \
     --train-signals N10.24 \
     --test-signals N10.24 \
     --precision 3 \
-    --train-batch-size 2 \
-    --eval-batch-size 2 \
+    --train-batch-size 16 \
+    --eval-batch-size 16 \
     --learning-rate 1e-5 \
     --num-epochs 1 \
     --disable-adapter-in-input \
@@ -58,3 +58,6 @@ python cache_signals.py \
 ## train introspector
 python train_introspector.py \
     --config experiment_configs/single_mlp_l10_n24.json
+
+## some hyperparameter notes here
+#

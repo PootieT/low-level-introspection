@@ -26,11 +26,10 @@ import random
 from pathlib import Path
 from typing import Any, List, Dict
 
-from rich.diagnose import report
 from tqdm import tqdm
-import torch
 from datasets import Dataset, load_dataset
 from nnsight import LanguageModel
+import torch
 import transformers
 from torch.utils.data import IterableDataset
 from transformers import AutoTokenizer, BatchEncoding

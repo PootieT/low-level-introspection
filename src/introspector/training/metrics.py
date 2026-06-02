@@ -38,17 +38,10 @@ def compute_l2_dist(label_nums: List[float], pred_nums: List[float]):
 
 
 def compute_metrics(eval_pred: Tuple[np.ndarray, np.ndarray], tokenizer: PreTrainedTokenizerBase):
-    logits, label = eval_pred
-
-    # fix label shifting by 1 token
-    logits = torch.from_numpy(logits)[..., :-1, :].contiguous()
-    labels = torch.from_numpy(label)[..., 1:].contiguous()
+    pred, label = eval_pred
+    pred = pred[..., :-1]
+    labels = label[..., 1:]
     non_prompt_mask = labels != -100
-    pred = np.argmax(logits, axis=-1)
-
-    # compute NLL loss wrt label
-    with torch.no_grad():
-        loss = F.nll_loss(F.log_softmax(logits, dim=-1)[non_prompt_mask], labels[non_prompt_mask])
 
     # compute exact match token by token
     match = np.ma.masked_array(pred == labels, mask=~non_prompt_mask)
@@ -56,7 +49,7 @@ def compute_metrics(eval_pred: Tuple[np.ndarray, np.ndarray], tokenizer: PreTrai
     mean_char_match = match.mean(axis=1).mean()
 
     # get numerical labels and predictions
-    label_nums, pred_nums = get_numericals(pred, labels.numpy(), tokenizer)
+    label_nums, pred_nums = get_numericals(pred, labels, tokenizer)
 
     # compute numerical distance to label
     l2_dist = compute_l2_dist(label_nums, pred_nums)
@@ -68,7 +61,6 @@ def compute_metrics(eval_pred: Tuple[np.ndarray, np.ndarray], tokenizer: PreTrai
     # correlation
     corr, p_value = pearsonr(pred_nums, label_nums)
     return {
-        "loss": loss,
         "l2_dist": l2_dist,
         "exact_match": exact_match,
         "mean_char_match": mean_char_match,
