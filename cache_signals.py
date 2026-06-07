@@ -218,7 +218,9 @@ def build_split(
 
 def report_signal_statistics(dataset: Dataset):
     df = dataset.to_pandas()
+    assert len(df) > 0, "dataset is empty!"
     print(df.groupby(["signal_type", "signal_layer", "signal_index"])["activation"].describe())
+    # TODO cache statistics to json as well
     return
 
 def report_token_overlap(train_dataset: Dataset, test_dataset: Dataset):
@@ -227,7 +229,13 @@ def report_token_overlap(train_dataset: Dataset, test_dataset: Dataset):
     overlap = len(train_tokens & test_tokens)
     print(f"Total train data= {len(train_dataset)}, test data= {len(test_dataset)}")
     print(f"Unique train tokens= {len(train_tokens)}, test tokens= {len(test_tokens)}, overlap= {overlap}")
-    return
+    return {
+        "unique_train": len(train_tokens),
+        "unique_eval": len(test_tokens),
+        "unique_overlap": overlap,
+        "total_train": len(train_dataset),
+        "total_eval": len(test_dataset),
+    }
 
 
 
@@ -268,7 +276,7 @@ def main():
     # assume dataset is large and is not truncated so using streaming mode
     if isinstance(hf_dataset_train, IterableDataset):
         hf_dataset_train = hf_dataset_train.take(config.train_dataset.max_samples)
-        hf_dataset_dev = hf_dataset_train.skip(config.train_dataset.max_samples).take(config.dev_dataset.max_samples)
+        hf_dataset_dev = hf_dataset_dev.skip(max(config.train_dataset.max_samples, config.dev_dataset.offset)).take(config.dev_dataset.max_samples)
         hf_dataset_test = hf_dataset_test.take(config.test_dataset.max_samples)
 
 
@@ -311,7 +319,6 @@ def main():
         dataset_config=config.test_dataset,
         config=config,
     )
-
     print("Training data signal statistics:")
     report_signal_statistics(train_dataset)
     print("Dev data signal statistics:")
@@ -320,15 +327,18 @@ def main():
     report_signal_statistics(test_dataset)
 
     print("Train dev overlap:")
-    report_token_overlap(train_dataset, dev_dataset)
+    train_dev_overlap = report_token_overlap(train_dataset, dev_dataset)
 
     print("Train test overlap:")
-    report_token_overlap(train_dataset, test_dataset)
+    train_test_overlap = report_token_overlap(train_dataset, test_dataset)
 
     output_dir = Path(config.cache_dir) / config.experiment_name
     train_path = output_dir / "train"
     dev_path = output_dir / "dev"
     test_path = output_dir / "test"
+
+    with open(output_dir / "token_overlaps.json", "w") as f:
+        json.dump({"train_dev_overlaps": train_dev_overlap, "train_test_overlaps": train_test_overlap}, f, indent=2)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 

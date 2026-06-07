@@ -169,31 +169,6 @@ def main():
         remove_columns=test_dataset_raw.column_names,
     )
 
-    # split test into several versions controlling seen vs. unseen tokens
-    # TODO better to just eval the whole split and save the results per instance
-    # TODO and aggregate metrics afterwards
-    # train_tokens = set(train_dataset_raw["token"])
-    # test_dataset_unseen_raw = test_dataset_raw.filter(lambda ex: ex["token"] not in train_tokens)
-    # test_dataset_seen_raw = test_dataset_raw.filter(lambda ex: ex["token"] in train_tokens)
-    # test_dataset_unseen = test_dataset_unseen_raw.map(
-    #     lambda ex: preprocess_example(
-    #         ex,
-    #         tokenizer=tokenizer,
-    #         prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
-    #         max_length=config.training_config.max_seq_length,
-    #     ),
-    #     remove_columns=test_dataset_unseen_raw.column_names,
-    # )
-    # test_dataset_seen = test_dataset_seen_raw.map(
-    #     lambda ex: preprocess_example(
-    #         ex,
-    #         tokenizer=tokenizer,
-    #         prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
-    #         max_length=config.training_config.max_seq_length,
-    #     ),
-    #     remove_columns=test_dataset_seen_raw.column_names,
-    # )
-
     for i in range(3):
         print(f"============= Training example row {i} =============")
         print(tokenizer.decode(train_dataset[i]["input_ids"]))
@@ -255,9 +230,9 @@ def main():
         per_device_train_batch_size=config.training_config.train_batch_size,
         per_device_eval_batch_size=config.training_config.eval_batch_size,
         num_train_epochs=config.training_config.num_epochs,
-        logging_steps=100//config.training_config.train_batch_size,
+        logging_steps=math.ceil(100/config.training_config.train_batch_size),
         eval_strategy="steps",
-        eval_steps=400//config.training_config.train_batch_size,
+        eval_steps=math.ceil(400//config.training_config.train_batch_size),
         save_strategy="epoch",
         bf16=torch.cuda.is_available(),
         remove_unused_columns=False,
@@ -281,8 +256,7 @@ def main():
     dev_results = trainer.evaluate()
     trainer.save_metrics("dev", dev_results)
 
-    # for test split
-    pdb.set_trace()
+    # for test split (splitting eval into different subsets to control for e.g.token overlap)
     test_outputs = trainer.predict(test_dataset)
     test_predictions = test_outputs.predictions
     test_label_ids = test_outputs.label_ids
