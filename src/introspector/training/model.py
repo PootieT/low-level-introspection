@@ -54,6 +54,9 @@ def replace_model_with_gated_version(model: PeftModelForCausalLM):
         set_lora_masks(model, lora_token_mask)
         try:
             return orig_forward(*args, **kwargs)
+        except TypeError as e:
+            # in these cases it complains PeftModelForCausalLM.forward() got multiple values for argument 'input_ids'
+            return orig_forward(**kwargs)
         finally:
             set_lora_masks(model, None)
 
