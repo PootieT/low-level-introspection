@@ -83,14 +83,14 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--train-token-selector",
-        type=Union[int,str],
+        type=str, #Union[int,str],
         default=-1,
         help="Token index to introspect on. Integer (fixed position) or string range value (e.g. '10:20') for "
              "random selection",
     )
     parser.add_argument(
         "--test-token-selector",
-        type=Union[int, str],
+        type=str, #Union[int, str],
         default=-1,
         help="Token index to introspect on (for test split).",
     )
