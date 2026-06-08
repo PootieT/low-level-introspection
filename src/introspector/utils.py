@@ -6,6 +6,15 @@ from transformers import BitsAndBytesConfig
 
 from src.introspector.config import ExperimentConfig
 
+def int_or_str(value):
+    try:
+        return int(value)
+    except ValueError:
+        try:
+            return float(value)
+        except ValueError:
+            return value
+
 
 def get_quantization_config(config: ExperimentConfig):
     q_config = None

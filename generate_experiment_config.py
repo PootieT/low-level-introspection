@@ -29,6 +29,7 @@ from typing import Union
 
 from transformers import AutoConfig
 
+from src.introspector.utils import int_or_str
 from src.introspector.config import DatasetConfig, ExperimentConfig, TrainingConfig
 from src.introspector.signals.schema import ExplicitSignalSpec, FixedTokenSelector, RandomRangeTokenSelector
 from src.introspector.signals.resolution import resolve_signal_source
@@ -83,14 +84,14 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--train-token-selector",
-        type=str, #Union[int,str],
+        type=int_or_str, #Union[int,str],
         default=-1,
         help="Token index to introspect on. Integer (fixed position) or string range value (e.g. '10:20') for "
              "random selection",
     )
     parser.add_argument(
         "--test-token-selector",
-        type=str, #Union[int, str],
+        type=int_or_str, #Union[int, str],
         default=-1,
         help="Token index to introspect on (for test split).",
     )
