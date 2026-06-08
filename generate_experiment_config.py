@@ -73,11 +73,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         required=True,
         help="Inline or path to json configuration of training signals."
-             'For fixed signals it might look like {"type":"explicit", "signals":["N12.1","N12.2"]}'
+             'For fixed signals it might look like {"type":"explicit", "signals":["N12.1","N12.2"]}, or simply "N12.1,N12.2"'
              'For sampling random sets it might look like {"type":"uniform_layer_sampler", '
              '  "signal_type":"attention_score","layers":[1,2,3,4], "signals_per_layer"=2, "seed"=21}'
     )
     parser.add_argument("--test-signals", type=str, required=True, help="See train-signals")
+    parser.add_argument("--same-train-test-signals", action="store_true",
+                        help="if sampling neurons, choosing the same signals for the test split")
 
     parser.add_argument(
         "--train-token-selector",
@@ -145,8 +147,8 @@ def main() -> None:
 
     model_config = AutoConfig.from_pretrained(args.model)
     train_spec = resolve_signal_source(load_spec(args.train_signals), model_config=model_config, precision=args.precision)
-    dev_spec = resolve_signal_source(load_spec(args.train_signals), model_config=model_config, no_sample_signals=train_spec, precision=args.precision)
-    test_spec = resolve_signal_source(load_spec(args.test_signals), model_config=model_config, no_sample_signals=train_spec, precision=args.precision)
+    dev_spec = resolve_signal_source(load_spec(args.train_signals), model_config=model_config, no_sample_signals=train_spec, precision=args.precision, same_train_test_signals=args.same_train_test_signals)
+    test_spec = resolve_signal_source(load_spec(args.test_signals), model_config=model_config, no_sample_signals=train_spec, precision=args.precision, same_train_test_signals=args.same_train_test_signals)
 
     train_token_selector = load_token_selector(args.train_token_selector)
     dev_token_selector = load_token_selector(args.train_token_selector)
