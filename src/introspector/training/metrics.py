@@ -14,6 +14,7 @@ def get_numericals(pred: np.ndarray, label: np.ndarray, tokenizer) -> Tuple[List
     # since each label maybe different number of tokens, cannot vectorize
     label_nums = []
     pred_nums = []
+    nan_cnt = 0
     for i in range(len(pred)):
         mask = label[i]!=-100
         label_num = float(tokenizer.decode(label[i][mask], skip_special_tokens=True, clean_up_tokenization_spaces=False))
@@ -22,9 +23,12 @@ def get_numericals(pred: np.ndarray, label: np.ndarray, tokenizer) -> Tuple[List
             pred_str_cleaned = re.sub(r'[^0-9.\-+]', '', pred_str)
             pred_num = float(pred_str_cleaned)
         except:
-            pred_num = np.nan
+            # pred_num = np.nan
+            nan_cnt += 1
+            continue  # skipping NaNs so numerical metrics don't become NaN
         label_nums.append(label_num)
         pred_nums.append(pred_num)
+    print(f"Total of {nan_cnt} out of {len(pred)} samples not parsable.")
     return label_nums, pred_nums
 
 

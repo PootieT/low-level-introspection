@@ -20,7 +20,7 @@ python scripts/generate_experiment_config.py \
     --precision 3 \
     --output experiment_configs/mlp_l10_n200.json
 """
-
+import pdb
 import argparse
 import json
 from datetime import datetime, timezone
@@ -31,11 +31,8 @@ from transformers import AutoConfig
 
 from src.introspector.utils import int_or_str
 from src.introspector.config import DatasetConfig, ExperimentConfig, TrainingConfig
-from src.introspector.signals.schema import ExplicitSignalSpec, FixedTokenSelector, RandomRangeTokenSelector
+from src.introspector.signals.schema import ExplicitSignalSpec, FixedTokenSelector, RandomRangeTokenSelector, ExplicitSignalSpec, UniformLayerSampler
 from src.introspector.signals.resolution import resolve_signal_source
-
-
-
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,7 +73,7 @@ def parse_args() -> argparse.Namespace:
         help="Inline or path to json configuration of training signals."
              'For fixed signals it might look like {"type":"explicit", "signals":["N12.1","N12.2"]}, or simply "N12.1,N12.2"'
              'For sampling random sets it might look like {"type":"uniform_layer_sampler", '
-             '  "signal_type":"attention_score","layers":[1,2,3,4], "signals_per_layer"=2, "seed"=21}'
+             '  "signal_type":"attention_score","layers":[1,2,3,4], "signals_per_layer":2, "seed":21}'
     )
     parser.add_argument("--test-signals", type=str, required=True, help="See train-signals")
     parser.add_argument("--same-train-test-signals", action="store_true",
@@ -126,12 +123,16 @@ def parse_args() -> argparse.Namespace:
 
 def load_spec(value: str):
     if value.endswith(".json"):
-        return json.loads(Path(value).read_text())
+        spec_dict= json.loads(Path(value).read_text())
+        return ExplicitSignal.model_validate(spec_dict) if spec_dict["type"]=="explicit" else UniformLayerSampler.model_validate(spec_dict)
     else:
         try:
-            return json.loads(value)
+            spec_dict = json.loads(value)
+            return SignalSource.model_validate(spec_dict) if spec_dict["type"]=="explicit" else UniformLayerSampler.model_validate(spec_dict)
         except json.decoder.JSONDecodeError:
             print(f"{value} is not a valid JSON, assuming it is a single signal or comma separated list of signals.")
+            if any(s in value for s in ["[", "{","t"]):
+                raise ValueError(f"Not a comma separated list: {value}")
             return ExplicitSignalSpec(type="explicit", signals=value.split(","))
 
 def load_token_selector(value: Union[int,str]):

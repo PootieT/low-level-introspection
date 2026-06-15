@@ -219,9 +219,9 @@ def build_split(
 def report_signal_statistics(dataset: Dataset):
     df = dataset.to_pandas()
     assert len(df) > 0, "dataset is empty!"
-    print(df.groupby(["signal_type", "signal_layer", "signal_index"])["activation"].describe())
-    # TODO cache statistics to json as well
-    return
+    dscr = df.groupby(["signal_type", "signal_layer", "signal_index"])["activation"].describe()
+    print(dscr)
+    return dscr.reset_index().to_dict(orient="records")
 
 def report_token_overlap(train_dataset: Dataset, test_dataset: Dataset):
     train_tokens = set(train_dataset["token"])
@@ -320,11 +320,11 @@ def main():
         config=config,
     )
     print("Training data signal statistics:")
-    report_signal_statistics(train_dataset)
+    train_stats = report_signal_statistics(train_dataset)
     print("Dev data signal statistics:")
-    report_signal_statistics(dev_dataset)
+    dev_stats = report_signal_statistics(dev_dataset)
     print("Test data signal statistics:")
-    report_signal_statistics(test_dataset)
+    test_stats = report_signal_statistics(test_dataset)
 
     print("Train dev overlap:")
     train_dev_overlap = report_token_overlap(train_dataset, dev_dataset)
@@ -333,10 +333,13 @@ def main():
     train_test_overlap = report_token_overlap(train_dataset, test_dataset)
 
     output_dir = Path(config.cache_dir) / config.experiment_name
+    output_dir.mkdir(parents=True, exist_ok=True)
     train_path = output_dir / "train"
     dev_path = output_dir / "dev"
     test_path = output_dir / "test"
 
+    with open(output_dir / "dataset_signal_stats.json", "w") as f:
+        json.dump({"train": train_stats, "dev": dev_stats, "test": test_stats}, f, indent=2)
     with open(output_dir / "token_overlaps.json", "w") as f:
         json.dump({"train_dev_overlaps": train_dev_overlap, "train_test_overlaps": train_test_overlap}, f, indent=2)
 

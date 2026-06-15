@@ -51,8 +51,19 @@ def preprocess_example(
     tokenizer,
     prompt_fn,
     max_length,
-    return_frozen_input_len=False
+    return_frozen_input_len=False,
+    for_prediction=False,
 ):
+    """
+    preprocess dataset for training or prediction
+    :param example: Dict of examples
+    :param tokenizer:
+    :param prompt_fn: function to piece together the prompt
+    :param max_length:
+    :param return_frozen_input_len: used for lora token masking
+    :param for_prediction: if True, do not suffix the target activation, and left-pad the batches
+    :return:
+    """
     introspection_prompt = prompt_fn(
         signal_type=example["signal_type"],
         layer=example["signal_layer"],
@@ -64,7 +75,10 @@ def preprocess_example(
 
     target = example["target"]
 
-    full_text = f"{full_prompt} {target}{tokenizer.eos_token}"
+    if for_prediction:
+        full_text = f"{full_prompt}"
+    else:
+        full_text = f"{full_prompt} {target}{tokenizer.eos_token}"
 
     input_tokens = tokenizer(
         example['text'],
@@ -256,6 +270,8 @@ def main():
     dev_results = trainer.evaluate()
     trainer.save_metrics("dev", dev_results)
 
+
+    # TODO I think these evals are not autoregressively generating the numbers
     # for test split (splitting eval into different subsets to control for e.g.token overlap)
     test_outputs = trainer.predict(test_dataset)
     test_predictions = test_outputs.predictions
@@ -285,8 +301,8 @@ def main():
 
     final_dir = output_dir / "adapter_weights"
 
-    trainer.save_model(str(final_dir))
-    print(f"Saved model to: {final_dir}")
+    # trainer.save_model(str(final_dir))
+    # print(f"Saved model to: {final_dir}")
 
 
 if __name__ == "__main__":
