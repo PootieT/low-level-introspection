@@ -10,6 +10,13 @@ class LoRAGatingCollator(DataCollatorForSeq2Seq):
     which isn't padded correctly by default collator, so here we have to
     subclass and manually pad it with additional 0s
     """
+
+    def __init__(self, *args, for_prediction=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.for_prediction = for_prediction
+        if for_prediction:
+            self.tokenizer.padding_side = "left"
+
     def __call__(self, features):
         input_lens = [f.pop("frozen_input_len") for f in features]
         unpadded_full_prompt_lens = [len(f["input_ids"]) for f in features]
@@ -20,7 +27,10 @@ class LoRAGatingCollator(DataCollatorForSeq2Seq):
         for input_len, full_prompt_len in zip(input_lens, unpadded_full_prompt_lens):
             mask = [0] * input_len + [1] * (full_prompt_len - input_len)
             pad_len = seq_len - len(mask)
-            padded_masks.append(mask + [0] * pad_len)
+            if self.for_prediction:
+                padded_masks.append([0] * pad_len + mask)
+            else:
+                padded_masks.append(mask + [0] * pad_len)
 
         batch["lora_token_mask"] = torch.tensor(padded_masks,dtype=torch.float32)
         return batch

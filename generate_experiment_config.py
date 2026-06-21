@@ -31,7 +31,8 @@ from transformers import AutoConfig
 
 from src.introspector.utils import int_or_str
 from src.introspector.config import DatasetConfig, ExperimentConfig, TrainingConfig
-from src.introspector.signals.schema import ExplicitSignalSpec, FixedTokenSelector, RandomRangeTokenSelector, ExplicitSignalSpec, UniformLayerSampler
+from src.introspector.signals.schema import ExplicitSignalSpec, FixedTokenSelector, RandomRangeTokenSelector, \
+    ExplicitSignalSpec, UniformLayerSampler, SignalSource
 from src.introspector.signals.resolution import resolve_signal_source
 
 
@@ -118,13 +119,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", default="data")
     parser.add_argument("--output-dir", default="outputs/runs")
 
+    # ---- misc ----
+    parser.add_argument("--overwrite-cache", action="store_true",
+                        help="Whether to overwrite cached experiment config file if there exist one")
     return parser.parse_args()
 
 
 def load_spec(value: str):
     if value.endswith(".json"):
         spec_dict= json.loads(Path(value).read_text())
-        return ExplicitSignal.model_validate(spec_dict) if spec_dict["type"]=="explicit" else UniformLayerSampler.model_validate(spec_dict)
+        return ExplicitSignalSpec.model_validate(spec_dict) if spec_dict["type"]=="explicit" else UniformLayerSampler.model_validate(spec_dict)
     else:
         try:
             spec_dict = json.loads(value)
@@ -144,6 +148,11 @@ def load_token_selector(value: Union[int,str]):
 
 def main() -> None:
     args = parse_args()
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and not args.overwrite_cache:
+        print(f"Output file {output_path} already exists, skipping...")
+        return
 
     hf_data_kwargs = json.loads(args.hf_data_kwargs) if args.hf_data_kwargs else {}
 
@@ -207,14 +216,13 @@ def main() -> None:
             max_seq_length=args.max_seq_length + 30, # input + introspection prefill
             prompt_type=args.prompt_type,
             disable_adapter_in_input=args.disable_adapter_in_input,
+            precision=args.precision
         ),
 
         cache_dir=args.cache_dir,
         output_dir=args.output_dir,
     )
 
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(output_path, "w") as f:
         json.dump(

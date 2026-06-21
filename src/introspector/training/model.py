@@ -27,6 +27,11 @@ class GatedLinear(Linear):
 
             mask = self.lora_token_mask
             if mask is not None:
+                seq_len = x.shape[1]
+                if mask.shape[1] != seq_len:
+                    # for generation, dynamically slice the mask, so when generation uses KV-cache, set mask to 1
+                    mask = mask[:, -seq_len:]
+
                 lora_out = lora_out * mask.unsqueeze(-1).to(lora_out.dtype)
 
             result = result + lora_out
@@ -59,8 +64,20 @@ def replace_model_with_gated_version(model: PeftModelForCausalLM):
             return orig_forward(**kwargs)
         finally:
             set_lora_masks(model, None)
-
     model.forward = forward_with_mask
+
+    # monkey patch generate (this wasn't in the training, so I guess eval during training is not autoregressive)
+    orig_generate = model.generate
+    def generate_with_mask(*args, lora_token_mask=None, **kwargs):
+        # lora_token_mask = args[0].pop("lora_token_mask", None)
+        set_lora_masks(model, lora_token_mask)
+        try:
+            return orig_generate(*args, **kwargs)
+        except AttributeError as e:
+            return orig_generate(**kwargs)
+        finally:
+            set_lora_masks(model, None)
+    model.generate = generate_with_mask
 
 
 

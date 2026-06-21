@@ -21,15 +21,18 @@ import argparse
 import json
 import math
 import pdb
+import regex as re
 import threading
 from functools import partial
 from pathlib import Path
 from typing import Tuple
 
+from tqdm import tqdm
 import numpy as np
 import torch
 from datasets import load_from_disk
 from peft import LoraConfig, get_peft_model
+from torch.utils.data import DataLoader
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -40,7 +43,7 @@ from transformers import (
 from src.introspector.config import ExperimentConfig
 from src.introspector.training.collator import LoRAGatingCollator
 from src.introspector.training.model import replace_model_with_gated_version, replace_lora_with_gated_version
-from src.introspector.training.metrics import compute_metrics
+from src.introspector.training.metrics import compute_metrics, get_numericals, compute_metrics_from_numericals
 from src.introspector.prompts import PROMPT_REGISTRY
 
 INTROSPECTION_SEPARATOR = "<|introspection|>"
@@ -127,6 +130,9 @@ def parse_args():
         type=Path,
         required=True,
     )
+    parser.add_argument("--overwrite-cache", action="store_true",
+                        help="Whether to overwrite cached experiment files if there exist one")
+
     return parser.parse_args()
 
 
@@ -140,6 +146,11 @@ def main():
     train_path = cache_dir / "train"
     dev_path = cache_dir / "dev"
     test_path = cache_dir / "test"
+    output_dir = Path(config.output_dir) / config.experiment_name
+
+    if (output_dir / "test_results.json").exists() and not args.overwrite_cache:
+        print(f"Experiments ran already, skipping.. {output_dir}")
+        return
 
     # load tokenizer, add special token
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
@@ -179,6 +190,17 @@ def main():
             prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
             max_length=config.training_config.max_seq_length,
             return_frozen_input_len=config.training_config.disable_adapter_in_input,
+        ),
+        remove_columns=test_dataset_raw.column_names,
+    )
+    test_dataset_pred = test_dataset_raw.map(
+        lambda ex: preprocess_example(
+            ex,
+            tokenizer=tokenizer,
+            prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
+            max_length=config.training_config.max_seq_length,
+            return_frozen_input_len=config.training_config.disable_adapter_in_input,
+            for_prediction=True,
         ),
         remove_columns=test_dataset_raw.column_names,
     )
@@ -225,6 +247,14 @@ def main():
             label_pad_token_id=-100,
             return_tensors="pt",
         )
+        pred_collator = LoRAGatingCollator(
+            tokenizer=tokenizer,
+            model=model,
+            padding=True,
+            label_pad_token_id=-100,
+            return_tensors="pt",
+            for_prediction=True
+        )
     else:
         collator = DataCollatorForSeq2Seq(
             tokenizer=tokenizer,
@@ -234,8 +264,6 @@ def main():
             return_tensors="pt",
         )
 
-
-    output_dir = Path(config.output_dir) / config.experiment_name
 
     training_args = TrainingArguments(
         output_dir=str(output_dir),
@@ -250,7 +278,7 @@ def main():
         save_strategy="epoch",
         bf16=torch.cuda.is_available(),
         remove_unused_columns=False,
-        report_to="wandb",
+        # report_to="wandb",
     )
 
     trainer = Trainer(
@@ -266,12 +294,10 @@ def main():
 
     trainer.save_metrics("train", train_results.metrics)
 
-    # get dev split final metrics
+    # get dev eval split final metrics
     dev_results = trainer.evaluate()
     trainer.save_metrics("dev", dev_results)
 
-
-    # TODO I think these evals are not autoregressively generating the numbers
     # for test split (splitting eval into different subsets to control for e.g.token overlap)
     test_outputs = trainer.predict(test_dataset)
     test_predictions = test_outputs.predictions
@@ -290,19 +316,46 @@ def main():
     with open(str(output_dir / "history.json"), "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
-    # evaluate test split carefully by looking at instances with seen tokens vs not
-    # other_eval_metrics = trainer.evaluate(
-    #     eval_dataset={
-    #         "test_seen_tokens": test_dataset_seen,
-    #         "test_unseen_tokens": test_dataset_unseen,
-    #     }
-    # )
-    # trainer.save_metrics("test_others", other_eval_metrics)
-
     final_dir = output_dir / "adapter_weights"
 
     # trainer.save_model(str(final_dir))
     # print(f"Saved model to: {final_dir}")
+
+    # now evaluate using prediction (autoregressive generation)
+    if not config.training_config.disable_adapter_in_input:
+        exit() # Not implemented yet
+
+    dataloader = DataLoader(
+        test_dataset_pred,
+        batch_size=config.training_config.train_batch_size,
+        collate_fn=pred_collator,
+        shuffle=False
+    )
+    model.eval()
+    gen_nums = []
+    with torch.no_grad():
+        for batch in tqdm(dataloader):
+            batch = batch.to(model.device)
+            gen_tokens_batch = model.generate(**batch, max_new_tokens=config.training_config.precision+2)
+            input_seq_len = batch["input_ids"].shape[1]
+            gen_strs_batch = tokenizer.batch_decode(gen_tokens_batch[:, input_seq_len:], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            for gen_str in gen_strs_batch:
+                try:
+                    gen_str_clean = re.sub(r'[^0-9.\-+]', '', gen_str)
+                    gen_num = float(gen_str_clean)
+                except:
+                    gen_num = np.nan
+                gen_nums.append(gen_num)
+
+    labels = np.array([float(a) for a in test_dataset_raw["target"]])
+    gen_nums = np.array(gen_nums)
+    test_pred_metrics = compute_metrics_from_numericals(gen_nums, labels)
+    seen_token_test_pred_results = compute_metrics_from_numericals(gen_nums[seen_token_mask], labels[seen_token_mask])
+    unseen_token_test_pred_results = compute_metrics_from_numericals(gen_nums[~seen_token_mask], labels[~seen_token_mask])
+    trainer.save_metrics("test_pred", test_pred_metrics)
+    trainer.save_metrics("test_pred_seen_token", seen_token_test_pred_results)
+    trainer.save_metrics("test_pred_unseen_token", unseen_token_test_pred_results)
+
 
 
 if __name__ == "__main__":

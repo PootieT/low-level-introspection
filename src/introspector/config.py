@@ -30,6 +30,7 @@ class TrainingConfig(BaseModel):
     lora_alpha: int = 32
     disable_adapter_in_input: bool = False
     prompt_type: str = "prompt_no_token_index"
+    precision: int = 3
 
 
 class ExperimentConfig(BaseModel):

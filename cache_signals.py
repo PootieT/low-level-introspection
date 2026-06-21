@@ -247,12 +247,24 @@ def parse_args():
         type=Path,
         required=True,
     )
+    parser.add_argument("--overwrite-cache", action="store_true",
+                        help="Whether to overwrite cached dataset files if there exist one")
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     config = ExperimentConfig.model_validate_json(Path(args.config).read_text())
+
+    output_dir = Path(config.cache_dir) / config.experiment_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    train_path = output_dir / "train"
+    dev_path = output_dir / "dev"
+    test_path = output_dir / "test"
+    if train_path.exists() and not args.overwrite_cache:
+        print("Signal dataset cached, skipping ...")
+        return
 
     set_seed(config.seed)
 
@@ -331,12 +343,6 @@ def main():
 
     print("Train test overlap:")
     train_test_overlap = report_token_overlap(train_dataset, test_dataset)
-
-    output_dir = Path(config.cache_dir) / config.experiment_name
-    output_dir.mkdir(parents=True, exist_ok=True)
-    train_path = output_dir / "train"
-    dev_path = output_dir / "dev"
-    test_path = output_dir / "test"
 
     with open(output_dir / "dataset_signal_stats.json", "w") as f:
         json.dump({"train": train_stats, "dev": dev_stats, "test": test_stats}, f, indent=2)

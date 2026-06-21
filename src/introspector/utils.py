@@ -87,3 +87,17 @@ def get_l2_attn_weights(model, tokenized, layer, value_weighting=True, remote=Fa
         effective = attn_weights * value_norms.unsqueeze(2).expand(attn_weights.shape)
         effective /= torch.sum(effective, dim=-1, keepdim=True)
         return effective
+
+
+def rsetattr(obj, attr, val):
+    pre, _, post = attr.rpartition('.')
+    # If there's a dot, recursively get the nested object
+    if pre:
+        target_obj = rgetattr(obj, pre)
+    else:
+        target_obj = obj
+    setattr(target_obj, post, val)
+
+def rgetattr(obj, attr):
+    # Helper to get nested attributes
+    return functools.reduce(getattr, [obj] + attr.split('.'))

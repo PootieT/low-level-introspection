@@ -55,6 +55,22 @@ def compute_metrics(eval_pred: Tuple[np.ndarray, np.ndarray], tokenizer: PreTrai
     # get numerical labels and predictions
     label_nums, pred_nums = get_numericals(pred, labels, tokenizer)
 
+    numerical_metrics = compute_metrics_from_numericals(pred_nums, label_nums)
+    return {
+        "exact_match": exact_match,
+        "mean_char_match": mean_char_match,
+        **numerical_metrics,
+    }
+
+def compute_metrics_from_numericals(pred_nums: List[float], label_nums:List[float]):
+    # just in case filter out nan cases, because they corrupt the metrics
+    nan_mask = np.isnan(pred_nums)
+    non_nan_mask = ~nan_mask
+    if sum(nan_mask) > 0:
+        print(f"Removing {sum(nan_mask)} out of {len(pred_nums)} samples that are NaN.")
+    pred_nums = np.array(pred_nums)[non_nan_mask]
+    label_nums = np.array(label_nums)[non_nan_mask]
+
     # compute numerical distance to label
     l2_dist = compute_l2_dist(label_nums, pred_nums)
 
@@ -66,8 +82,6 @@ def compute_metrics(eval_pred: Tuple[np.ndarray, np.ndarray], tokenizer: PreTrai
     corr, p_value = pearsonr(pred_nums, label_nums)
     return {
         "l2_dist": l2_dist,
-        "exact_match": exact_match,
-        "mean_char_match": mean_char_match,
         "avg_diff": avg_diff,
         "std_diff": std_diff,
         "corr": corr,
