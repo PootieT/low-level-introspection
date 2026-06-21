@@ -278,7 +278,7 @@ def main():
         save_strategy="epoch",
         bf16=torch.cuda.is_available(),
         remove_unused_columns=False,
-        # report_to="wandb",
+        report_to="wandb",
     )
 
     trainer = Trainer(
