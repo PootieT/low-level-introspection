@@ -1,4 +1,4 @@
-EXP_NAME=single_mlp_l10_n24
+EXP_NAME=single_mlp_l10_n24_debug
 
 python intervene_introspector.py \
     --config experiment_configs/$EXP_NAME.json

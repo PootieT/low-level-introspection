@@ -3,6 +3,8 @@ This file takes in a finetuned introspector, and intervenes at
 the low-level signal it is trained on, and caches model outputs
 after intervention
 """
+import os
+import glob
 import pdb
 import json
 import regex as re
@@ -12,6 +14,7 @@ import argparse
 
 from tqdm import tqdm
 import numpy as np
+import pandas as pd
 from datasets import load_from_disk
 from nnsight.modeling.language import LanguageModel
 from peft import PeftModel
@@ -69,9 +72,11 @@ def main():
     num_added = tokenizer.add_special_tokens(special_tokens)
 
     model = AutoModelForCausalLM.from_pretrained(config.model_name,torch_dtype=torch.bfloat16, device_map="auto", local_files_only=True)
+    model.resize_token_embeddings(len(tokenizer))
     device = model.device
-    lora_path = Path(config.output_dir) / config.experiment_name / "adapter_weights"
-    model = PeftModel.from_pretrained(model, lora_path)
+    checkpoint_paths = glob.glob(str(Path(config.output_dir) / config.experiment_name / "checkpoint-*"))
+    latest_checkpoint_path = max(checkpoint_paths, key=os.path.getctime)
+    model = PeftModel.from_pretrained(model, latest_checkpoint_path)
 
     # monkey patch to get the introspection token masking
     replace_model_with_gated_version(model)
@@ -108,7 +113,7 @@ def main():
     # for each signal forward whole dataset, for each datapoint, sample
     # a random activation for the neuron, obtain generation
     # compare sampled random activation to generated activation
-    all_outputs = {}
+    signal_output = []
     all_metrics = {}
     for signal in signals:
         print(f"Processing signal: {signal}")
@@ -118,7 +123,6 @@ def main():
             collate_fn=collator,
             shuffle=False
         )
-        signal_output = []
         unparsable_cnt = 0
         # uniformly sample a random signal as replacement (TODO could make it more realistic)
         high, low = dscr["min"][(signal.type, signal.layer, signal.index)], dscr["max"][(signal.type, signal.layer, signal.index)]
@@ -136,8 +140,8 @@ def main():
                 getter = operator.attrgetter(mlp_layer_path)
                 # assuming dimensions are [bs, token, h], output dim is [bs, h]
                 og_output = getter(gated_model)
+                og_signal_batch = og_output[range(bs), token_positions, signal.index].detach().cpu().tolist().save()
                 og_output[range(bs), token_positions, signal.index] = random_signal_batch
-
                 output = gated_model.generator.output.save()
 
             # parse output to number and save
@@ -146,18 +150,19 @@ def main():
                 try:
                     pred_str_cleaned = re.sub(r'[^0-9.\-+]', '', pred_str)
                     pred_num = float(pred_str_cleaned)
-                    signal_output.append({"data_idx": data_idx+i, "intervened_signal": random_signal_batch[i].cpu().item(), "pred_num": pred_num})
+                    signal_output.append({"data_idx": data_idx+i,"signal": str(signal), "intervened_signal": random_signal_batch[i].cpu().item(), "pred_num": pred_num, "og_signal": og_signal_batch[i]})
                 except:
                     unparsable_cnt += 1
-                    signal_output.append({"data_idx": data_idx + i, "intervened_signal": random_signal_batch[i].cpu().item(), "pred_num": np.nan})
+                    signal_output.append({"data_idx": data_idx + i, "signal": str(signal),"intervened_signal": random_signal_batch[i].cpu().item(), "pred_num": np.nan, "og_signal": og_signal_batch[i]})
             data_idx += bs
 
         print(f"unparsable predictions cnt = {unparsable_cnt}")
-        all_outputs[signal] = signal_output
-        all_metrics[signal] = compute_metrics_from_numericals([r["pred_num"] for r in signal_output], [r["intervened_signal"] for r in signal_output])
+        all_metrics[str(signal)] = compute_metrics_from_numericals([r["pred_num"] for r in signal_output], [r["intervened_signal"] for r in signal_output])
 
-    with open(Path(config.output_dir) / config.experiment_name / "intervention_results.json", "wb") as f:
-        json.dump(all_outputs, f, indent=2)
+    output_df = pd.DataFrame(signal_output)
+    output_df.to_parquet(Path(config.output_dir) / config.experiment_name / "intervention_results.parquet")
+    with open(str(Path(config.output_dir) / config.experiment_name / "intervention_results_metrics.json"), "w") as f:
+        json.dump(all_metrics, f, indent=2)
 
 
 
