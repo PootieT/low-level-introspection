@@ -225,8 +225,8 @@ def main():
     peft_config = LoraConfig(
         r=config.training_config.lora_r, # rank
         lora_alpha=config.training_config.lora_alpha,  # Scaling factor
-        target_modules="all-linear",  # Apply to all linear layers (or specify specific ones like ["q_proj", "v_proj"])
-        lora_dropout=0.05,
+        target_modules=config.training_config.lora_target_modules,  # "all-linear", Apply to all linear layers (or specify specific ones like ["q_proj", "v_proj"])
+        lora_dropout=config.training_config.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM"
     )

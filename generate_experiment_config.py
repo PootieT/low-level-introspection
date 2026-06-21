@@ -114,6 +114,10 @@ def parse_args() -> argparse.Namespace:
     # ---- lora ----
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-target-modules", type=str, default="all-linear",
+                        help="Comma separated list of names of modules to use for lora adaptor, all-linear targets all "
+                             "linear modules")
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
 
     # ---- paths ----
     parser.add_argument("--cache-dir", default="data")
@@ -216,7 +220,11 @@ def main() -> None:
             max_seq_length=args.max_seq_length + 30, # input + introspection prefill
             prompt_type=args.prompt_type,
             disable_adapter_in_input=args.disable_adapter_in_input,
-            precision=args.precision
+            precision=args.precision,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_target_modules=args.lora_target_modules if "," not in args.lora_target_modules else args.lora_target_modules.split(","),
+            lora_dropout=args.lora_dropout,
         ),
 
         cache_dir=args.cache_dir,

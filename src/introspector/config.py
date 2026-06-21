@@ -3,7 +3,7 @@
 """
 Schema classes for experiments, datasets, etc
 """
-from typing import List, Any
+from typing import List, Any, Optional, Union
 
 from pydantic import BaseModel
 
@@ -28,6 +28,8 @@ class TrainingConfig(BaseModel):
     max_seq_length: int = 256
     lora_r: int = 16
     lora_alpha: int = 32
+    lora_target_modules: Union[str,List[str]] = "all-linear"
+    lora_dropout: float = 0.05
     disable_adapter_in_input: bool = False
     prompt_type: str = "prompt_no_token_index"
     precision: int = 3
