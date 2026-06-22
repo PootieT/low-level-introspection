@@ -23,7 +23,9 @@ class GatedLinear(Linear):
 
             lora_A = self.lora_A[active_adapter]
             lora_B = self.lora_B[active_adapter]
-            lora_out = lora_B(lora_A(x)) * self.scaling[active_adapter]
+            x_cast = x.to(lora_A.weight.dtype)
+            lora_out = lora_B(lora_A(x_cast)) * self.scaling[active_adapter]
+            lora_out = lora_out.to(result.dtype)
 
             mask = self.lora_token_mask
             if mask is not None:
