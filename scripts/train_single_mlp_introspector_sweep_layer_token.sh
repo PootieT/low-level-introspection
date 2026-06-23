@@ -1,15 +1,15 @@
 #!/bin/bash -l
 #$ -P llamagrp
-#$ -N single_mlp_l10_n24
+#$ -N single_mlp_sweep
 #$ -pe omp 8
 #$ -l gpus=1
 #$ -l gpu_c=8.5
 #$ -l gpu_memory=47G
-#$ -l h_rt=24:00:00
+#$ -l h_rt=12:00:00
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1
+#$ -t 1-80
 
 ## SCC env setup
 ## Keep track of information related to the current job
@@ -26,7 +26,8 @@ conda activate /projectnb/llamagrp/peter/low-level-introspection/introspection_e
 
 ## environment setup
 export WANDB_PROJECT=low-level-introspection
-export WANDB_WATCH=all
+export WANDB_RUN_GROUP=single_neuron_sweep_layer_token
+#export WANDB_WATCH=all
 #export CUDA_LAUNCH_BLOCKING=1  # for debugging cuda errors
 
 # specify array job params
@@ -35,9 +36,9 @@ declare -a params
 idx=0
 IFS=' ' # space is set as delimiter
 
-for layer in 0 2 4 6 8 10 12
+for layer in 0 2 4 6 8 10 12 14
 do
-    for pos in -1 -4 -7 -10 -13 -16 -19 -22 -25 -28 0
+    for pos in -1 -4 -7 -10 -13 -16 -19 -22 -25 -28
     do
         params[idx]=$layer$IFS$pos
         ((idx++))
@@ -48,10 +49,10 @@ read -ra taskinput <<< "${params[$index]}" # str is read into an array as tokens
 LAYER=${taskinput[0]}
 TOKEN_POS=${taskinput[1]}
 
-for SAMPLE in {1..10}
+for SAMPLE in {0..9}
 do
   ### generate experiment config first as JSON
-  EXP_NAME="single_mlp_l${LAYER}_sample${SAMPLE}_pos${TOKEN_POS}_train300K"
+  EXP_NAME="l${LAYER}_sample${SAMPLE}_pos${TOKEN_POS}_train300K"
   echo "Running Experiment: ${EXP_NAME}"
   python generate_experiment_config.py \
       --experiment-name $EXP_NAME \
@@ -66,8 +67,8 @@ do
       --test-max-samples 3000 \
       --max-seq-length 32 \
       --hf-data-kwargs '{"config": "en", "streaming": true}' \
-      --train-signals '{"type":"uniform_layer_sampler", "signal_type":"attention_score","layers":['$LAYER'], "signals_per_layer"=1, "seed"=21}' \
-      --test-signals '{"type":"uniform_layer_sampler", "signal_type":"attention_score","layers":['$LAYER'], "signals_per_layer"=1, "seed"=21}' \
+      --train-signals '{"type":"uniform_layer_sampler", "signal_type":"mlp","layers":['$LAYER'], "signals_per_layer":1, "seed":21}' \
+      --test-signals '{"type":"uniform_layer_sampler", "signal_type":"mlp","layers":['$LAYER'], "signals_per_layer":1, "seed":21}' \
       --same-train-test-signals \
       --train-token-selector $TOKEN_POS \
       --test-token-selector $TOKEN_POS \
@@ -77,14 +78,20 @@ do
       --learning-rate 5e-5 \
       --num-epochs 1 \
       --disable-adapter-in-input \
-      --output experiment_configs/$EXP_NAME.json
-      exit
-  ### cache activations and generate dataset
-  #python cache_signals.py \
-  #    --config experiment_configs/$EXP_NAME.json
-  #
-  ### train introspector
-  #python train_introspector.py \
-  #    --config experiment_configs/$EXP_NAME.json
+      --cache-dir data/single_mlp_sweep \
+      --output-dir outputs/runs/single_mlp_sweep \
+      --output experiment_configs/single_mlp_sweep/$EXP_NAME.json
 
+  ## cache activations and generate dataset
+  python cache_signals.py \
+      --config experiment_configs/single_mlp_sweep/$EXP_NAME.json
+
+  ## train introspector
+  python train_introspector.py \
+      --config experiment_configs/single_mlp_sweep/$EXP_NAME.json \
+      --overwrite-cache
+
+  ## intervene and check generation
+  python intervene_introspector.py \
+    --config experiment_configs/single_mlp_sweep/$EXP_NAME.json
 done

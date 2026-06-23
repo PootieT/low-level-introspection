@@ -32,5 +32,5 @@ class LoRAGatingCollator(DataCollatorForSeq2Seq):
             else:
                 padded_masks.append(mask + [0] * pad_len)
 
-        batch["lora_token_mask"] = torch.tensor(padded_masks,dtype=torch.float32)
+        batch["lora_token_mask"] = torch.tensor(padded_masks, dtype=torch.float32)
         return batch

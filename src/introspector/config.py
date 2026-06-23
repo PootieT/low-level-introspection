@@ -33,6 +33,7 @@ class TrainingConfig(BaseModel):
     disable_adapter_in_input: bool = False
     prompt_type: str = "prompt_no_token_index"
     precision: int = 3
+    bf16: bool = True
 
 
 class ExperimentConfig(BaseModel):

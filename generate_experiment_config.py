@@ -21,6 +21,7 @@ python scripts/generate_experiment_config.py \
     --output experiment_configs/mlp_l10_n200.json
 """
 import pdb
+import os
 import argparse
 import json
 from datetime import datetime, timezone
@@ -48,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument("--load-in-4bit", action="store_true", help="Load model weights in 4bit")
     parser.add_argument("--load-in-8bit", action="store_true", help="Load model weights in 8bit")
+    parser.add_argument("--bf16", action="store_true", help="Load model weights in bfloat16")
 
     # ---- dataset ----
     parser.add_argument("--train-dataset", required=True)
@@ -225,13 +227,14 @@ def main() -> None:
             lora_alpha=args.lora_alpha,
             lora_target_modules=args.lora_target_modules if "," not in args.lora_target_modules else args.lora_target_modules.split(","),
             lora_dropout=args.lora_dropout,
+            bf16=args.bf16
         ),
 
         cache_dir=args.cache_dir,
         output_dir=args.output_dir,
     )
 
-
+    os.makedirs(Path(args.output_dir).parent, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(
             config.model_dump(),

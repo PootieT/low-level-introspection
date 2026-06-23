@@ -216,7 +216,7 @@ def main():
     # load model
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32,
         device_map="auto",
     )
     model.resize_token_embeddings(len(tokenizer))
@@ -276,7 +276,7 @@ def main():
         eval_strategy="steps",
         eval_steps=math.ceil(400//config.training_config.train_batch_size),
         save_strategy="epoch",
-        bf16=torch.cuda.is_available(),
+        bf16=config.training_config.bf16,
         remove_unused_columns=False,
         report_to="wandb",
     )
@@ -336,7 +336,7 @@ def main():
     with torch.no_grad():
         for batch in tqdm(dataloader):
             batch = batch.to(model.device)
-            gen_tokens_batch = model.generate(**batch, max_new_tokens=config.training_config.precision+2)
+            gen_tokens_batch = model.generate(**batch, max_new_tokens=config.training_config.precision+2, pad_token_id=tokenizer.pad_token_id)
             input_seq_len = batch["input_ids"].shape[1]
             gen_strs_batch = tokenizer.batch_decode(gen_tokens_batch[:, input_seq_len:], skip_special_tokens=True, clean_up_tokenization_spaces=False)
             for gen_str in gen_strs_batch:
@@ -349,6 +349,8 @@ def main():
 
     labels = np.array([float(a) for a in test_dataset_raw["target"]])
     gen_nums = np.array(gen_nums)
+    if config.experiment_name.startswith("r16_alpha32"):
+        pdb.set_trace()
     test_pred_metrics = compute_metrics_from_numericals(gen_nums, labels)
     seen_token_test_pred_results = compute_metrics_from_numericals(gen_nums[seen_token_mask], labels[seen_token_mask])
     unseen_token_test_pred_results = compute_metrics_from_numericals(gen_nums[~seen_token_mask], labels[~seen_token_mask])

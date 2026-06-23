@@ -52,6 +52,9 @@ def parse_args():
              '  "signal_type":"attention_score","layers":[1,2,3,4], "signals_per_layer"=2, "seed"=21}'
              'default to None, the training signals'
     )
+    parser.add_argument("--overwrite-cache", action="store_true",
+                        help="Whether to overwrite cached dataset files if there exist one")
+
     return parser.parse_args()
 
 
@@ -71,12 +74,12 @@ def main():
     special_tokens = {"additional_special_tokens": [INTROSPECTION_SEPARATOR]}
     num_added = tokenizer.add_special_tokens(special_tokens)
 
-    model = AutoModelForCausalLM.from_pretrained(config.model_name,torch_dtype=torch.bfloat16, device_map="auto", local_files_only=True)
+    model = AutoModelForCausalLM.from_pretrained(config.model_name,device_map="auto", local_files_only=True, torch_dtype=torch.bfloat16,) #
     model.resize_token_embeddings(len(tokenizer))
     device = model.device
     checkpoint_paths = glob.glob(str(Path(config.output_dir) / config.experiment_name / "checkpoint-*"))
     latest_checkpoint_path = max(checkpoint_paths, key=os.path.getctime)
-    model = PeftModel.from_pretrained(model, latest_checkpoint_path)
+    model = PeftModel.from_pretrained(model, latest_checkpoint_path, autocast_adapter_dtype=False)
 
     # monkey patch to get the introspection token masking
     replace_model_with_gated_version(model)
@@ -84,7 +87,7 @@ def main():
     gated_model = LanguageModel(model, tokenizer=tokenizer, )
 
     # load test dataset, get signal ranges
-    test_data_path = Path(config.cache_dir) / config.experiment_name / "train"
+    test_data_path = Path(config.cache_dir) / config.experiment_name / "test"
     test_dataset_raw = load_from_disk(str(test_data_path))
     df = test_dataset_raw.to_pandas()
     dscr = df.groupby(["signal_type", "signal_layer", "signal_index"])["activation"].describe()
@@ -126,14 +129,15 @@ def main():
         unparsable_cnt = 0
         # uniformly sample a random signal as replacement (TODO could make it more realistic)
         high, low = dscr["min"][(signal.type, signal.layer, signal.index)], dscr["max"][(signal.type, signal.layer, signal.index)]
-        random_signals = torch.rand(len(test_dataset)).to(torch.bfloat16).to(device)*(high-low) + low
+        random_signals = torch.rand(len(test_dataset)).to(torch.bfloat16).to(device)*(high-low) + low  #
         data_idx = 0
         for batch in tqdm(dataloader):
+            batch = batch.to(device)
             bs, input_seq_len = batch["input_ids"].shape[0], batch["input_ids"].shape[1]
             random_signal_batch = random_signals[data_idx:data_idx + bs]
-            og_token_positions = torch.tensor(test_dataset_raw["token_position"][data_idx:data_idx + bs])
+            og_token_positions = torch.tensor(test_dataset_raw["token_position"][data_idx:data_idx + bs]).to(device)
             # prediction requires left padding, need to offset by padding tokens. offset of -1 is label shift I think
-            token_positions = og_token_positions + (batch["input_ids"] == tokenizer.pad_token_id).sum(dim=1) -1
+            token_positions = og_token_positions + (batch["input_ids"] == tokenizer.pad_token_id).sum(dim=1).to(device) -1
             with torch.no_grad(), gated_model.generate(batch, max_new_tokens=signal.precision+2, pad_token_id=tokenizer.pad_token_id):
                 # TODO extend to other signal types
                 mlp_layer_path = resolve_mlp_signal_path(gated_model, signal.layer)
