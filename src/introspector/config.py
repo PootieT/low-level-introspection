@@ -36,6 +36,13 @@ class TrainingConfig(BaseModel):
     bf16: bool = True
 
 
+class EvalConfig(BaseModel):
+    # generation configs
+    do_sample: bool = False
+    temperature: float = 1.0
+    top_k: int = 50
+    top_p: float = 1.0
+
 class ExperimentConfig(BaseModel):
     experiment_name: str
     created_at: str
@@ -57,6 +64,7 @@ class ExperimentConfig(BaseModel):
     test_token_selector: TokenSelector
 
     training_config: TrainingConfig
+    eval_config: EvalConfig
 
     cache_dir: str
     output_dir: str

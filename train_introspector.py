@@ -336,7 +336,11 @@ def main():
     with torch.no_grad():
         for batch in tqdm(dataloader):
             batch = batch.to(model.device)
-            gen_tokens_batch = model.generate(**batch, max_new_tokens=config.training_config.precision+2, pad_token_id=tokenizer.pad_token_id)
+            gen_tokens_batch = model.generate(
+                **batch, max_new_tokens=config.training_config.precision+2, pad_token_id=tokenizer.pad_token_id,
+                do_sample=config.eval_config.do_sample, temperature=config.eval_config.temperature,
+                top_k=config.eval_config.top_k, top_p=config.eval_config.top_p
+            )
             input_seq_len = batch["input_ids"].shape[1]
             gen_strs_batch = tokenizer.batch_decode(gen_tokens_batch[:, input_seq_len:], skip_special_tokens=True, clean_up_tokenization_spaces=False)
             for gen_str in gen_strs_batch:

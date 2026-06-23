@@ -31,7 +31,7 @@ from typing import Union
 from transformers import AutoConfig
 
 from src.introspector.utils import int_or_str
-from src.introspector.config import DatasetConfig, ExperimentConfig, TrainingConfig
+from src.introspector.config import DatasetConfig, ExperimentConfig, TrainingConfig, EvalConfig
 from src.introspector.signals.schema import ExplicitSignalSpec, FixedTokenSelector, RandomRangeTokenSelector, \
     ExplicitSignalSpec, UniformLayerSampler, SignalSource
 from src.introspector.signals.resolution import resolve_signal_source
@@ -120,6 +120,12 @@ def parse_args() -> argparse.Namespace:
                         help="Comma separated list of names of modules to use for lora adaptor, all-linear targets all "
                              "linear modules")
     parser.add_argument("--lora-dropout", type=float, default=0.05)
+
+    # ---- evaluation (generation params for now) ----
+    parser.add_argument("--do-sample",action="store_true")
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--top-p", type=float, default=1.0)
 
     # ---- paths ----
     parser.add_argument("--cache-dir", default="data")
@@ -228,6 +234,12 @@ def main() -> None:
             lora_target_modules=args.lora_target_modules if "," not in args.lora_target_modules else args.lora_target_modules.split(","),
             lora_dropout=args.lora_dropout,
             bf16=args.bf16
+        ),
+        eval_config = EvalConfig(
+            do_sample=args.do_sample,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
         ),
 
         cache_dir=args.cache_dir,
