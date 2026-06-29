@@ -170,7 +170,7 @@ def create_batch_example(
                 "token_position": batch_token_positions[data_idx],
                 "token": token_str,
                 "activation": signals_activations[signal][data_idx],
-                "target": f"{signals_activations[signal][data_idx]:.{signal.precision}g}",
+                "target": f"{signals_activations[signal][data_idx]:.{signal.precision}f}",
             })
 
     return out
