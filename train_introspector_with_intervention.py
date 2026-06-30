@@ -180,18 +180,24 @@ class InterventionTrainer(Trainer):
             if len(non_ignore) == 0:
                 continue
             start = non_ignore[0].item()
-            if len(tgt) > len(non_ignore): # if new label is longer (e.g. 0.123 -> -0.322)
-                pdb.set_trace()
-                end = min(labels.shape[1], len(labels[i, start:]))
-                labels[i, start:end] = torch.tensor(tgt[: end - start], device=labels.device)
-                attn_mask[i, start:end] = torch.tensor(1, device=labels.device)
-                lora_mask[i, start:end] = torch.tensor(1, device=labels.device)
-            else: # if new label is shorter (e.g. -0.322 -> 0.123), need to flip the other digits
-                end = min(start + len(tgt), labels.shape[1])
-                labels[i, start:end] = torch.tensor(tgt[: end - start], device=labels.device)
-                labels[i, end:] = torch.tensor(-100, device=labels.device)
-                attn_mask[i, end:] = torch.tensor(0, device=labels.device)
-                lora_mask[i, end:] = torch.tensor(0, device=labels.device)
+            # if len(tgt) > len(non_ignore): # if new label is longer (e.g. 0.123 -> -0.322)
+            #     pdb.set_trace()
+            #     end = min(labels.shape[1], len(labels[i, start:]))
+            #     labels[i, start:end] = torch.tensor(tgt[: end - start], device=labels.device)
+            #     attn_mask[i, start:end] = torch.tensor(1, device=labels.device)
+            #     lora_mask[i, start:end] = torch.tensor(1, device=labels.device)
+            # else: # if new label is shorter (e.g. -0.322 -> 0.123), need to flip the other digits
+            #     end = min(start + len(tgt), labels.shape[1])
+            #     labels[i, start:end] = torch.tensor(tgt[: end - start], device=labels.device)
+            #     labels[i, end:] = torch.tensor(-100, device=labels.device)
+            #     attn_mask[i, end:] = torch.tensor(0, device=labels.device)
+            #     lora_mask[i, end:] = torch.tensor(0, device=labels.device)
+            # with normalization of digit str (+0.123 or -0.211), length of new and old string should be same len
+            assert len(tgt) == len(non_ignore), "new random signal not same length as original signal"
+            end = labels.shape[1]
+            labels[i, start:end] = torch.tensor(tgt[: end - start], device=labels.device)
+            attn_mask[i, start:end] = torch.tensor(1, device=labels.device)
+            lora_mask[i, start:end] = torch.tensor(1, device=labels.device)
 
         inputs["labels"] = labels
         inputs["attention_mask"] = attn_mask
