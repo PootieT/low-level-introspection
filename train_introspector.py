@@ -17,6 +17,8 @@ python scripts/train_introspector.py \
 
 from __future__ import annotations
 
+import os
+import glob
 import argparse
 import json
 import math
@@ -148,7 +150,7 @@ def main():
     test_path = cache_dir / "test"
     output_dir = Path(config.output_dir) / config.experiment_name
 
-    if (output_dir / "test_results.json").exists() and not args.overwrite_cache:
+    if (output_dir / "test_pred_results.json").exists() and not args.overwrite_cache:
         print(f"Experiments ran already, skipping.. {output_dir}")
         return
 
@@ -290,8 +292,13 @@ def main():
         compute_metrics=partial(compute_metrics, tokenizer=tokenizer),
         preprocess_logits_for_metrics=get_argmax_from_logits  # otherwise during test prediction it's too much mem
     )
-    train_results = trainer.train()
-
+    ckpt_dirs = glob.glob(f"{output_dir}/checkpoint-*")
+    if ckpt_dirs and not args.overwrite_cache:
+        print(f"Found Trained model, skipping training and loading directly ..")
+        latest_checkpoint_path = max(ckpt_dirs, key=os.path.getctime)
+        train_results = trainer.train(resume_from_checkpoint=latest_checkpoint_path)
+    else:
+        train_results = trainer.train()
     trainer.save_metrics("train", train_results.metrics)
 
     # get dev eval split final metrics
@@ -316,8 +323,7 @@ def main():
     with open(str(output_dir / "history.json"), "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
-    final_dir = output_dir / "adapter_weights"
-
+    # final_dir = output_dir / "adapter_weights"
     # trainer.save_model(str(final_dir))
     # print(f"Saved model to: {final_dir}")
 

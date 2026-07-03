@@ -64,7 +64,12 @@ class ExperimentConfig(BaseModel):
     test_token_selector: TokenSelector
 
     training_config: TrainingConfig
-    eval_config: EvalConfig
+    eval_config: EvalConfig = EvalConfig(
+        do_sample=False,
+        temperature=1.0,
+        top_k=50,
+        top_p=1.0,
+    )
 
     cache_dir: str
     output_dir: str

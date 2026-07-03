@@ -38,7 +38,7 @@ from src.introspector.config import ExperimentConfig, DatasetConfig
 from src.introspector.models.signal_paths import resolve_mlp_signal_path, resolve_resid_signal_path
 from src.introspector.prompts import PROMPT_REGISTRY
 from src.introspector.signals.schema import SignalSpec, TokenSelector
-from src.introspector.utils import get_quantization_config
+from src.introspector.utils import get_quantization_config, float_to_str_target
 
 
 def load_json(path: str | Path) -> dict[str, Any]:
@@ -170,7 +170,7 @@ def create_batch_example(
                 "token_position": batch_token_positions[data_idx],
                 "token": token_str,
                 "activation": signals_activations[signal][data_idx],
-                "target": f"{'+' if signals_activations[signal][data_idx]>0 else ''}{signals_activations[signal][data_idx]:.{signal.precision}f}",
+                "target": float_to_str_target(signals_activations[signal][data_idx], signal.precision) #f"{'+' if signals_activations[signal][data_idx]>0 else ''}{signals_activations[signal][data_idx]:.{signal.precision}f}",
             })
 
     return out

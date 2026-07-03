@@ -47,6 +47,7 @@ from transformers import (
     TrainingArguments,
 )
 
+from src.introspector.utils import float_to_str_target
 from src.introspector.config import ExperimentConfig
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
 from src.introspector.prompts import PROMPT_REGISTRY
@@ -169,7 +170,7 @@ class InterventionTrainer(Trainer):
 
         # Replace target text with intervention values
         precision = self.experiment_config.training_config.precision
-        target_strings = [f"{v.item():.{precision}f}{self.tokenizer.eos_token}" for v in intervention_values]
+        target_strings = [f"{float_to_str_target(v, precision)}{self.tokenizer.eos_token}" for v in intervention_values]
         tokenized_targets = self.tokenizer(target_strings, add_special_tokens=False)["input_ids"]
         labels = inputs["labels"].clone()
         attn_mask = inputs["attention_mask"].clone()
@@ -193,9 +194,11 @@ class InterventionTrainer(Trainer):
             #     attn_mask[i, end:] = torch.tensor(0, device=labels.device)
             #     lora_mask[i, end:] = torch.tensor(0, device=labels.device)
             # with normalization of digit str (+0.123 or -0.211), length of new and old string should be same len
+            # pdb.set_trace()
             assert len(tgt) == len(non_ignore), "new random signal not same length as original signal"
-            end = labels.shape[1]
-            labels[i, start:end] = torch.tensor(tgt[: end - start], device=labels.device)
+            end = min(start + len(tgt), labels.shape[1])
+            labels[i, start:end] = torch.tensor(tgt, device=labels.device)
+            # these two lines technically shouldn't change either
             attn_mask[i, start:end] = torch.tensor(1, device=labels.device)
             lora_mask[i, start:end] = torch.tensor(1, device=labels.device)
 

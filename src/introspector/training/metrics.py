@@ -15,6 +15,7 @@ def get_numericals(pred: np.ndarray, label: np.ndarray, tokenizer) -> Tuple[List
     label_nums = []
     pred_nums = []
     nan_cnt = 0
+    example_nan_gen = []
     for i in range(len(pred)):
         mask = label[i]!=-100
         label_num = float(tokenizer.decode(label[i][mask], skip_special_tokens=True, clean_up_tokenization_spaces=False))
@@ -25,10 +26,13 @@ def get_numericals(pred: np.ndarray, label: np.ndarray, tokenizer) -> Tuple[List
         except:
             # pred_num = np.nan
             nan_cnt += 1
+            example_nan_gen.append(f"raw: {pred_str}, cleaned: {pred_str_cleaned}")
             continue  # skipping NaNs so numerical metrics don't become NaN
         label_nums.append(label_num)
         pred_nums.append(pred_num)
     print(f"Total of {nan_cnt} out of {len(pred)} samples not parsable.")
+    if nan_cnt > 0:
+        print("\n".join(example_nan_gen[:10]))
     return label_nums, pred_nums
 
 
@@ -79,7 +83,12 @@ def compute_metrics_from_numericals(pred_nums: List[float], label_nums:List[floa
     std_diff = np.std(pred_nums) - np.std(label_nums)
 
     # correlation
-    corr, p_value = pearsonr(pred_nums, label_nums)
+    try:
+        corr, p_value = pearsonr(pred_nums, label_nums)
+    except ValueError as e:
+        print("Value error:", e)
+        corr = float("nan")
+        p_value = float("nan")
     return {
         "l2_dist": l2_dist,
         "avg_diff": avg_diff,

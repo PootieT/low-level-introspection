@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1-80
+#$ -t 7-80
 
 ## SCC env setup
 ## Keep track of information related to the current job
@@ -32,6 +32,7 @@ export WANDB_RUN_GROUP=single_neuron_sweep_layer_token
 
 # specify array job params
 index=$(($SGE_TASK_ID-1))
+
 declare -a params
 idx=0
 IFS=' ' # space is set as delimiter
@@ -77,6 +78,7 @@ do
       --eval-batch-size 128 \
       --learning-rate 5e-5 \
       --num-epochs 1 \
+      --bf16 \
       --disable-adapter-in-input \
       --cache-dir data/single_mlp_sweep \
       --output-dir outputs/runs/single_mlp_sweep \
@@ -89,9 +91,14 @@ do
   ## train introspector
   python train_introspector.py \
       --config experiment_configs/single_mlp_sweep/$EXP_NAME.json \
-      --overwrite-cache
+#      --overwrite-cache
 
   ## intervene and check generation
   python intervene_introspector.py \
     --config experiment_configs/single_mlp_sweep/$EXP_NAME.json
+
+  ## delete model checkpoints to save space
+  python utils/delete_checkpoint_after_experiment_completion.py \
+    --config experiment_configs/single_mlp_sweep/$EXP_NAME.json \
+    --expected-files "test_results.json,test_pred_results.json,intervention_results_metrics.json"
 done

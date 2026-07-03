@@ -15,6 +15,8 @@ def int_or_str(value):
         except ValueError:
             return value
 
+def float_to_str_target(value: float, precision=3):
+    return f"{'+' if value > 0 else ''}{value:.{precision}f}"
 
 def get_quantization_config(config: ExperimentConfig):
     q_config = None
