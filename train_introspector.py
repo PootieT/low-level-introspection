@@ -32,7 +32,7 @@ from typing import Tuple
 from tqdm import tqdm
 import numpy as np
 import torch
-from datasets import load_from_disk
+from datasets import load_from_disk, Dataset
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader
 from transformers import (
@@ -305,20 +305,6 @@ def main():
     dev_results = trainer.evaluate()
     trainer.save_metrics("dev", dev_results)
 
-    # for test split (splitting eval into different subsets to control for e.g.token overlap)
-    test_outputs = trainer.predict(test_dataset)
-    test_predictions = test_outputs.predictions
-    test_label_ids = test_outputs.label_ids
-    full_test_results = compute_metrics((test_predictions, test_label_ids), tokenizer=tokenizer)
-    train_tokens = set(train_dataset_raw["token"])
-    seen_token_mask = test_dataset_raw.map(lambda ex: {"seen":True if ex["token"] in train_tokens else False}, remove_columns=test_dataset_raw.column_names)
-    seen_token_mask = np.array(list(seen_token_mask["seen"]))
-    seen_token_test_results = compute_metrics([test_predictions[seen_token_mask], test_label_ids[seen_token_mask]], tokenizer=tokenizer)
-    unseen_token_test_results = compute_metrics([test_predictions[~seen_token_mask], test_label_ids[~seen_token_mask]], tokenizer=tokenizer)
-    trainer.save_metrics("test", full_test_results)
-    trainer.save_metrics("test_seen_token", seen_token_test_results)
-    trainer.save_metrics("test_unseen_token", unseen_token_test_results)
-
     history = trainer.state.log_history
     with open(str(output_dir / "history.json"), "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
@@ -327,10 +313,41 @@ def main():
     # trainer.save_model(str(final_dir))
     # print(f"Saved model to: {final_dir}")
 
+    # for test split (splitting eval into different subsets to control for e.g.token overlap)
+    evaluate_test_split(config, model, pred_collator, test_dataset, test_dataset_pred, test_dataset_raw, tokenizer,
+                        train_dataset_raw, trainer)
+
+
+def evaluate_test_split(
+    config: ExperimentConfig,
+    model: AutoModelForCausalLM,
+    pred_collator: DataCollatorForSeq2Seq,
+    test_dataset: Dataset,
+    test_dataset_pred: Dataset,
+    test_dataset_raw: Dataset,
+    tokenizer: AutoTokenizer,
+    train_dataset_raw: Dataset,
+    trainer: Trainer
+):
+    """ All evaluation logic for test split (next-token-prediction eval + generation eval)"""
+    test_outputs = trainer.predict(test_dataset)
+    test_predictions = test_outputs.predictions
+    test_label_ids = test_outputs.label_ids
+    full_test_results = compute_metrics((test_predictions, test_label_ids), tokenizer=tokenizer)
+    train_tokens = set(train_dataset_raw["token"])
+    seen_token_mask = test_dataset_raw.map(lambda ex: {"seen": True if ex["token"] in train_tokens else False},
+                                           remove_columns=test_dataset_raw.column_names)
+    seen_token_mask = np.array(list(seen_token_mask["seen"]))
+    seen_token_test_results = compute_metrics([test_predictions[seen_token_mask], test_label_ids[seen_token_mask]],
+                                              tokenizer=tokenizer)
+    unseen_token_test_results = compute_metrics([test_predictions[~seen_token_mask], test_label_ids[~seen_token_mask]],
+                                                tokenizer=tokenizer)
+    trainer.save_metrics("test", full_test_results)
+    trainer.save_metrics("test_seen_token", seen_token_test_results)
+    trainer.save_metrics("test_unseen_token", unseen_token_test_results)
     # now evaluate using prediction (autoregressive generation)
     if not config.training_config.disable_adapter_in_input:
-        exit() # Not implemented yet
-
+        exit()  # Not implemented yet
     dataloader = DataLoader(
         test_dataset_pred,
         batch_size=config.training_config.train_batch_size,
@@ -343,12 +360,13 @@ def main():
         for batch in tqdm(dataloader):
             batch = batch.to(model.device)
             gen_tokens_batch = model.generate(
-                **batch, max_new_tokens=config.training_config.precision+2, pad_token_id=tokenizer.pad_token_id,
+                **batch, max_new_tokens=config.training_config.precision + 2, pad_token_id=tokenizer.pad_token_id,
                 do_sample=config.eval_config.do_sample, temperature=config.eval_config.temperature,
                 top_k=config.eval_config.top_k, top_p=config.eval_config.top_p
             )
             input_seq_len = batch["input_ids"].shape[1]
-            gen_strs_batch = tokenizer.batch_decode(gen_tokens_batch[:, input_seq_len:], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            gen_strs_batch = tokenizer.batch_decode(gen_tokens_batch[:, input_seq_len:], skip_special_tokens=True,
+                                                    clean_up_tokenization_spaces=False)
             for gen_str in gen_strs_batch:
                 try:
                     gen_str_clean = re.sub(r'[^0-9.\-+]', '', gen_str)
@@ -356,18 +374,15 @@ def main():
                 except:
                     gen_num = np.nan
                 gen_nums.append(gen_num)
-
     labels = np.array([float(a) for a in test_dataset_raw["target"]])
     gen_nums = np.array(gen_nums)
-    if config.experiment_name.startswith("r16_alpha32"):
-        pdb.set_trace()
     test_pred_metrics = compute_metrics_from_numericals(gen_nums, labels)
     seen_token_test_pred_results = compute_metrics_from_numericals(gen_nums[seen_token_mask], labels[seen_token_mask])
-    unseen_token_test_pred_results = compute_metrics_from_numericals(gen_nums[~seen_token_mask], labels[~seen_token_mask])
+    unseen_token_test_pred_results = compute_metrics_from_numericals(gen_nums[~seen_token_mask],
+                                                                     labels[~seen_token_mask])
     trainer.save_metrics("test_pred", test_pred_metrics)
     trainer.save_metrics("test_pred_seen_token", seen_token_test_pred_results)
     trainer.save_metrics("test_pred_unseen_token", unseen_token_test_pred_results)
-
 
 
 if __name__ == "__main__":
