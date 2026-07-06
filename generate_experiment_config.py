@@ -112,6 +112,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-adapter-in-input", action="store_true",
                         help="Whether to deactivate LoRA adaptor in input")
     parser.add_argument("--prompt-type", type=str, default="prompt_no_token_index")
+    parser.add_argument("--use-regressor", action="store_true",
+                        help="Whether to use regressor or default language head")
 
     # ---- lora ----
     parser.add_argument("--lora-r", type=int, default=16)
@@ -219,6 +221,8 @@ def main() -> None:
         train_token_selector=train_token_selector,
         dev_token_selector=dev_token_selector,
         test_token_selector=test_token_selector,
+
+        use_regressor=args.use_regressor,
 
         training_config =TrainingConfig(
             learning_rate=args.learning_rate,

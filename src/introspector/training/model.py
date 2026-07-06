@@ -3,11 +3,15 @@ import threading
 from typing import Any, Optional
 
 import torch
+from torch import nn
 from peft.tuners.lora.layer import Linear
 
 from peft import PeftModelForCausalLM, LoraConfig
 from peft.tuners.lora import LoraLayer
 from peft.tuners.lora.layer import Linear
+from transformers import AutoModelForCausalLM
+
+
 
 
 
@@ -81,6 +85,179 @@ def replace_model_with_gated_version(model: PeftModelForCausalLM):
             set_lora_masks(model, None)
     model.generate = generate_with_mask
 
+# class IntrospectionRegressionModel(PeftModelForCausalLM):
+#
+#     def __init__(self,model):
+#         # do NOT call super().__init__ because we already HAVE a fully-built peft model instance
+#         self.__dict__ = model.__dict__
+#         self.regression_head = nn.Linear(self.config.hidden_size,1,bias=False)
+#
+#     def forward(
+#         self,
+#         *args,
+#         labels=None,
+#         regression_token_positions=-1,
+#         output_hidden_states=True,
+#         **kwargs,
+#     ):
+#         outputs = super().forward(*args,output_hidden_states=True,**kwargs)
+#         hidden = outputs.hidden_states[-1]
+#         bs = hidden.shape[0]
+#
+#         batch_idx = torch.arange(bs,device=hidden.device)
+#         selected_hidden = hidden[batch_idx,regression_token_positions]
+#
+#         pred = self.regression_head(selected_hidden).squeeze(-1)
+#
+#         loss = None
+#         if labels is not None:
+#             regression_labels = labels.to(pred.dtype)
+#             try:
+#                 loss = nn.functional.mse_loss(pred,regression_labels)
+#             except Exception as e:
+#                 print(e)
+#                 pdb.set_trace()
+#
+#         # attach for trainer / metrics
+#         # outputs.regression_predictions = pred
+#         outputs.logits = pred
+#         # overwrite loss
+#         outputs.loss = loss
+#         # pdb.set_trace()
+#         return outputs
 
+# ============================================================
+# Hook helpers
+# ============================================================
+class InterventionHook:
+    # TODO extend to other types of signals
+    def __init__(self, token_positions, signal_indices, intervention_values):
+        """
+        token_positions: [bs]
+        signal_indices: [bs]
+        intervention_values: [bs]
+        """
+        self.token_positions = token_positions
+        self.neuron_indices = signal_indices
+        self.intervention_values = intervention_values
 
+    def __call__(self, module, inputs, outputs):
+        # outputs shape:
+        # [bs, seq, hidden]
+        outputs = outputs.clone()
+        bs = outputs.shape[0]
+        batch_idx = torch.arange(bs, device=outputs.device)
 
+        outputs[
+            batch_idx,
+            self.token_positions,
+            self.neuron_indices,
+        ] = self.intervention_values.to(outputs.dtype)
+
+        return outputs
+
+class IntrospectionRegressionModel(PeftModelForCausalLM):
+
+    def __init__(
+        self,
+        model,
+        signal_ranges,
+        intervention_fn=None,
+    ):
+        # IMPORTANT: do NOT call super().__init__
+        self.__dict__ = model.__dict__
+        self.regression_head = nn.Linear(self.config.hidden_size, 1,bias=False)
+        self.signal_ranges = signal_ranges  # {(layer, idx): (low, high)}
+        self.intervention_fn = intervention_fn  # optional custom intervention sampler
+
+    def sample_intervention_values(self,signal_layers,signal_indices,device):
+        vals = []
+        for layer, idx in zip(signal_layers.tolist(),signal_indices.tolist()):
+            low, high = self.signal_ranges[(layer, idx)]
+            if self.intervention_fn is not None:
+                val = self.intervention_fn(layer=layer,idx=idx,low=low,high=high)
+            else:
+                val = random.uniform(low, high)
+            vals.append(val)
+
+        return torch.tensor(vals,device=device,dtype=torch.float32)
+
+    def forward(
+        self,
+        *args,
+        token_position=None, # intervention inputs
+        signal_layer=None,
+        signal_index=None,
+        regression_token_positions=-1, # regression
+        labels=None, # labels for regression are scalar and shifted tokens otherwise
+        do_intervention=True,
+        output_hidden_states=True,
+        **kwargs,
+    ):
+        # avoid mutating HF internals
+        kwargs = kwargs.copy()
+
+        hooks = []
+        intervention_values = None
+        try:
+            # REGISTER INTERVENTION HOOKS
+            if (
+                do_intervention
+                and token_position is not None
+                and signal_layer is not None
+                and signal_index is not None
+            ):
+                bs = token_position.shape[0]
+                device = token_position.device
+
+                # sample interventions INSIDE forward
+                intervention_values = self.sample_intervention_values(signal_layer,signal_index,device)
+                unique_layers = torch.unique(signal_layer)
+                for layer in unique_layers.tolist():
+                    mask = signal_layer == layer
+                    hook = InterventionHook(
+                        token_positions=token_position[mask],
+                        signal_indices=signal_index[mask],
+                        intervention_values=intervention_values[mask],
+                    )
+
+                    # TODO:
+                    # replace with your signal resolver
+                    module_path = resolve_mlp_signal_path(self,layer,path_to_output=False,)
+                    module = operator.attrgetter(module_path)(self)
+                    handle =  module.register_forward_hook(hook)
+                    hooks.append(handle)
+
+                # regression target = intervention value
+                if labels is not None and labels.ndim == 1:
+                    labels = intervention_values
+
+            # BASE MODEL FORWARD
+            outputs = super().forward(
+                *args,
+                output_hidden_states=True,
+                **kwargs,
+            )
+
+            # REGRESSION MODE
+            if labels is not None and labels.ndim == 1:
+                hidden = outputs.hidden_states[-1]
+                bs = hidden.shape[0]
+                batch_idx = torch.arange(bs,device=hidden.device)
+                selected_hidden = hidden[batch_idx,regression_token_positions]
+                pred = self.regression_head(selected_hidden).squeeze(-1)
+                regression_labels = labels.to(pred.dtype)
+                loss = nn.functional.mse_loss(pred,regression_labels,)
+
+                # Trainer expects logits
+                outputs.logits = pred
+                outputs.loss = loss
+                # debugging
+                outputs.intervention_values = intervention_values
+
+            return outputs
+
+        finally:
+            # ALWAYS cleanup hooks
+            for h in hooks:
+                h.remove()

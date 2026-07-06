@@ -63,6 +63,8 @@ class ExperimentConfig(BaseModel):
     dev_token_selector: TokenSelector
     test_token_selector: TokenSelector
 
+    use_regressor: bool=False
+
     training_config: TrainingConfig
     eval_config: EvalConfig = EvalConfig(
         do_sample=False,

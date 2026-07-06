@@ -47,22 +47,27 @@ def compute_l2_dist(label_nums: List[float], pred_nums: List[float]):
 
 def compute_metrics(eval_pred: Tuple[np.ndarray, np.ndarray], tokenizer: PreTrainedTokenizerBase):
     pred, label = eval_pred
-    pred = pred[..., :-1]
-    labels = label[..., 1:]
-    non_prompt_mask = labels != -100
+    metrics = {}
+    if not (pred.ndim==label.ndim==1): # not regressor
+        pred = pred[..., :-1]
+        labels = label[..., 1:]
+        non_prompt_mask = labels != -100
+    
+        # compute exact match token by token
+        match = np.ma.masked_array(pred == labels, mask=~non_prompt_mask)
+        exact_match = match.all(axis=1).mean()
+        mean_char_match = match.mean(axis=1).mean()
+        metrics.update({
+            "exact_match": exact_match,
+            "mean_char_match": mean_char_match,
+        })
 
-    # compute exact match token by token
-    match = np.ma.masked_array(pred == labels, mask=~non_prompt_mask)
-    exact_match = match.all(axis=1).mean()
-    mean_char_match = match.mean(axis=1).mean()
-
-    # get numerical labels and predictions
-    label_nums, pred_nums = get_numericals(pred, labels, tokenizer)
-
+        # get numerical labels and predictions
+        label_nums, pred_nums = get_numericals(pred, labels, tokenizer)
+    else: # regressor
+        pred_nums, label_nums = pred, label
     numerical_metrics = compute_metrics_from_numericals(pred_nums, label_nums)
     return {
-        "exact_match": exact_match,
-        "mean_char_match": mean_char_match,
         **numerical_metrics,
     }
 
