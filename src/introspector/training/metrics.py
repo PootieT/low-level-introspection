@@ -90,14 +90,15 @@ def compute_metrics_from_numericals(pred_nums: List[float], label_nums:List[floa
     # correlation
     try:
         corr, p_value = pearsonr(pred_nums, label_nums)
+        corr, p_value = corr.item(), p_value.item()
     except ValueError as e:
         print("Value error:", e)
         corr = float("nan")
         p_value = float("nan")
     return {
-        "l2_dist": l2_dist,
-        "avg_diff": avg_diff,
-        "std_diff": std_diff,
+        "l2_dist": l2_dist.item(),
+        "avg_diff": avg_diff.item(),
+        "std_diff": std_diff.item(),
         "corr": corr,
         "corr_p_value": p_value,
     }

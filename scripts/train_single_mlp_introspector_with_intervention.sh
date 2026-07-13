@@ -20,10 +20,10 @@ echo "Job ID : $JOB_ID  $SGE_TASK_ID"
 echo "=========================================================="
 nvidia-smi
 
-module load cuda/11.8   # 11.2
-module load miniconda/23.11.0
-conda activate /projectnb/llamagrp/peter/low-level-introspection/introspection_env
-#conda activate introspection
+#module load cuda/11.8   # 11.2
+#module load miniconda/23.11.0
+#conda activate /projectnb/llamagrp/peter/low-level-introspection/introspection_env
+conda activate introspection
 
 ## environment setup
 export WANDB_PROJECT=low-level-introspection
@@ -44,7 +44,7 @@ LORA_ALPHA=32
 ## vary lr
 LRS=(5e-5 1e-6 5e-7 2e-7 1e-7 5e-8)
 LR=${LRS[$index]}
-#LR=5e-5
+LR=5e-5
 
 ## dropout
 LORA_DOS=(0.1 0.15 0.2 0.3 0.4 0.5 0.6 0.7 0.8)
@@ -53,7 +53,7 @@ LORA_DO=0.05
 
 
 ### generate experiment config first as JSON
-EXP_NAME="intervention_train_reg_N1.24_r${LORA_R}_alpha${LORA_ALPHA}_lr${LR}_3K"
+EXP_NAME="intervention_train_reg_N1.24_r${LORA_R}_alpha${LORA_ALPHA}_lr${LR}_3K_debug"
 python generate_experiment_config.py \
     --experiment-name $EXP_NAME \
     --model meta-llama/Llama-3.2-1B \

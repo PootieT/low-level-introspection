@@ -23,6 +23,8 @@ import argparse
 import json
 import math
 import pdb
+
+import pandas as pd
 import regex as re
 import threading
 from functools import partial
@@ -41,6 +43,8 @@ from transformers import (
     Trainer,
     TrainingArguments, PreTrainedTokenizerBase, DataCollatorForSeq2Seq,
 )
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from src.introspector.config import ExperimentConfig
 from src.introspector.training.collator import LoRAGatingCollator
@@ -345,9 +349,16 @@ def evaluate_test_split(
     trainer.save_metrics("test", full_test_results)
     trainer.save_metrics("test_seen_token", seen_token_test_results)
     trainer.save_metrics("test_unseen_token", unseen_token_test_results)
+    output_dir = Path(config.output_dir) / config.experiment_name
+    pred_df = pd.DataFrame({"predictions": test_predictions, "labels": test_label_ids})
+    pred_df.to_csv(str(output_dir / "test_predictions.json"), index=False)
+    sns.scatterplot(x="labels", y="predictions", data=pred_df)
+    plt.savefig(str(output_dir / "test_predictions_scatter.png"))
+
     # now evaluate using prediction (autoregressive generation)
-    if not config.training_config.disable_adapter_in_input:
-        exit()  # Not implemented yet
+    if not config.training_config.disable_adapter_in_input or config.use_regressor:
+        exit()  # Not implemented yet, and doesn't apply for regressor
+
     dataloader = DataLoader(
         test_dataset_pred,
         batch_size=config.training_config.train_batch_size,

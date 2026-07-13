@@ -205,102 +205,56 @@ class InterventionTrainer(Trainer):
     #
     #     return (loss, outputs) if return_outputs else loss
 
-    ```python
-    # ============================================================
-    # TRAINER
-    # ============================================================
-
-    from transformers import Trainer
-
-    class InterventionTrainer(Trainer):
-
-        def __init__(
-                self,
-                *args,
-                tokenizer,
-                experiment_config,
-                **kwargs,
-        ):
-            super().__init__(*args, **kwargs)
-
-            self.tokenizer = tokenizer
-
-            self.experiment_config = (
-                experiment_config
-            )
-
-        def compute_loss(
-                self,
-                model,
-                inputs,
-                return_outputs=False,
-                **kwargs,
-        ):
-            # clone to avoid HF mutation weirdness
-            inputs = inputs.copy()
-            # ====================================================
-            # REGRESSION MODE
-            # ====================================================
-            if self.experiment_config.use_regressor:
-                # labels should be original activations
-                # model.forward will overwrite them
-                # with intervention values internally
-                inputs["labels"] = inputs["activation"]
-
-            # ====================================================
-            # TEXT GENERATION MODE
-            # ====================================================
-            else:
-                # standard LM labels
-                pass
-
-            outputs = model(**inputs)
-
-            loss = outputs.loss
-
-            return (
-                (loss, outputs)
-                if return_outputs
-                else loss
-            )
-
-        def prediction_step(
+    def compute_loss(
             self,
             model,
             inputs,
-            prediction_loss_only,
-            ignore_keys=None,
-        ):
-            # make evaluation/predict
-            # use EXACT SAME LOGIC
-            inputs = inputs.copy()
-            if self.experiment_config.use_regressor:
-                inputs["labels"] = inputs["activation"]
+            return_outputs=False,
+            **kwargs,
+    ):
+        # clone to avoid HF mutation weirdness
+        inputs = inputs.copy()
+        # ====================================================
+        # REGRESSION MODE
+        # ====================================================
+        if self.experiment_config.use_regressor:
+            # labels should be original activations
+            # model.forward will overwrite them
+            # with intervention values internally
+            inputs["labels"] = inputs["activation"]
 
-            with torch.no_grad():
-                outputs = model(**inputs)
+        # ====================================================
+        # TEXT GENERATION MODE
+        # ====================================================
+        else:
+            # standard LM labels
+            pass
 
-            loss = outputs.loss.detach()
-            preds = outputs.logits.detach().float()
+        outputs = model(**inputs)
+        loss = outputs.loss
+        return (loss, outputs) if return_outputs else loss
 
-            # IMPORTANT: compare against intervention values, NOT original activations
-            labels =  outputs.intervention_values.detach().float()
-            return loss, preds, labels
-
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None, ):
-        # make evaluation/predict use EXACT SAME LOGIC
+    def prediction_step(
+        self,
+        model,
+        inputs,
+        prediction_loss_only,
+        ignore_keys=None,
+    ):
+        # make evaluation/predict, use EXACT SAME LOGIC
         inputs = inputs.copy()
         if self.experiment_config.use_regressor:
-            inputs["labels"] = inputs[ "activation" ]
+            inputs["labels"] = inputs["activation"]
 
         with torch.no_grad():
             outputs = model(**inputs)
 
         loss = outputs.loss.detach()
         preds = outputs.logits.detach().float()
-        # IMPORTANT:compare against intervention values, NOT original activations
-        labels = outputs.intervention_values.detach().float())
+        # IMPORTANT: compare against intervention values, NOT original activations
+        labels = outputs.intervention_values.detach().float()
         return loss, preds, labels
+
 
     # def prediction_step(
     #     self,
@@ -344,7 +298,7 @@ def main():
     test_path = cache_dir / "test"
     output_dir = Path(config.output_dir) / f"{config.experiment_name}"
 
-    if (output_dir / "test_pred_results.json").exists() and not args.overwrite_cache:
+    if (output_dir / "test_results.json").exists() and not args.overwrite_cache:
         print(f"Experiments ran already, skipping.. {output_dir}")
         return
 
@@ -370,7 +324,7 @@ def main():
     grouped = df.groupby(["signal_layer", "signal_index"])["activation"]
     signal_ranges = {}
     for key, vals in grouped:
-        signal_ranges[key] = (float(vals.min()),float(vals.max()),)
+        signal_ranges[key] = (float(vals.min()), float(vals.max()),)
 
     # ========================================================
     # Preprocess datasets
@@ -402,12 +356,11 @@ def main():
         remove_columns=dev_dataset_raw.column_names,
     )
     test_dataset = test_dataset_raw.map(
-        partial(preprocess, keep_signal_specs=False),
+        partial(preprocess, keep_signal_specs=True),
         remove_columns=test_dataset_raw.column_names,
     )
-    # TODO test prediction data
     test_dataset_pred = test_dataset_raw.map(
-        partial(preprocess, for_prediction=True, keep_signal_specs=False),
+        partial(preprocess, for_prediction=True, keep_signal_specs=True),
         remove_columns=test_dataset_raw.column_names,
     )
     
@@ -431,7 +384,7 @@ def main():
     model.resize_token_embeddings(len(tokenizer))
 
     if config.use_regressor:
-        model = IntrospectionRegressionModel(model)
+        model = IntrospectionRegressionModel(model, signal_ranges=signal_ranges)
         # model.__class__ = IntrospectionRegressionModel
         # model.regression_head = nn.Linear(model.config.hidden_size,1,bias=False,)
 

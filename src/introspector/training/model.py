@@ -1,16 +1,15 @@
 import pdb
-import threading
+import random
+import operator
 from typing import Any, Optional
 
 import torch
 from torch import nn
+
+from peft import PeftModelForCausalLM
 from peft.tuners.lora.layer import Linear
 
-from peft import PeftModelForCausalLM, LoraConfig
-from peft.tuners.lora import LoraLayer
-from peft.tuners.lora.layer import Linear
-from transformers import AutoModelForCausalLM
-
+from src.introspector.models.signal_paths import resolve_mlp_signal_path
 
 
 
@@ -166,7 +165,7 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
     ):
         # IMPORTANT: do NOT call super().__init__
         self.__dict__ = model.__dict__
-        self.regression_head = nn.Linear(self.config.hidden_size, 1,bias=False)
+        self.regression_head = nn.Linear(self.config.hidden_size, 1, bias=True)
         self.signal_ranges = signal_ranges  # {(layer, idx): (low, high)}
         self.intervention_fn = intervention_fn  # optional custom intervention sampler
 
@@ -221,8 +220,6 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
                         intervention_values=intervention_values[mask],
                     )
 
-                    # TODO:
-                    # replace with your signal resolver
                     module_path = resolve_mlp_signal_path(self,layer,path_to_output=False,)
                     module = operator.attrgetter(module_path)(self)
                     handle =  module.register_forward_hook(hook)
@@ -248,12 +245,10 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
                 pred = self.regression_head(selected_hidden).squeeze(-1)
                 regression_labels = labels.to(pred.dtype)
                 loss = nn.functional.mse_loss(pred,regression_labels,)
-
                 # Trainer expects logits
                 outputs.logits = pred
                 outputs.loss = loss
-                # debugging
-                outputs.intervention_values = intervention_values
+                outputs["intervention_values"] = intervention_values
 
             return outputs
 
