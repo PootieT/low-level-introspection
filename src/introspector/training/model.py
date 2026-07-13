@@ -165,7 +165,19 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
     ):
         # IMPORTANT: do NOT call super().__init__
         self.__dict__ = model.__dict__
+        # Keep the head in fp32 for stable MSE regression, but move it onto the
+        # base model's device so it does not silently sit on CPU when the base
+        # model is dispatched with device_map / loaded in bf16 (which would
+        # otherwise throw a device/dtype mismatch at the head matmul).
         self.regression_head = nn.Linear(self.config.hidden_size, 1, bias=True)
+        _base_param = next(model.parameters())
+        self.regression_head = self.regression_head.to(device=_base_param.device)
+        print(
+            f"[IntrospectionRegressionModel] base model dtype={_base_param.dtype}, "
+            f"device={_base_param.device} | regression_head dtype="
+            f"{self.regression_head.weight.dtype}, device={self.regression_head.weight.device}"
+        )
+        self._printed_forward_dtypes = False
         self.signal_ranges = signal_ranges  # {(layer, idx): (low, high)}
         self.intervention_fn = intervention_fn  # optional custom intervention sampler
 
@@ -242,6 +254,19 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
                 bs = hidden.shape[0]
                 batch_idx = torch.arange(bs,device=hidden.device)
                 selected_hidden = hidden[batch_idx,regression_token_positions]
+                head_device = self.regression_head.weight.device
+                head_dtype = self.regression_head.weight.dtype
+                if not self._printed_forward_dtypes:
+                    print(
+                        f"[IntrospectionRegressionModel.forward] hidden dtype="
+                        f"{selected_hidden.dtype}, device={selected_hidden.device} -> "
+                        f"head dtype={head_dtype}, device={head_device}; "
+                        f"do_intervention={do_intervention}, labels dtype={labels.dtype}"
+                    )
+                    self._printed_forward_dtypes = True
+                # cast hidden to the head's device/dtype so a bf16/device-mapped
+                # base model does not mismatch the fp32 head
+                selected_hidden = selected_hidden.to(device=head_device, dtype=head_dtype)
                 pred = self.regression_head(selected_hidden).squeeze(-1)
                 regression_labels = labels.to(pred.dtype)
                 loss = nn.functional.mse_loss(pred,regression_labels,)

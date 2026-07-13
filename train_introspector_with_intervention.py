@@ -84,6 +84,11 @@ def parse_args():
     )
     parser.add_argument("--overwrite-cache", action="store_true",
                         help="Whether to overwrite cached experiment files if there exist one")
+    parser.add_argument("--no-intervention", action="store_true",
+                        help="Disable causal intervention. For the regressor this trains/evaluates against "
+                             "the ORIGINAL activation instead of a random intervened value, which is a "
+                             "sanity check that the regression head can read a scalar out of the hidden "
+                             "states at all.")
 
 
     return parser.parse_args()
@@ -108,12 +113,14 @@ class InterventionTrainer(Trainer):
         signal_ranges,
         tokenizer: AutoTokenizer,
         experiment_config: ExperimentConfig,
+        do_intervention: bool = True,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.signal_ranges = signal_ranges
         self.tokenizer = tokenizer
         self.experiment_config = experiment_config
+        self.do_intervention = do_intervention
 
     # def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
     #     # if we want to evaluate without intervention for example, then we skip the new logic
@@ -218,9 +225,9 @@ class InterventionTrainer(Trainer):
         # REGRESSION MODE
         # ====================================================
         if self.experiment_config.use_regressor:
-            # labels should be original activations
-            # model.forward will overwrite them
-            # with intervention values internally
+            # labels should be original activations. When intervention is on,
+            # model.forward overwrites them with the sampled intervention value
+            # internally; when off, they stay as the true activation target.
             inputs["labels"] = inputs["activation"]
 
         # ====================================================
@@ -229,6 +236,9 @@ class InterventionTrainer(Trainer):
         else:
             # standard LM labels
             pass
+
+        if not self.do_intervention:
+            inputs["do_intervention"] = False
 
         outputs = model(**inputs)
         loss = outputs.loss
@@ -241,18 +251,30 @@ class InterventionTrainer(Trainer):
         prediction_loss_only,
         ignore_keys=None,
     ):
-        # make evaluation/predict, use EXACT SAME LOGIC
+        # for the text-generation model there is no regression head /
+        # intervention_values, so use the default HF prediction path
+        if not self.experiment_config.use_regressor:
+            return super().prediction_step(
+                model, inputs, prediction_loss_only, ignore_keys=ignore_keys
+            )
+
+        # make evaluation/predict, use EXACT SAME LOGIC as compute_loss
         inputs = inputs.copy()
-        if self.experiment_config.use_regressor:
-            inputs["labels"] = inputs["activation"]
+        inputs["labels"] = inputs["activation"]
+        if not self.do_intervention:
+            inputs["do_intervention"] = False
 
         with torch.no_grad():
             outputs = model(**inputs)
 
         loss = outputs.loss.detach()
         preds = outputs.logits.detach().float()
-        # IMPORTANT: compare against intervention values, NOT original activations
-        labels = outputs.intervention_values.detach().float()
+        if self.do_intervention:
+            # IMPORTANT: compare against the intervened values, NOT original activations
+            labels = outputs.intervention_values.detach().float()
+        else:
+            # sanity-check mode: target is the true, un-intervened activation
+            labels = inputs["activation"].detach().float()
         return loss, preds, labels
 
 
@@ -435,8 +457,12 @@ def main():
         data_collator=pred_collator if config.use_regressor else collator,
         compute_metrics=partial(compute_metrics,tokenizer=tokenizer),
         preprocess_logits_for_metrics=None if config.use_regressor else get_argmax_from_logits,
-        experiment_config=config
+        experiment_config=config,
+        do_intervention=not args.no_intervention,
     )
+    if args.no_intervention:
+        print("[train_introspector_with_intervention] --no-intervention set: "
+              "training/evaluating the regressor against the ORIGINAL activation (sanity check).")
     ckpt_dirs = glob.glob(f"{output_dir}/checkpoint-*")
     if ckpt_dirs and not args.overwrite_cache:
         print(f"Found Trained model, skipping training and loading directly ..")
