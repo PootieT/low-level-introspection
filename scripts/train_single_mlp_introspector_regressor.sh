@@ -97,3 +97,5 @@ python train_introspector_with_intervention.py \
 #python intervene_introspector.py \
 #    --config "experiment_configs/internvetion_train/${EXP_NAME}.json"
 
+# This works, which means regressor heads is implemented correctly without intervention training
+# so the culprit is really intervention training. Let's figure out how to get this to work

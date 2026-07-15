@@ -114,6 +114,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-type", type=str, default="prompt_no_token_index")
     parser.add_argument("--use-regressor", action="store_true",
                         help="Whether to use regressor or default language head")
+    parser.add_argument("--intervention-signal-distribution", type=str, default="uniform",
+                        choices=["uniform", "gaussian", "extreme"],
+                        help="Distribution to sample the injected value from at intervention time. "
+                             "'uniform' draws U(min, max); 'gaussian' fits N(mean, std) to the neuron's "
+                             "empirical activations (better matches the real, skewed activation distribution); "
+                             "'extreme' draws uniformly from a range intervention-extreme-scale x wider than "
+                             "the empirical range (sanity check: does an exaggerated signal force the model "
+                             "to learn to read it).")
+    parser.add_argument("--intervention-extreme-scale", type=float, default=1000.0,
+                        help="Multiplier on the empirical range width used when "
+                             "--intervention-signal-distribution=extreme. Sweep this to find where the "
+                             "model starts tracking the intervened value.")
 
     # ---- lora ----
     parser.add_argument("--lora-r", type=int, default=16)
@@ -225,6 +237,8 @@ def main() -> None:
         use_regressor=args.use_regressor,
 
         training_config =TrainingConfig(
+            intervention_signal_distribution=args.intervention_signal_distribution,
+            intervention_extreme_scale=args.intervention_extreme_scale,
             learning_rate=args.learning_rate,
             train_batch_size=args.train_batch_size,
             eval_batch_size=args.eval_batch_size,

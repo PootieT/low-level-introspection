@@ -11,6 +11,11 @@ from peft.tuners.lora.layer import Linear
 
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
 
+# default multiplier for the "extreme" intervention sanity check (samples
+# uniformly from a range EXTREME_SCALE x wider than empirical, centered on the
+# empirical midpoint). Override per-experiment via TrainingConfig.intervention_extreme_scale
+EXTREME_SCALE = 1000.0
+
 
 
 
@@ -161,6 +166,8 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
         self,
         model,
         signal_ranges,
+        intervention_distribution="uniform",
+        intervention_extreme_scale=EXTREME_SCALE,
         intervention_fn=None,
     ):
         # IMPORTANT: do NOT call super().__init__
@@ -178,17 +185,35 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
             f"{self.regression_head.weight.dtype}, device={self.regression_head.weight.device}"
         )
         self._printed_forward_dtypes = False
-        self.signal_ranges = signal_ranges  # {(layer, idx): (low, high)}
+        # {(layer, idx): {"min","max","mean","std"}}
+        self.signal_ranges = signal_ranges
+        self.intervention_distribution = intervention_distribution
+        self.intervention_extreme_scale = intervention_extreme_scale
         self.intervention_fn = intervention_fn  # optional custom intervention sampler
 
     def sample_intervention_values(self,signal_layers,signal_indices,device):
         vals = []
         for layer, idx in zip(signal_layers.tolist(),signal_indices.tolist()):
-            low, high = self.signal_ranges[(layer, idx)]
+            stats = self.signal_ranges[(layer, idx)]
             if self.intervention_fn is not None:
-                val = self.intervention_fn(layer=layer,idx=idx,low=low,high=high)
+                val = self.intervention_fn(layer=layer, idx=idx, **stats)
+            elif self.intervention_distribution == "gaussian":
+                # fit a gaussian to the neuron's empirical activations and draw from it
+                val = random.gauss(stats["mean"], stats["std"])
+            elif self.intervention_distribution == "uniform":
+                val = random.uniform(stats["min"], stats["max"])
+            elif self.intervention_distribution == "extreme":
+                # sanity check: sample from a range intervention_extreme_scale x
+                # wider than the empirical range, centered on the empirical
+                # midpoint. The much larger signal should be easier to read out if
+                # the model can read the neuron at all.
+                center = (stats["min"] + stats["max"]) / 2
+                half_width = self.intervention_extreme_scale * (stats["max"] - stats["min"]) / 2
+                val = random.uniform(center - half_width, center + half_width)
             else:
-                val = random.uniform(low, high)
+                raise ValueError(
+                    f"Unknown intervention_distribution: {self.intervention_distribution!r}"
+                )
             vals.append(val)
 
         return torch.tensor(vals,device=device,dtype=torch.float32)

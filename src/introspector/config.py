@@ -34,6 +34,14 @@ class TrainingConfig(BaseModel):
     prompt_type: str = "prompt_no_token_index"
     precision: int = 3
     bf16: bool = True
+    # distribution used to sample the random value injected at intervention time
+    # "uniform": U(min, max) of the neuron's empirical range
+    # "gaussian": N(mean, std) fit to the neuron's empirical activations
+    # "extreme": U over a range intervention_extreme_scale x wider than empirical (sanity check)
+    intervention_signal_distribution: str = "uniform"
+    # how much wider than the empirical range to sample from when
+    # intervention_signal_distribution == "extreme"
+    intervention_extreme_scale: float = 1000.0
 
 
 class EvalConfig(BaseModel):

@@ -78,7 +78,6 @@ python generate_experiment_config.py \
     --learning-rate $LR \
     --lora-r $LORA_R \
     --lora-alpha $LORA_ALPHA \
-    --use-regressor \
     --cache-dir data/internvetion_train \
     --output-dir outputs/runs/internvetion_train \
     --output experiment_configs/internvetion_train_regressor/$EXP_NAME.json

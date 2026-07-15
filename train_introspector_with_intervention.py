@@ -346,7 +346,12 @@ def main():
     grouped = df.groupby(["signal_layer", "signal_index"])["activation"]
     signal_ranges = {}
     for key, vals in grouped:
-        signal_ranges[key] = (float(vals.min()), float(vals.max()),)
+        signal_ranges[key] = {
+            "min": float(vals.min()),
+            "max": float(vals.max()),
+            "mean": float(vals.mean()),
+            "std": float(vals.std()),
+        }
 
     # ========================================================
     # Preprocess datasets
@@ -406,7 +411,12 @@ def main():
     model.resize_token_embeddings(len(tokenizer))
 
     if config.use_regressor:
-        model = IntrospectionRegressionModel(model, signal_ranges=signal_ranges)
+        model = IntrospectionRegressionModel(
+            model,
+            signal_ranges=signal_ranges,
+            intervention_distribution=config.training_config.intervention_signal_distribution,
+            intervention_extreme_scale=config.training_config.intervention_extreme_scale,
+        )
         # model.__class__ = IntrospectionRegressionModel
         # model.regression_head = nn.Linear(model.config.hidden_size,1,bias=False,)
 
