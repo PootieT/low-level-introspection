@@ -1,3 +1,4 @@
+import os
 import pdb
 import random
 import operator
@@ -8,8 +9,14 @@ from torch import nn
 
 from peft import PeftModelForCausalLM
 from peft.tuners.lora.layer import Linear
+from transformers import TrainerCallback
 
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
+
+# the custom regression head is NOT part of the PEFT adapter, so PEFT's
+# save_pretrained never serializes it. We persist/load it under this filename
+# alongside each checkpoint ourselves.
+REGRESSION_HEAD_FILENAME = "regression_head.pt"
 
 # default multiplier for the "extreme" intervention sanity check (samples
 # uniformly from a range EXTREME_SCALE x wider than empirical, centered on the
@@ -190,6 +197,15 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
         self.intervention_distribution = intervention_distribution
         self.intervention_extreme_scale = intervention_extreme_scale
         self.intervention_fn = intervention_fn  # optional custom intervention sampler
+        # dedicated RNG for intervention sampling so eval passes can be made
+        # reproducible independently of training-time draws (see seed_intervention_rng)
+        self.intervention_rng = random.Random()
+
+    def seed_intervention_rng(self, seed):
+        """Reset the intervention sampler to a fixed seed so a subsequent eval
+        pass draws a reproducible sequence of intervention values. Call right
+        before an evaluation loop."""
+        self.intervention_rng = random.Random(seed)
 
     def sample_intervention_values(self,signal_layers,signal_indices,device):
         vals = []
@@ -199,9 +215,9 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
                 val = self.intervention_fn(layer=layer, idx=idx, **stats)
             elif self.intervention_distribution == "gaussian":
                 # fit a gaussian to the neuron's empirical activations and draw from it
-                val = random.gauss(stats["mean"], stats["std"])
+                val = self.intervention_rng.gauss(stats["mean"], stats["std"])
             elif self.intervention_distribution == "uniform":
-                val = random.uniform(stats["min"], stats["max"])
+                val = self.intervention_rng.uniform(stats["min"], stats["max"])
             elif self.intervention_distribution == "extreme":
                 # sanity check: sample from a range intervention_extreme_scale x
                 # wider than the empirical range, centered on the empirical
@@ -209,7 +225,7 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
                 # the model can read the neuron at all.
                 center = (stats["min"] + stats["max"]) / 2
                 half_width = self.intervention_extreme_scale * (stats["max"] - stats["min"]) / 2
-                val = random.uniform(center - half_width, center + half_width)
+                val = self.intervention_rng.uniform(center - half_width, center + half_width)
             else:
                 raise ValueError(
                     f"Unknown intervention_distribution: {self.intervention_distribution!r}"
@@ -306,3 +322,47 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
             # ALWAYS cleanup hooks
             for h in hooks:
                 h.remove()
+
+
+# ============================================================
+# Regression head persistence
+# ============================================================
+class RegressionHeadSaveCallback(TrainerCallback):
+    """
+    PEFT's save_pretrained only serializes the adapter (+ modules_to_save)
+    weights, so the custom regression head is otherwise silently dropped on
+    save and re-initialized randomly on reload. This callback writes the head's
+    state_dict next to every checkpoint the Trainer saves.
+    """
+
+    def __init__(self, model):
+        self.model = model
+
+    def on_save(self, args, state, control, **kwargs):
+        if not hasattr(self.model, "regression_head"):
+            return
+        ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        path = os.path.join(ckpt_dir, REGRESSION_HEAD_FILENAME)
+        torch.save(self.model.regression_head.state_dict(), path)
+        print(f"[RegressionHeadSaveCallback] saved regression head -> {path}")
+
+
+def load_regression_head(model, ckpt_dir):
+    """
+    Restore a regression head previously saved by RegressionHeadSaveCallback.
+    Returns True if a head was found & loaded, False otherwise (leaving the
+    freshly-initialized head in place).
+    """
+    head_path = os.path.join(ckpt_dir, REGRESSION_HEAD_FILENAME)
+    if not os.path.exists(head_path):
+        print(f"[load_regression_head] WARNING: no regression head at {head_path}. "
+              f"Evaluating with a freshly-initialized (UNTRAINED) head. Re-train with "
+              f"the updated code (e.g. --overwrite-cache) to persist it.")
+        return False
+    device = model.regression_head.weight.device
+    state_dict = torch.load(head_path, map_location="cpu")
+    model.regression_head.load_state_dict(state_dict)
+    model.regression_head.to(device=device)
+    print(f"[load_regression_head] loaded regression head from {head_path}")
+    return True

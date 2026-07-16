@@ -40,6 +40,9 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from datasets import load_from_disk
 from peft import LoraConfig, get_peft_model
@@ -57,12 +60,15 @@ from src.introspector.prompts import PROMPT_REGISTRY
 from src.introspector.training.collator import LoRAGatingCollator
 from src.introspector.training.metrics import (
     compute_metrics,
+    compute_metrics_from_numericals,
     get_numericals,
 )
 from src.introspector.training.model import (
     replace_model_with_gated_version,
     replace_lora_with_gated_version,
-    IntrospectionRegressionModel
+    IntrospectionRegressionModel,
+    RegressionHeadSaveCallback,
+    load_regression_head,
 )
 from train_introspector import (
     preprocess_example,
@@ -89,6 +95,13 @@ def parse_args():
                              "the ORIGINAL activation instead of a random intervened value, which is a "
                              "sanity check that the regression head can read a scalar out of the hidden "
                              "states at all.")
+    parser.add_argument("--refit-head", action="store_true",
+                        help="Post-hoc diagnostic: freeze the LoRA/base model and solve for the OPTIMAL "
+                             "linear regression head (closed-form ridge/OLS) that predicts the true "
+                             "activation from the frozen representation. Answers 'what is the best a "
+                             "linear head could do on the normal activation range given this model'.")
+    parser.add_argument("--refit-lambda", type=float, default=1.0,
+                        help="Ridge regularization strength for --refit-head.")
 
 
     return parser.parse_args()
@@ -98,6 +111,83 @@ def get_argmax_from_logits(logits, labels):
     return torch.argmax(logits, dim=-1)
 
 
+# ============================================================
+# Post-hoc optimal regression head (closed-form ridge / OLS)
+# ============================================================
+
+@torch.no_grad()
+def _extract_readout_features(model, dataset, collator, config, readout_pos=-1):
+    """
+    Run the frozen model WITHOUT intervention and collect, per example:
+      - the last-layer hidden state at the readout position (the vector the
+        regression head reads), and
+      - the true activation target.
+    Returns (X [N, H], y [N]) as float32 CPU tensors.
+    """
+    dl = DataLoader(
+        dataset,
+        batch_size=config.training_config.eval_batch_size,
+        collate_fn=collator,
+        shuffle=False,
+    )
+    feats, targets = [], []
+    model.eval()
+    for batch in dl:
+        batch = batch.to(model.device)
+        activation = batch.pop("activation")
+        outputs = model(**batch, do_intervention=False, output_hidden_states=True)
+        h = outputs.hidden_states[-1][:, readout_pos, :].float().cpu()
+        feats.append(h)
+        targets.append(activation.float().cpu())
+    return torch.cat(feats), torch.cat(targets)
+
+
+def refit_regression_head(model, fit_dataset, eval_dataset, collator, config,
+                          output_dir, ridge_lambda=1.0):
+    """
+    Freeze everything and solve for the optimal linear regression head via ridge
+    regression (closed form) that maps the frozen representation -> true
+    activation. Loads the solution into model.regression_head and reports how
+    well this *best-case* linear head does on the normal activation range.
+
+    NB: this is a linear probe (correlational). High correlation here means the
+    representation linearly encodes the activation / the head was mis-aimed, NOT
+    that the model causally reads the neuron.
+    """
+    Xtr, ytr = _extract_readout_features(model, fit_dataset, collator, config)
+    Xte, yte = _extract_readout_features(model, eval_dataset, collator, config)
+
+    # augment with a bias column and solve (X'X + lambda I) w = X'y
+    n, hdim = Xtr.shape
+    Xtr_b = torch.cat([Xtr, torch.ones(n, 1)], dim=1)
+    A = Xtr_b.T @ Xtr_b + ridge_lambda * torch.eye(hdim + 1)
+    w = torch.linalg.solve(A, Xtr_b.T @ ytr)  # [H+1]
+    weight, bias = w[:-1], w[-1]
+
+    # load the optimal head back into the model (keep head dtype/device)
+    head = model.regression_head
+    with torch.no_grad():
+        head.weight.copy_(weight.view(1, -1).to(head.weight.dtype).to(head.weight.device))
+        head.bias.copy_(bias.view(1).to(head.bias.dtype).to(head.bias.device))
+
+    # evaluate the fitted head
+    pred_tr = (Xtr_b @ w)
+    Xte_b = torch.cat([Xte, torch.ones(Xte.shape[0], 1)], dim=1)
+    pred_te = (Xte_b @ w)
+    train_metrics = compute_metrics_from_numericals(pred_tr.numpy(), ytr.numpy())
+    test_metrics = compute_metrics_from_numericals(pred_te.numpy(), yte.numpy())
+    print(f"[refit_regression_head] ridge_lambda={ridge_lambda}")
+    print(f"  train-fit  corr={train_metrics['corr']:.4f}  l2={train_metrics['l2_dist']:.4f}")
+    print(f"  test       corr={ test_metrics['corr']:.4f}  l2={ test_metrics['l2_dist']:.4f}")
+
+    out = {"ridge_lambda": ridge_lambda, "train_fit": train_metrics, "test": test_metrics}
+    with open(str(Path(output_dir) / "refit_head_metrics.json"), "w") as f:
+        json.dump(out, f, indent=2)
+    df = pd.DataFrame({"predictions": pred_te.numpy(), "activation": yte.numpy()})
+    df.to_csv(str(Path(output_dir) / "refit_head_predictions.csv"), index=False)
+    sns.scatterplot(data=df,x="activation", y="predictions")
+    plt.savefig(str(Path(output_dir) / "refit_head_predictions_scatter.png"))
+    return test_metrics
 
 
 
@@ -121,96 +211,6 @@ class InterventionTrainer(Trainer):
         self.tokenizer = tokenizer
         self.experiment_config = experiment_config
         self.do_intervention = do_intervention
-
-    # def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-    #     # if we want to evaluate without intervention for example, then we skip the new logic
-    #     if "token_position" not in inputs:
-    #         loss, outputs = super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
-    #         return (loss, outputs) if return_outputs else loss
-    #
-    #     token_positions = inputs.pop("token_position")
-    #     signal_layers = inputs.pop("signal_layer")
-    #     signal_indices = inputs.pop("signal_index")
-    #
-    #     bs = token_positions.shape[0]
-    #     device = token_positions.device
-    #
-    #     # Sample random intervention values
-    #     intervention_values = []
-    #
-    #     for layer, idx in zip(signal_layers.tolist(), signal_indices.tolist()):
-    #         low, high = self.signal_ranges[(layer, idx)]
-    #         # TODO can change to something more natural instead of uniform
-    #         val = random.uniform(low, high)
-    #         intervention_values.append(val)
-    #
-    #     intervention_values = torch.tensor(intervention_values, device=device, dtype=torch.float32)
-    #
-    #     if self.experiment_config.use_regressor:
-    #         labels = intervention_values
-    #         attn_mask = inputs["attention_mask"].clone()
-    #         lora_mask = inputs["lora_token_mask"].clone()
-    #     else:  # regular text training
-    #         # Replace target text with intervention values
-    #         precision = self.experiment_config.training_config.precision
-    #         target_strings = [f" {float_to_str_target(v, precision)}{self.tokenizer.eos_token}" for v in intervention_values]
-    #         tokenized_targets = self.tokenizer(target_strings, add_special_tokens=False)["input_ids"]
-    #         labels = inputs["labels"].clone()
-    #         attn_mask = inputs["attention_mask"].clone()
-    #         lora_mask = inputs["lora_token_mask"].clone()
-    #         for i in range(bs):
-    #             tgt = tokenized_targets[i]
-    #             non_ignore = (labels[i] != -100).nonzero(as_tuple=True)[0]
-    #             if len(non_ignore) == 0:
-    #                 continue
-    #             start = non_ignore[0].item()
-    #             assert len(tgt) == len(non_ignore), "new random signal not same length as original signal"
-    #             end = min(start + len(tgt), labels.shape[1])
-    #             labels[i, start:end] = torch.tensor(tgt, device=labels.device)
-    #             # these two lines technically shouldn't change either
-    #             attn_mask[i, start:end] = torch.tensor(1, device=labels.device)
-    #             lora_mask[i, start:end] = torch.tensor(1, device=labels.device)
-    #
-    #     inputs["labels"] = labels
-    #     inputs["attention_mask"] = attn_mask
-    #     inputs["lora_attention_mask"] = lora_mask
-    #
-    #     # Register hooks
-    #     hooks = []
-    #     unique_layers = torch.unique(signal_layers)
-    #
-    #     for layer in unique_layers.tolist():
-    #         mask = signal_layers == layer
-    #         layer_token_positions = token_positions[mask]
-    #         layer_signal_indices = signal_indices[mask]
-    #         layer_intervention_values = intervention_values[mask]
-    #
-    #         hook = InterventionHook(
-    #             token_positions=layer_token_positions,
-    #             signal_indices=layer_signal_indices,
-    #             intervention_values=layer_intervention_values,
-    #         )
-    #
-    #         # TODO extend to other signal types
-    #         module_path = resolve_mlp_signal_path(model, layer, path_to_output=False)
-    #         module = operator.attrgetter(module_path)(model)
-    #         handle = module.register_forward_hook(hook)
-    #         hooks.append(handle)
-    #
-    #     # Forward model and compute loss
-    #     if bs == 128:
-    #         pdb.set_trace()
-    #     outputs = model(**inputs)
-    #     if self.experiment_config.use_regressor:
-    #         loss = outputs["loss"]
-    #     else:
-    #         loss = outputs.loss
-    #
-    #     # Cleanup hooks
-    #     for h in hooks:
-    #         h.remove()
-    #
-    #     return (loss, outputs) if return_outputs else loss
 
     def compute_loss(
             self,
@@ -277,33 +277,6 @@ class InterventionTrainer(Trainer):
             labels = inputs["activation"].detach().float()
         return loss, preds, labels
 
-
-    # def prediction_step(
-    #     self,
-    #     model,
-    #     inputs,
-    #     prediction_loss_only,
-    #     ignore_keys=None,
-    # ):
-    #     # only needed for regressor evaluation
-    #     # save regression labels BEFORE forward
-    #     if "activation" in inputs:
-    #         inputs["labels"] = inputs["activation"]
-    #     with torch.no_grad():
-    #         outputs = model(**inputs)
-    #         loss = outputs.loss.detach()
-    #         preds = outputs.logits.detach().float()
-    #
-    #     # IMPORTANT:
-    #     # return regression labels instead
-    #     #
-    #
-    #     return (
-    #         loss,
-    #         preds,
-    #         inputs["activation"].detach(),
-    #     )
-
 # ============================================================
 # Main
 # ============================================================
@@ -320,7 +293,7 @@ def main():
     test_path = cache_dir / "test"
     output_dir = Path(config.output_dir) / f"{config.experiment_name}"
 
-    if (output_dir / "test_results.json").exists() and not args.overwrite_cache:
+    if (output_dir / "refit_head_predictions_scatter.png").exists() and not args.overwrite_cache:
         print(f"Experiments ran already, skipping.. {output_dir}")
         return
 
@@ -469,22 +442,31 @@ def main():
         preprocess_logits_for_metrics=None if config.use_regressor else get_argmax_from_logits,
         experiment_config=config,
         do_intervention=not args.no_intervention,
+        # persist the custom regression head next to every checkpoint (PEFT won't)
+        callbacks=[RegressionHeadSaveCallback(model)] if config.use_regressor else None,
     )
-    if args.no_intervention:
-        print("[train_introspector_with_intervention] --no-intervention set: "
-              "training/evaluating the regressor against the ORIGINAL activation (sanity check).")
+
     ckpt_dirs = glob.glob(f"{output_dir}/checkpoint-*")
     if ckpt_dirs and not args.overwrite_cache:
         print(f"Found Trained model, skipping training and loading directly ..")
         latest_checkpoint_path = max(ckpt_dirs, key=os.path.getctime)
+        # resume loads the adapter/embeddings; the regression head is NOT in the
+        # PEFT checkpoint, so restore it explicitly afterwards
         train_results = trainer.train(resume_from_checkpoint=latest_checkpoint_path)
+        if config.use_regressor:
+            load_regression_head(model, latest_checkpoint_path)
     else:
         train_results = trainer.train()
-    trainer.save_metrics( "train", train_results.metrics)
+        trainer.save_metrics( "train", train_results.metrics)
+    # seed the intervention sampler so eval draws are reproducible across reloads
+    if config.use_regressor:
+        model.seed_intervention_rng(config.seed)
     dev_results = trainer.evaluate()
     trainer.save_metrics("dev", dev_results,)
 
-    # these evals don't involve interveneing with the signal, for intervention eval we use the other script
+    # Eval with default trainer setup (if train with intervention then test with intervention)
+    if config.use_regressor:
+        model.seed_intervention_rng(config.seed)
     evaluate_test_split(
         config,
         model,
@@ -496,6 +478,37 @@ def main():
         train_dataset_raw,
         trainer
     )
+
+    # alternative eval setting (flip the intervention flag)
+    trainer.do_intervention = args.no_intervention
+    if config.use_regressor:
+        model.seed_intervention_rng(config.seed)
+    evaluate_test_split(
+        config,
+        model,
+        pred_collator,
+        test_dataset,
+        test_dataset_pred,
+        test_dataset_raw,
+        tokenizer,
+        train_dataset_raw,
+        trainer,
+        suffix="_alt_intervention"
+    )
+
+    # Post-hoc diagnostic: solve for the optimal linear head on the normal
+    # activation range given the frozen representation (mutates the head, so run
+    # it LAST, after the standard evals).
+    if args.refit_head and config.use_regressor:
+        refit_regression_head(
+            model,
+            fit_dataset=train_dataset,       # for_prediction=True, has "activation"
+            eval_dataset=test_dataset_pred,  # for_prediction=True, has "activation"
+            collator=pred_collator,
+            config=config,
+            output_dir=output_dir,
+            ridge_lambda=args.refit_lambda,
+        )
 
 if __name__ == "__main__":
     main()

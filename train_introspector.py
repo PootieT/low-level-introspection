@@ -331,9 +331,15 @@ def evaluate_test_split(
     test_dataset_raw: Dataset,
     tokenizer: AutoTokenizer,
     train_dataset_raw: Dataset,
-    trainer: Trainer
+    trainer: Trainer,
+    suffix: str = "",
 ):
-    """ All evaluation logic for test split (next-token-prediction eval + generation eval)"""
+    """
+    All evaluation logic for test split (next-token-prediction eval + generation eval)
+
+    Args:
+        suffix: experiment artifact suffix
+    """
     test_outputs = trainer.predict(test_dataset)
     test_predictions = test_outputs.predictions
     test_label_ids = test_outputs.label_ids
@@ -346,18 +352,18 @@ def evaluate_test_split(
                                               tokenizer=tokenizer)
     unseen_token_test_results = compute_metrics([test_predictions[~seen_token_mask], test_label_ids[~seen_token_mask]],
                                                 tokenizer=tokenizer)
-    trainer.save_metrics("test", full_test_results)
-    trainer.save_metrics("test_seen_token", seen_token_test_results)
-    trainer.save_metrics("test_unseen_token", unseen_token_test_results)
+    trainer.save_metrics(f"test{suffix}", full_test_results)
+    trainer.save_metrics(f"test_seen_token{suffix}", seen_token_test_results)
+    trainer.save_metrics(f"test_unseen_token{suffix}", unseen_token_test_results)
     output_dir = Path(config.output_dir) / config.experiment_name
-    pred_df = pd.DataFrame({"predictions": test_predictions, "labels": test_label_ids})
-    pred_df.to_csv(str(output_dir / "test_predictions.json"), index=False)
-    sns.scatterplot(x="labels", y="predictions", data=pred_df)
-    plt.savefig(str(output_dir / "test_predictions_scatter.png"))
-
+    pred_df = pd.DataFrame({"predictions": test_predictions, "labels": test_label_ids, "activation": test_dataset["activation"]})
+    pred_df.to_csv(str(output_dir / f"test_predictions{suffix}.json"), index=False)
+    sns.scatterplot(x="labels", y="predictions", hue="activation", data=pred_df)
+    plt.savefig(str(output_dir / f"test_predictions_scatter{suffix}.png"))
+    plt.close()
     # now evaluate using prediction (autoregressive generation)
     if not config.training_config.disable_adapter_in_input or config.use_regressor:
-        exit()  # Not implemented yet, and doesn't apply for regressor
+        return  # Not implemented yet, and doesn't apply for regressor
 
     dataloader = DataLoader(
         test_dataset_pred,
@@ -391,9 +397,9 @@ def evaluate_test_split(
     seen_token_test_pred_results = compute_metrics_from_numericals(gen_nums[seen_token_mask], labels[seen_token_mask])
     unseen_token_test_pred_results = compute_metrics_from_numericals(gen_nums[~seen_token_mask],
                                                                      labels[~seen_token_mask])
-    trainer.save_metrics("test_pred", test_pred_metrics)
-    trainer.save_metrics("test_pred_seen_token", seen_token_test_pred_results)
-    trainer.save_metrics("test_pred_unseen_token", unseen_token_test_pred_results)
+    trainer.save_metrics(f"test_pred{suffix}", test_pred_metrics)
+    trainer.save_metrics(f"test_pred_seen_token{suffix}", seen_token_test_pred_results)
+    trainer.save_metrics(f"test_pred_unseen_token{suffix}", unseen_token_test_pred_results)
 
 
 if __name__ == "__main__":
