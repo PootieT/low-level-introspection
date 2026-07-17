@@ -33,6 +33,7 @@ import json
 import math
 import random
 import operator
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
@@ -44,7 +45,7 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from datasets import load_from_disk
+from datasets import load_from_disk, Dataset
 from peft import LoraConfig, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
@@ -100,8 +101,15 @@ def parse_args():
                              "linear regression head (closed-form ridge/OLS) that predicts the true "
                              "activation from the frozen representation. Answers 'what is the best a "
                              "linear head could do on the normal activation range given this model'.")
-    parser.add_argument("--refit-lambda", type=float, default=1.0,
-                        help="Ridge regularization strength for --refit-head.")
+    parser.add_argument("--refit-estimator", type=str, default="ridge", choices=["ridge", "pls"],
+                        help="Linear fitter for --refit-head: 'ridge' (L2, dense direction, hyperparam=lambda) "
+                             "or 'pls' (partial least squares, low-rank subspace, hyperparam=n_components).")
+    parser.add_argument("--refit-lambda-grid", type=str, default="0.01,0.1,1,10,100,1000,10000",
+                        help="Comma-separated ridge lambdas to sweep (--refit-estimator ridge). The best is "
+                             "selected on the dev split (by correlation); the final head is fit on "
+                             "train+dev with that lambda and evaluated on test.")
+    parser.add_argument("--refit-pls-components", type=str, default="1,2,4,8,16,32,64",
+                        help="Comma-separated n_components to sweep (--refit-estimator pls).")
 
 
     return parser.parse_args()
@@ -116,12 +124,14 @@ def get_argmax_from_logits(logits, labels):
 # ============================================================
 
 @torch.no_grad()
-def _extract_readout_features(model, dataset, collator, config, readout_pos=-1):
+def _extract_readout_features(model, dataset, collator, config, readout_pos=-1, do_intervention=False):
     """
-    Run the frozen model WITHOUT intervention and collect, per example:
+    Run the frozen model and collect, per example:
       - the last-layer hidden state at the readout position (the vector the
         regression head reads), and
-      - the true activation target.
+      - the target: the true activation when do_intervention=False, or the
+        (sampled) injected value when do_intervention=True. Under intervention
+        the hidden state also reflects the injection.
     Returns (X [N, H], y [N]) as float32 CPU tensors.
     """
     dl = DataLoader(
@@ -135,59 +145,176 @@ def _extract_readout_features(model, dataset, collator, config, readout_pos=-1):
     for batch in dl:
         batch = batch.to(model.device)
         activation = batch.pop("activation")
-        outputs = model(**batch, do_intervention=False, output_hidden_states=True)
+        outputs = model(**batch, do_intervention=do_intervention, output_hidden_states=True)
         h = outputs.hidden_states[-1][:, readout_pos, :].float().cpu()
         feats.append(h)
-        targets.append(activation.float().cpu())
+        if do_intervention:
+            targets.append(outputs.intervention_values.float().cpu())
+        else:
+            targets.append(activation.float().cpu())
     return torch.cat(feats), torch.cat(targets)
 
 
-def refit_regression_head(model, fit_dataset, eval_dataset, collator, config,
-                          output_dir, ridge_lambda=1.0):
-    """
-    Freeze everything and solve for the optimal linear regression head via ridge
-    regression (closed form) that maps the frozen representation -> true
-    activation. Loads the solution into model.regression_head and reports how
-    well this *best-case* linear head does on the normal activation range.
+# ---- linear probes: any fitter returns a (coef, intercept) linear map ----
+@dataclass
+class LinearProbe:
+    coef: torch.Tensor   # [H]
+    intercept: float
 
-    NB: this is a linear probe (correlational). High correlation here means the
-    representation linearly encodes the activation / the head was mis-aimed, NOT
-    that the model causally reads the neuron.
+    def predict(self, X):  # X: [N, H] -> [N]
+        return X @ self.coef.to(X.dtype) + self.intercept
+
+
+def fit_ridge(X, y, lam):
+    """Closed-form ridge (L2) probe."""
+    Xb = torch.cat([X, torch.ones(X.shape[0], 1)], dim=1)
+    A = Xb.T @ Xb + lam * torch.eye(Xb.shape[1])
+    w = torch.linalg.solve(A, Xb.T @ y)
+    return LinearProbe(coef=w[:-1].float(), intercept=float(w[-1]))
+
+
+def fit_pls(X, y, n_components):
     """
+    Partial least squares (single response) via sklearn's PLSRegression, which
+    finds n_components low-rank latent directions of maximum covariance with y.
+    PLS predict is affine, so we recover the exact effective (coef, intercept)
+    linear map by probing with 0 and the identity (convention-proof across
+    sklearn versions).
+    """
+    from sklearn.cross_decomposition import PLSRegression
+
+    hdim = X.shape[1]
+    Xnp = X.double().numpy()
+    ynp = y.double().numpy()
+    pls = PLSRegression(n_components=int(n_components), scale=True).fit(Xnp, ynp)
+    intercept = float(pls.predict(np.zeros((1, hdim))).ravel()[0])
+    coef = pls.predict(np.eye(hdim)).ravel() - intercept
+    return LinearProbe(coef=torch.tensor(coef, dtype=torch.float32), intercept=intercept)
+
+
+FITTERS = {"ridge": fit_ridge, "pls": fit_pls}
+
+
+def _corr_score(metrics):
+    """Selection score = dev correlation, treating nan (e.g. degenerate constant
+    predictions) as worst-possible."""
+    c = metrics["corr"]
+    return -float("inf") if (c is None or np.isnan(c)) else c
+
+
+def refit_regression_head(
+    model: IntrospectionRegressionModel,
+    fit_dataset: Dataset,
+    dev_dataset: Dataset,
+    eval_dataset: Dataset,
+    collator: LoRAGatingCollator,
+    config: ExperimentConfig,
+    output_dir: str,
+    estimator: str,
+    hyperparam_grid,
+):
+    """
+    Freeze everything and fit the optimal LINEAR readout (estimator = ridge or
+    pls) from the frozen representation -> true activation. The hyperparameter
+    (ridge lambda / pls n_components) is selected on dev by correlation; the
+    final probe is fit on train+dev and:
+      1. evaluated ENDOGENOUSLY on test (predict true activation, no intervention)
+      2. evaluated INTERVENTIONALLY on test (inject gaussian-distributed values
+         into the neuron and check whether this SAME endogenously-fit direction
+         tracks the INJECTED value -> causal-transfer / faithfulness).
+    The selected probe is loaded into model.regression_head.
+    """
+    fit_fn = FITTERS[estimator]
+
+    # extract frozen endogenous features once per split (no intervention)
     Xtr, ytr = _extract_readout_features(model, fit_dataset, collator, config)
+    Xdev, ydev = _extract_readout_features(model, dev_dataset, collator, config)
     Xte, yte = _extract_readout_features(model, eval_dataset, collator, config)
 
-    # augment with a bias column and solve (X'X + lambda I) w = X'y
-    n, hdim = Xtr.shape
-    Xtr_b = torch.cat([Xtr, torch.ones(n, 1)], dim=1)
-    A = Xtr_b.T @ Xtr_b + ridge_lambda * torch.eye(hdim + 1)
-    w = torch.linalg.solve(A, Xtr_b.T @ ytr)  # [H+1]
-    weight, bias = w[:-1], w[-1]
+    # ---- hyperparam sweep: fit on train, select on dev ----
+    print(f"[refit_regression_head] estimator={estimator}; sweep (fit train, select dev corr):")
+    dev_sweep = []
+    best_hp = hyperparam_grid[0]
+    best_score = -float("inf")
+    for hp in hyperparam_grid:
+        probe = fit_fn(Xtr, ytr, hp)
+        dev_metrics = compute_metrics_from_numericals(probe.predict(Xdev).numpy(), ydev.numpy())
+        dev_sweep.append({"hyperparam": hp, "dev_corr": dev_metrics["corr"], "dev_l2": dev_metrics["l2_dist"]})
+        print(f"  hp={hp:<10g} dev_corr={dev_metrics['corr']:.4f}  dev_l2={dev_metrics['l2_dist']:.4f}")
+        score = _corr_score(dev_metrics)
+        if score > best_score:
+            best_score, best_hp = score, hp
+    print(f"[refit_regression_head] best hyperparam={best_hp:g} (dev_corr={best_score:.4f})")
 
-    # load the optimal head back into the model (keep head dtype/device)
+    # ---- final fit on train+dev with best hyperparam ----
+    Xfit = torch.cat([Xtr, Xdev], dim=0)
+    yfit = torch.cat([ytr, ydev], dim=0)
+    probe = fit_fn(Xfit, yfit, best_hp)
+
+    # load the selected probe into the model head (keep head dtype/device)
     head = model.regression_head
     with torch.no_grad():
-        head.weight.copy_(weight.view(1, -1).to(head.weight.dtype).to(head.weight.device))
-        head.bias.copy_(bias.view(1).to(head.bias.dtype).to(head.bias.device))
+        head.weight.copy_(probe.coef.view(1, -1).to(head.weight.dtype).to(head.weight.device))
+        head.bias.copy_(torch.tensor([probe.intercept]).to(head.bias.dtype).to(head.bias.device))
 
-    # evaluate the fitted head
-    pred_tr = (Xtr_b @ w)
-    Xte_b = torch.cat([Xte, torch.ones(Xte.shape[0], 1)], dim=1)
-    pred_te = (Xte_b @ w)
-    train_metrics = compute_metrics_from_numericals(pred_tr.numpy(), ytr.numpy())
-    test_metrics = compute_metrics_from_numericals(pred_te.numpy(), yte.numpy())
-    print(f"[refit_regression_head] ridge_lambda={ridge_lambda}")
-    print(f"  train-fit  corr={train_metrics['corr']:.4f}  l2={train_metrics['l2_dist']:.4f}")
-    print(f"  test       corr={ test_metrics['corr']:.4f}  l2={ test_metrics['l2_dist']:.4f}")
+    # ---- (1) endogenous test eval ----
+    endo_metrics = compute_metrics_from_numericals(probe.predict(Xte).numpy(), yte.numpy())
+    print(f"  test ENDOGENOUS   corr={endo_metrics['corr']:.4f}  l2={endo_metrics['l2_dist']:.4f}")
 
-    out = {"ridge_lambda": ridge_lambda, "train_fit": train_metrics, "test": test_metrics}
+    # ---- (2) interventional (causal-transfer) test eval, gaussian injection ----
+    prev_dist = model.intervention_distribution
+    model.intervention_distribution = "gaussian"
+    model.seed_intervention_rng(config.seed)
+    Xiv, yiv = _extract_readout_features(model, eval_dataset, collator, config, do_intervention=True)
+    model.intervention_distribution = prev_dist
+    interv_metrics = compute_metrics_from_numericals(probe.predict(Xiv).numpy(), yiv.numpy())
+    print(f"  test INTERVENTION corr={interv_metrics['corr']:.4f}  l2={interv_metrics['l2_dist']:.4f}  (gaussian)")
+
+    # ---- (a) perturbation diagnostic: how much does the injection actually move
+    # the readout? Xiv and Xte are per-example aligned (same eval_dataset, no
+    # shuffle), so (Xiv - Xte) is exactly the injection's effect on the readout.
+    # If this is ~0, the readout position is blind to the neuron and interventional
+    # corr ~0 is a readout-location problem, NOT proof of contextual bypass.
+    dX = (Xiv - Xte).norm(dim=1)          # [N] per-example ||ΔX||
+    base = Xte.norm(dim=1).clamp_min(1e-8)
+    rel = dX / base
+    perturbation = {
+        "delta_readout_norm_mean": float(dX.mean()),
+        "delta_readout_norm_median": float(dX.median()),
+        "readout_norm_mean": float(Xte.norm(dim=1).mean()),
+        "relative_delta_mean": float(rel.mean()),
+        "relative_delta_median": float(rel.median()),
+    }
+    print(f"  intervention Δreadout: |ΔX|={perturbation['delta_readout_norm_mean']:.4g} "
+          f"(relative {perturbation['relative_delta_mean']:.3g} of "
+          f"|X|={perturbation['readout_norm_mean']:.4g})")
+
+    out = {
+        "estimator": estimator,
+        "hyperparam_grid": list(hyperparam_grid),
+        "best_hyperparam": best_hp,
+        "dev_sweep": dev_sweep,
+        "endogenous_test": endo_metrics,
+        "interventional_test": interv_metrics,
+        "readout_perturbation": perturbation,
+    }
     with open(str(Path(output_dir) / "refit_head_metrics.json"), "w") as f:
         json.dump(out, f, indent=2)
-    df = pd.DataFrame({"predictions": pred_te.numpy(), "activation": yte.numpy()})
-    df.to_csv(str(Path(output_dir) / "refit_head_predictions.csv"), index=False)
-    sns.scatterplot(data=df,x="activation", y="predictions")
-    plt.savefig(str(Path(output_dir) / "refit_head_predictions_scatter.png"))
-    return test_metrics
+    pd.DataFrame({"predictions": probe.predict(Xte).numpy(), "activation": yte.numpy()}).to_csv(
+        str(Path(output_dir) / "refit_head_predictions_endogenous.csv"), index=False)
+    pd.DataFrame({"predictions": probe.predict(Xiv).numpy(), "injected": yiv.numpy()}).to_csv(
+        str(Path(output_dir) / "refit_head_predictions_interventional.csv"), index=False)
+    plt.figure()
+    sns.scatterplot(x=yte.numpy(), y=probe.predict(Xte).numpy())
+    plt.xlabel("true activation"); plt.ylabel("prediction")
+    plt.savefig(str(Path(output_dir) / "refit_head_endogenous_scatter.png"))
+    plt.close()
+    plt.figure()
+    sns.scatterplot(x=yiv.numpy(), y=probe.predict(Xiv).numpy())
+    plt.xlabel("injected value"); plt.ylabel("prediction")
+    plt.savefig(str(Path(output_dir) / "refit_head_interventional_scatter.png"))
+    plt.close()
+    return out
 
 
 
@@ -465,49 +592,57 @@ def main():
     trainer.save_metrics("dev", dev_results,)
 
     # Eval with default trainer setup (if train with intervention then test with intervention)
-    if config.use_regressor:
-        model.seed_intervention_rng(config.seed)
-    evaluate_test_split(
-        config,
-        model,
-        pred_collator,
-        test_dataset,
-        test_dataset_pred,
-        test_dataset_raw,
-        tokenizer,
-        train_dataset_raw,
-        trainer
-    )
+    if not (output_dir / "test_predictions.json").exists() or args.overwrite_cache:
+        if config.use_regressor:
+            model.seed_intervention_rng(config.seed)
+        evaluate_test_split(
+            config,
+            model,
+            pred_collator,
+            test_dataset,
+            test_dataset_pred,
+            test_dataset_raw,
+            tokenizer,
+            train_dataset_raw,
+            trainer
+        )
 
     # alternative eval setting (flip the intervention flag)
     trainer.do_intervention = args.no_intervention
-    if config.use_regressor:
-        model.seed_intervention_rng(config.seed)
-    evaluate_test_split(
-        config,
-        model,
-        pred_collator,
-        test_dataset,
-        test_dataset_pred,
-        test_dataset_raw,
-        tokenizer,
-        train_dataset_raw,
-        trainer,
-        suffix="_alt_intervention"
+    if not (output_dir / "test_predictions_alt_intervention.json").exists() or args.overwrite_cache:
+        if config.use_regressor:
+            model.seed_intervention_rng(config.seed)
+        evaluate_test_split(
+            config,
+            model,
+            pred_collator,
+            test_dataset,
+            test_dataset_pred,
+            test_dataset_raw,
+            tokenizer,
+            train_dataset_raw,
+            trainer,
+            suffix="_alt_intervention"
     )
 
     # Post-hoc diagnostic: solve for the optimal linear head on the normal
     # activation range given the frozen representation (mutates the head, so run
     # it LAST, after the standard evals).
     if args.refit_head and config.use_regressor:
+        if args.refit_estimator == "pls":
+            hyperparam_grid = [int(x) for x in args.refit_pls_components.split(",")]
+        else:
+            hyperparam_grid = [float(x) for x in args.refit_lambda_grid.split(",")]
         refit_regression_head(
             model,
             fit_dataset=train_dataset,       # for_prediction=True, has "activation"
+            dev_dataset=dev_dataset,         # for_prediction=True, has "activation"
             eval_dataset=test_dataset_pred,  # for_prediction=True, has "activation"
             collator=pred_collator,
             config=config,
             output_dir=output_dir,
-            ridge_lambda=args.refit_lambda,
+            estimator=args.refit_estimator,
+            hyperparam_grid=hyperparam_grid,
         )
 
 if __name__ == "__main__":

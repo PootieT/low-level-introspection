@@ -262,6 +262,17 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
                 bs = token_position.shape[0]
                 device = token_position.device
 
+                # token_position is relative to the UNPADDED text (text starts at
+                # index 0). The regressor batches are LEFT-padded, so the text
+                # actually starts at index num_left_pad. Shift token_position by the
+                # leading pad count so the hook injects into the intended token
+                # rather than a padding/wrong token. (Assumes left padding: with no
+                # right padding, (attention_mask == 0).sum == leading pad count.)
+                attention_mask = kwargs.get("attention_mask")
+                if attention_mask is not None:
+                    num_left_pad = (attention_mask == 0).sum(dim=1).to(token_position.device)
+                    token_position = token_position + num_left_pad
+
                 # sample interventions INSIDE forward
                 intervention_values = self.sample_intervention_values(signal_layer,signal_index,device)
                 unique_layers = torch.unique(signal_layer)
@@ -289,6 +300,11 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
                 **kwargs,
             )
 
+            # always expose the sampled intervention values (None if not
+            # intervening) so downstream eval can use them as targets even when
+            # no regression labels are passed
+            outputs["intervention_values"] = intervention_values
+
             # REGRESSION MODE
             if labels is not None and labels.ndim == 1:
                 hidden = outputs.hidden_states[-1]
@@ -314,7 +330,6 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
                 # Trainer expects logits
                 outputs.logits = pred
                 outputs.loss = loss
-                outputs["intervention_values"] = intervention_values
 
             return outputs
 
