@@ -202,6 +202,50 @@ def _corr_score(metrics):
     return -float("inf") if (c is None or np.isnan(c)) else c
 
 
+def evaluate_interventional_test(
+    model: IntrospectionRegressionModel,
+    eval_dataset: Dataset,
+    collator: LoRAGatingCollator,
+    config: ExperimentConfig,
+    output_dir: str,
+    distribution: str = "gaussian",
+    suffix: str = "_gaussian",
+):
+    """
+    Evaluate the CURRENT (trained) regression head on the test split under
+    intervention drawn from `distribution`.
+
+    With distribution="gaussian" the injected values match the neuron's endogenous
+    N(mean, std) -- i.e. the same range the model sees naturally. Because the
+    injected value is independent of context, contextual bypass scores exactly 0
+    here by construction: any correlation is genuine causal reading. This is the
+    metric to select on.
+    """
+    prev_dist = model.intervention_distribution
+    model.intervention_distribution = distribution
+    model.seed_intervention_rng(config.seed)
+    X, y_inj = _extract_readout_features(model, eval_dataset, collator, config, do_intervention=True)
+    model.intervention_distribution = prev_dist
+
+    head = model.regression_head
+    with torch.no_grad():
+        pred = head(X.to(device=head.weight.device, dtype=head.weight.dtype)).squeeze(-1).float().cpu()
+    metrics = compute_metrics_from_numericals(pred.numpy(), y_inj.numpy())
+    print(f"[interventional test eval | {distribution} injection] "
+          f"corr={metrics['corr']:.4f}  l2={metrics['l2_dist']:.4f}")
+
+    with open(str(Path(output_dir) / f"interventional_test_metrics{suffix}.json"), "w") as f:
+        json.dump({"distribution": distribution, "test": metrics}, f, indent=2)
+    df = pd.DataFrame({"predictions": pred.numpy(), "injected": y_inj.numpy()})
+    df.to_csv(str(Path(output_dir) / f"interventional_test_predictions{suffix}.csv"), index=False)
+    plt.figure()
+    sns.scatterplot(data=df, x="injected", y="predictions")
+    plt.xlabel("injected value"); plt.ylabel("prediction")
+    plt.savefig(str(Path(output_dir) / f"interventional_test_scatter{suffix}.png"))
+    plt.close()
+    return metrics
+
+
 def refit_regression_head(
     model: IntrospectionRegressionModel,
     fit_dataset: Dataset,
@@ -225,6 +269,10 @@ def refit_regression_head(
     The selected probe is loaded into model.regression_head.
     """
     fit_fn = FITTERS[estimator]
+
+    # snapshot the CURRENT (intervention-trained, "causal") head direction before
+    # the refit probe overwrites it, so we can compare the two readout directions
+    causal_coef = model.regression_head.weight.detach().flatten().float().cpu().clone()
 
     # extract frozen endogenous features once per split (no intervention)
     Xtr, ytr = _extract_readout_features(model, fit_dataset, collator, config)
@@ -289,6 +337,13 @@ def refit_regression_head(
           f"(relative {perturbation['relative_delta_mean']:.3g} of "
           f"|X|={perturbation['readout_norm_mean']:.4g})")
 
+    # ---- direction comparison: is the causal (intervention-trained) readout the
+    # same direction as the endogenous (bypass-prone) refit? ~0 => two separate
+    # mechanisms; ~1 => the same direction serves both.
+    cos_causal_refit = float(nn.functional.cosine_similarity(
+        causal_coef.unsqueeze(0), probe.coef.unsqueeze(0)).item())
+    print(f"  cosine(causal head, refit head) = {cos_causal_refit:+.4f}")
+
     out = {
         "estimator": estimator,
         "hyperparam_grid": list(hyperparam_grid),
@@ -297,6 +352,7 @@ def refit_regression_head(
         "endogenous_test": endo_metrics,
         "interventional_test": interv_metrics,
         "readout_perturbation": perturbation,
+        "cosine_causal_vs_refit": cos_causal_refit,
     }
     with open(str(Path(output_dir) / "refit_head_metrics.json"), "w") as f:
         json.dump(out, f, indent=2)
@@ -624,6 +680,21 @@ def main():
             trainer,
             suffix="_alt_intervention"
     )
+
+    # Interventional test eval of the TRAINED head with the endogenous-matched
+    # (gaussian, k=1) injection distribution. Contextual bypass scores 0 here by
+    # construction, so this is the non-gameable causal-reading metric. Must run
+    # BEFORE --refit-head, which overwrites the trained head.
+    if config.use_regressor:
+        evaluate_interventional_test(
+            model,
+            eval_dataset=test_dataset_pred,
+            collator=pred_collator,
+            config=config,
+            output_dir=output_dir,
+            distribution="gaussian",
+            suffix="_gaussian",
+        )
 
     # Post-hoc diagnostic: solve for the optimal linear head on the normal
     # activation range given the frozen representation (mutates the head, so run
