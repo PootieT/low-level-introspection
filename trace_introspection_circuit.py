@@ -271,6 +271,25 @@ def decodability(X, y, train_frac=0.7):
 # ======================================================================
 # nnsight capture
 # ======================================================================
+# Injection-path resolvers dispatched by signal type, so tracing a different
+# signal type in the future just registers its resolver here. The residual-stream
+# decomposition captured below (attn/mlp/embed writes) is signal-type agnostic.
+SIGNAL_PATH_RESOLVERS = {
+    "mlp": resolve_mlp_signal_path,
+}
+
+
+def resolve_signal_injection_path(lm, signal_type: str, layer: int) -> str:
+    """Path (from the nnsight LanguageModel root) to the signal source tensor we
+    overwrite, dispatched by signal type. Raises for unregistered types."""
+    if signal_type not in SIGNAL_PATH_RESOLVERS:
+        raise NotImplementedError(
+            f"No injection-path resolver registered for signal type '{signal_type}'. "
+            f"Add one to SIGNAL_PATH_RESOLVERS."
+        )
+    return SIGNAL_PATH_RESOLVERS[signal_type](lm, layer, path_to_output=True)
+
+
 def nnsight_module_handles(lm, inject_layer):
     """Resolve nnsight envoy handles from the proven resolve_mlp_signal_path prefix."""
     actfn_path = resolve_mlp_signal_path(lm, inject_layer, path_to_output=False)  # ...layers.L.mlp.act_fn
@@ -282,41 +301,49 @@ def nnsight_module_handles(lm, inject_layer):
 
 
 @torch.no_grad()
-def trace_batch(lm, layers, embed, norm, inputs, abs_pos, inject_layer, neuron, v,
-                n_layers, start_layer):
+def trace_batch(lm, layers, embed, norm, inputs, abs_pos, inject_layer, inject_path,
+                neuron, v, n_layers, start_layer):
     """
-    One injected forward. Returns dict of last-token component writes, per-layer
+    One injected forward. Modules are accessed in COMPUTATIONAL-PATH ORDER
+    (embed -> for each layer: attention block -> [inject at signal layer] -> mlp
+    block -> residual -> final norm), and the injection overwrites the signal
+    source in-place via `inject_path` (resolved by signal type, not a hard-coded
+    module path) between the attention write and the MLP that consumes the neuron.
+
+    Returns last-token component writes (embed, per-layer attn/mlp), per-layer
     residuals at (inject position, last token), o_proj inputs (>= start_layer),
-    the pre-norm final residual, and post-norm hidden.
+    the pre-norm final residual, and the post-norm hidden.
     `inputs` must contain ONLY input_ids/attention_mask/lora_token_mask so the
     model's own intervention path does not also fire.
     """
     bs = inputs["input_ids"].shape[0]
     bidx = torch.arange(bs, device=abs_pos.device)
+    attn, mlp, resid_inj, resid_last, oproj = {}, {}, {}, {}, {}
     with lm.trace(inputs):
         emb = embed.output[bidx, -1, :].save()
-
-        # ---- inject: overwrite the neuron's SiLU activation at (abs_pos) ----
-        layers[inject_layer].mlp.act_fn.output[bidx, abs_pos, neuron] = v
-
-        attn = {L: layers[L].self_attn.output[0][bidx, -1, :].save() for L in range(n_layers)}
-        mlp = {L: layers[L].mlp.output[bidx, -1, :].save() for L in range(n_layers)}
-        final_resid = layers[n_layers - 1].output[0][bidx, -1, :].save()
+        for L in range(n_layers):
+            layer = layers[L]
+            # --- attention block ---
+            if L >= start_layer:
+                oproj[L] = layer.self_attn.o_proj.input[bidx, -1, :].save()
+            attn[L] = layer.self_attn.output[0][bidx, -1, :].save()
+            # --- inject the signal source in-place (resolver-derived path),
+            #     after the attention write and before the MLP consumes it ---
+            if L == inject_layer:
+                operator.attrgetter(inject_path)(lm)[bidx, abs_pos, neuron] = v
+            # --- mlp block ---
+            mlp[L] = layer.mlp.output[bidx, -1, :].save()
+            # --- residual after the layer (both positions, for decodability) ---
+            resid_inj[L] = layer.output[0][bidx, abs_pos, :].save()
+            resid_last[L] = layer.output[0][bidx, -1, :].save()
         normed = norm.output[bidx, -1, :].save()
-
-        resid_inj = {L: layers[L].output[0][bidx, abs_pos, :].save() for L in range(n_layers)}
-        resid_last = {L: layers[L].output[0][bidx, -1, :].save() for L in range(n_layers)}
-
-        # per-head: input to o_proj (concatenated head outputs) at last token
-        oproj = {L: layers[L].self_attn.o_proj.input[bidx, -1, :].save()
-                 for L in range(start_layer, n_layers)}
 
     val = lambda p: p.value if hasattr(p, "value") else p
     return {
         "embed": val(emb).float().cpu(),
         "attn": {L: val(t).float().cpu() for L, t in attn.items()},
         "mlp": {L: val(t).float().cpu() for L, t in mlp.items()},
-        "final_resid": val(final_resid).float().cpu(),
+        "final_resid": val(resid_last[n_layers - 1]).float().cpu(),
         "normed": val(normed).float().cpu(),
         "resid_inj": {L: val(t).float().cpu() for L, t in resid_inj.items()},
         "resid_last": {L: val(t).float().cpu() for L, t in resid_last.items()},
@@ -379,6 +406,7 @@ def main():
 
     lm = LanguageModel(model, tokenizer=tokenizer)
     layers, embed, norm = nnsight_module_handles(lm, inject_layer)
+    inject_path = resolve_signal_injection_path(lm, signal.type, inject_layer)
 
     # accumulators indexed [example, grid_point]
     comp_names = ["embed"] + [f"attn_{L}" for L in range(n_layers)] + [f"mlp_{L}" for L in range(n_layers)]
@@ -403,7 +431,7 @@ def main():
                             "attention_mask": attn_mask,
                             "lora_token_mask": batch.get("lora_token_mask")}
             cap = trace_batch(lm, layers, embed, norm, trace_inputs, abs_pos,
-                              inject_layer, neuron, float(v), n_layers, start_layer)
+                              inject_layer, inject_path, neuron, float(v), n_layers, start_layer)
 
             a = readout_scale(cap["final_resid"], w, gamma, eps)      # [b,H]
             g_contribs["embed"].append(contribution(a, cap["embed"]))
