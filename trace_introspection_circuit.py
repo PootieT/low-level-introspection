@@ -90,7 +90,7 @@ def parse_args():
                    help="First layer for per-head attention decomposition (default: the injected layer).")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--device", type=str, default=None)
-    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output-dir", type=Path, default=None)
     return p.parse_args()
 
