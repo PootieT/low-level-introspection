@@ -25,9 +25,9 @@ module load miniconda/23.11.0
 conda activate /projectnb/llamagrp/peter/low-level-introspection/introspection_env
 
 EXP_NAME=intervention_train_reg_extreme10_300K
-EXP_GROUP=intervention_train
+EXP_GROUP=intervention_train_regressor_extreme
 
-python trace_single_mlp_introspector.py \
+python trace_introspection_circuit.py \
     --config experiment_configs/$EXP_GROUP/$EXP_NAME.json \
     --n-examples 1 \
     --start-layer 9 \

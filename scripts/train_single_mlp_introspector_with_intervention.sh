@@ -53,7 +53,7 @@ LORA_DO=0.05
 
 
 ### generate experiment config first as JSON
-EXP_NAME="intervention_train_reg_N1.24_r${LORA_R}_alpha${LORA_ALPHA}_lr${LR}_3K_debug"
+EXP_NAME="intervention_train_reg_N10.24_r${LORA_R}_alpha${LORA_ALPHA}_lr${LR}_3K_debug"
 python generate_experiment_config.py \
     --experiment-name $EXP_NAME \
     --model meta-llama/Llama-3.2-1B \
@@ -67,7 +67,7 @@ python generate_experiment_config.py \
     --test-max-samples 3000 \
     --max-seq-length 32 \
     --hf-data-kwargs '{"config": "en", "streaming": true}' \
-    --train-signals N1.24 \
+    --train-signals N10.24 \
     --test-signals N1.24 \
     --precision 3 \
     --train-batch-size 32 \
@@ -78,18 +78,20 @@ python generate_experiment_config.py \
     --learning-rate $LR \
     --lora-r $LORA_R \
     --lora-alpha $LORA_ALPHA \
+    --intervention-signal-distribution extreme \
+    --intervention-extreme-scale 10 \
     --cache-dir data/internvetion_train \
     --output-dir outputs/runs/internvetion_train \
-    --output experiment_configs/internvetion_train_regressor/$EXP_NAME.json
+    --output experiment_configs/internvetion_train/$EXP_NAME.json
 #    --lora-dropout $LORA_DO \
 
 ### cache activations and generate dataset
 python cache_signals.py \
-    --config experiment_configs/internvetion_train_regressor/$EXP_NAME.json
+    --config experiment_configs/internvetion_train/$EXP_NAME.json
 
 ## train introspector
 python train_introspector_with_intervention.py \
-    --config experiment_configs/internvetion_train_regressor/$EXP_NAME.json \
+    --config experiment_configs/internvetion_train/$EXP_NAME.json \
 #    --overwrite-cache
 
 #python intervene_introspector.py \
@@ -106,3 +108,5 @@ python train_introspector_with_intervention.py \
 # also changed neuron from 10.24 -> 1.24, hopefully better? if not it's not an layer issue, but learnability issue, then we need to try regression head
 # best for N1.24 is weirdly around -0.19 (R=16,lr=1e-7)/-0.18 (R=2,lr=5e-7), but nothing more than that. then on test (NTP), it's -0.9, then almost zero for pred and regression
 # I think these may have to do with the random value used as label, maybe some runs are more natural than others
+
+# okay, the fix is increasing the range of intervention signals injected

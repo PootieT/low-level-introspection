@@ -24,6 +24,7 @@ python analysis/plot_lora_weight_pattern.py \
 import argparse
 import re
 from pathlib import Path
+from typing import List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -102,10 +103,15 @@ def normalize_per_column(mat):
     return mat / colmax
 
 
-def main():
-    args = parse_args()
-    sfile = resolve_safetensors(args.checkpoint)
-    out_dir = args.output_dir or sfile.parent
+def main(
+    checkpoint: str,
+    output_dir: str,
+    highlight_layer: Optional[int] = None,
+):
+    output_dir = Path(output_dir)
+    checkpoint = Path(checkpoint)
+    sfile = resolve_safetensors(checkpoint)
+    out_dir = output_dir / f'{str(sfile).split("/")[-4]}-{str(sfile).split("/")[-3]}'
     out_dir.mkdir(parents=True, exist_ok=True)
 
     norms = load_lora_norms(sfile)
@@ -133,9 +139,9 @@ def main():
     plt.figure(figsize=(8, 5))
     for j, m in enumerate(modules):
         plt.plot(layers, norm_mat[:, j], marker="o", label=m)
-    if args.highlight_layer is not None:
-        plt.axvline(args.highlight_layer, color="k", ls="--", alpha=0.6,
-                    label=f"layer {args.highlight_layer}")
+    if highlight_layer is not None:
+        plt.axvline(highlight_layer, color="k", ls="--", alpha=0.6,
+                    label=f"layer {highlight_layer}")
     plt.xlabel("layer"); plt.ylabel("||dW||_F (per-module normalized)")
     plt.title("LoRA update magnitude across layers")
     plt.ylim(0, 1.02)
@@ -149,4 +155,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # args = parse_args()
+    # main(**vars(args))
+    main(
+        checkpoint="/projectnb/llamagrp/peter/low-level-introspection/outputs/runs/internvetion_train/intervention_train_reg_extreme10_300K/checkpoint-9375",
+        output_dir="outputs/plots/lora_weight_pattern",
+        highlight_layer=10,
+    )
