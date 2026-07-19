@@ -166,6 +166,7 @@ def load_model_and_data(config: ExperimentConfig, checkpoint: Path):
 @torch.no_grad()
 def endogenous_predictions(model, dataset, collator, batch_size):
     """Regression prediction WITHOUT intervention, and the true activation."""
+    print("forward pass without intervention to collect ground truth activations")
     from torch.utils.data import DataLoader
     dl = DataLoader(dataset, batch_size=batch_size, collate_fn=collator, shuffle=False)
     preds, acts = [], []
@@ -293,10 +294,11 @@ def trace_batch(lm, layers, embed, norm, inputs, abs_pos, inject_layer, neuron, 
     bs = inputs["input_ids"].shape[0]
     bidx = torch.arange(bs, device=abs_pos.device)
     with lm.trace(inputs):
+        emb = embed.output[bidx, -1, :].save()
+
         # ---- inject: overwrite the neuron's SiLU activation at (abs_pos) ----
         layers[inject_layer].mlp.act_fn.output[bidx, abs_pos, neuron] = v
 
-        emb = embed.output[bidx, -1, :].save()
         attn = {L: layers[L].self_attn.output[0][bidx, -1, :].save() for L in range(n_layers)}
         mlp = {L: layers[L].mlp.output[bidx, -1, :].save() for L in range(n_layers)}
         final_resid = layers[n_layers - 1].output[0][bidx, -1, :].save()
@@ -365,6 +367,7 @@ def main():
     if not idx:
         raise SystemExit("No success examples selected; loosen --success-threshold.")
     sub = test_dataset.select(idx)
+    print(f"{len(idx)} endogenous examples selected ...")
 
     # ---- dose-response grid over the neuron's endogenous gaussian ----
     stats = signal_ranges[(inject_layer, neuron)]
