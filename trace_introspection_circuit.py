@@ -390,7 +390,7 @@ def main():
     bias = float(model.regression_head.bias.detach().flatten()[0].cpu())
 
     # ---- select endogenous-success examples ----
-    preds, acts = endogenous_predictions(model, test_dataset.select(range(50)), collator, args.batch_size)
+    preds, acts = endogenous_predictions(model, test_dataset, collator, args.batch_size)
     idx = select_success_indices(preds, acts, args.success_threshold, args.n_examples, args.max_scan)
     if not idx:
         raise SystemExit("No success examples selected; loosen --success-threshold.")
