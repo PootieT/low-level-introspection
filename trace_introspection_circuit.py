@@ -32,6 +32,7 @@ python trace_introspection_circuit.py \
 from __future__ import annotations
 
 import os
+import pdb
 import glob
 import json
 import argparse
@@ -334,8 +335,8 @@ def trace_batch(lm, layers, embed, norm, inputs, abs_pos, inject_layer, inject_p
             # --- mlp block ---
             mlp[L] = layer.mlp.output[bidx, -1, :].save()
             # --- residual after the layer (both positions, for decodability) ---
-            resid_inj[L] = layer.output[0][bidx, abs_pos, :].save()
-            resid_last[L] = layer.output[0][bidx, -1, :].save()
+            resid_inj[L] = layer.output[bidx, abs_pos, :].save()
+            resid_last[L] = layer.output[bidx, -1, :].save()
         normed = norm.output[bidx, -1, :].save()
 
     val = lambda p: p.value if hasattr(p, "value") else p
@@ -389,7 +390,7 @@ def main():
     bias = float(model.regression_head.bias.detach().flatten()[0].cpu())
 
     # ---- select endogenous-success examples ----
-    preds, acts = endogenous_predictions(model, test_dataset, collator, args.batch_size)
+    preds, acts = endogenous_predictions(model, test_dataset.select(range(50)), collator, args.batch_size)
     idx = select_success_indices(preds, acts, args.success_threshold, args.n_examples, args.max_scan)
     if not idx:
         raise SystemExit("No success examples selected; loosen --success-threshold.")
