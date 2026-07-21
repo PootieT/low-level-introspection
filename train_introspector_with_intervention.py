@@ -69,6 +69,7 @@ from src.introspector.training.model import (
     replace_lora_with_gated_version,
     IntrospectionRegressionModel,
     RegressionHeadSaveCallback,
+    InterventionAnnealCallback,
     load_regression_head,
 )
 from train_introspector import (
@@ -221,11 +222,12 @@ def evaluate_interventional_test(
     here by construction: any correlation is genuine causal reading. This is the
     metric to select on.
     """
-    prev_dist = model.intervention_distribution
+    prev_dist, prev_scale = model.intervention_distribution, model.intervention_scale
     model.intervention_distribution = distribution
+    model.intervention_scale = 1.0   # endogenous-matched, regardless of the annealed training scale
     model.seed_intervention_rng(config.seed)
     X, y_inj = _extract_readout_features(model, eval_dataset, collator, config, do_intervention=True)
-    model.intervention_distribution = prev_dist
+    model.intervention_distribution, model.intervention_scale = prev_dist, prev_scale
 
     head = model.regression_head
     with torch.no_grad():
@@ -310,11 +312,12 @@ def refit_regression_head(
     print(f"  test ENDOGENOUS   corr={endo_metrics['corr']:.4f}  l2={endo_metrics['l2_dist']:.4f}")
 
     # ---- (2) interventional (causal-transfer) test eval, gaussian injection ----
-    prev_dist = model.intervention_distribution
+    prev_dist, prev_scale = model.intervention_distribution, model.intervention_scale
     model.intervention_distribution = "gaussian"
+    model.intervention_scale = 1.0   # endogenous-matched, regardless of the annealed training scale
     model.seed_intervention_rng(config.seed)
     Xiv, yiv = _extract_readout_features(model, eval_dataset, collator, config, do_intervention=True)
-    model.intervention_distribution = prev_dist
+    model.intervention_distribution, model.intervention_scale = prev_dist, prev_scale
     interv_metrics = compute_metrics_from_numericals(probe.predict(Xiv).numpy(), yiv.numpy())
     print(f"  test INTERVENTION corr={interv_metrics['corr']:.4f}  l2={interv_metrics['l2_dist']:.4f}  (gaussian)")
 
@@ -613,6 +616,21 @@ def main():
         report_to="wandb",
     )
 
+    callbacks = None
+    if config.use_regressor:
+        # persist the custom regression head next to every checkpoint (PEFT won't)
+        callbacks = [RegressionHeadSaveCallback(model)]
+        if config.training_config.intervention_anneal:
+            callbacks.append(InterventionAnnealCallback(
+                model,
+                scale_start=config.training_config.intervention_scale_start,
+                scale_end=config.training_config.intervention_scale_end,
+                schedule=config.training_config.intervention_anneal_schedule,
+                start_frac=config.training_config.intervention_anneal_start_frac,
+                end_frac=config.training_config.intervention_anneal_end_frac,
+                log_every=math.ceil(400 / config.training_config.train_batch_size),
+            ))
+
     trainer = InterventionTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -625,8 +643,7 @@ def main():
         preprocess_logits_for_metrics=None if config.use_regressor else get_argmax_from_logits,
         experiment_config=config,
         do_intervention=not args.no_intervention,
-        # persist the custom regression head next to every checkpoint (PEFT won't)
-        callbacks=[RegressionHeadSaveCallback(model)] if config.use_regressor else None,
+        callbacks=callbacks,
     )
 
     ckpt_dirs = glob.glob(f"{output_dir}/checkpoint-*")

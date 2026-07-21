@@ -126,6 +126,18 @@ def parse_args() -> argparse.Namespace:
                         help="Multiplier on the empirical range width used when "
                              "--intervention-signal-distribution=extreme. Sweep this to find where the "
                              "model starts tracking the intervened value.")
+    parser.add_argument("--intervention-anneal", action="store_true",
+                        help="Anneal the intervention spread from --intervention-scale-start down to "
+                             "--intervention-scale-end over training (start easy on a large injected "
+                             "signal, end on the endogenous-matched distribution).")
+    parser.add_argument("--intervention-scale-start", type=float, default=100.0)
+    parser.add_argument("--intervention-scale-end", type=float, default=1.0)
+    parser.add_argument("--intervention-anneal-schedule", type=str, default="log",
+                        choices=["log", "linear", "cosine"])
+    parser.add_argument("--intervention-anneal-start-frac", type=float, default=0.0,
+                        help="Fraction of training before annealing begins (hold at scale-start).")
+    parser.add_argument("--intervention-anneal-end-frac", type=float, default=1.0,
+                        help="Fraction of training at which annealing completes (hold at scale-end after).")
 
     # ---- lora ----
     parser.add_argument("--lora-r", type=int, default=16)
@@ -239,6 +251,12 @@ def main() -> None:
         training_config =TrainingConfig(
             intervention_signal_distribution=args.intervention_signal_distribution,
             intervention_extreme_scale=args.intervention_extreme_scale,
+            intervention_anneal=args.intervention_anneal,
+            intervention_scale_start=args.intervention_scale_start,
+            intervention_scale_end=args.intervention_scale_end,
+            intervention_anneal_schedule=args.intervention_anneal_schedule,
+            intervention_anneal_start_frac=args.intervention_anneal_start_frac,
+            intervention_anneal_end_frac=args.intervention_anneal_end_frac,
             learning_rate=args.learning_rate,
             train_batch_size=args.train_batch_size,
             eval_batch_size=args.eval_batch_size,

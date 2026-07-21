@@ -1,5 +1,6 @@
 import os
 import pdb
+import math
 import random
 import operator
 from typing import Any, Optional
@@ -197,6 +198,11 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
         self.intervention_distribution = intervention_distribution
         self.intervention_extreme_scale = intervention_extreme_scale
         self.intervention_fn = intervention_fn  # optional custom intervention sampler
+        # single annealable spread multiplier used by every distribution
+        # (gaussian: std*scale, extreme: range*scale). Initialized to preserve the
+        # non-annealed behavior: extreme_scale for extreme, 1.0 (endogenous) else.
+        self.intervention_scale = (intervention_extreme_scale
+                                   if intervention_distribution == "extreme" else 1.0)
         # dedicated RNG for intervention sampling so eval passes can be made
         # reproducible independently of training-time draws (see seed_intervention_rng)
         self.intervention_rng = random.Random()
@@ -207,6 +213,10 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
         before an evaluation loop."""
         self.intervention_rng = random.Random(seed)
 
+    def set_intervention_scale(self, scale):
+        """Set the current intervention spread multiplier (annealing hook)."""
+        self.intervention_scale = float(scale)
+
     def sample_intervention_values(self,signal_layers,signal_indices,device):
         vals = []
         for layer, idx in zip(signal_layers.tolist(),signal_indices.tolist()):
@@ -214,17 +224,16 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
             if self.intervention_fn is not None:
                 val = self.intervention_fn(layer=layer, idx=idx, **stats)
             elif self.intervention_distribution == "gaussian":
-                # fit a gaussian to the neuron's empirical activations and draw from it
-                val = self.intervention_rng.gauss(stats["mean"], stats["std"])
+                # gaussian fit to the neuron's empirical activations; intervention_scale
+                # widens the std (=1 -> exactly endogenous, the annealing target).
+                val = self.intervention_rng.gauss(stats["mean"], self.intervention_scale * stats["std"])
             elif self.intervention_distribution == "uniform":
                 val = self.intervention_rng.uniform(stats["min"], stats["max"])
             elif self.intervention_distribution == "extreme":
-                # sanity check: sample from a range intervention_extreme_scale x
-                # wider than the empirical range, centered on the empirical
-                # midpoint. The much larger signal should be easier to read out if
-                # the model can read the neuron at all.
+                # uniform over a range intervention_scale x the empirical range,
+                # centered on the empirical midpoint (=1 -> natural range).
                 center = (stats["min"] + stats["max"]) / 2
-                half_width = self.intervention_extreme_scale * (stats["max"] - stats["min"]) / 2
+                half_width = self.intervention_scale * (stats["max"] - stats["min"]) / 2
                 val = self.intervention_rng.uniform(center - half_width, center + half_width)
             else:
                 raise ValueError(
@@ -361,6 +370,69 @@ class RegressionHeadSaveCallback(TrainerCallback):
         path = os.path.join(ckpt_dir, REGRESSION_HEAD_FILENAME)
         torch.save(self.model.regression_head.state_dict(), path)
         print(f"[RegressionHeadSaveCallback] saved regression head -> {path}")
+
+
+def anneal_value(step, max_steps, start, end, start_frac=0.0, end_frac=1.0, schedule="log"):
+    """
+    Interpolate a scalar from `start` -> `end` over the training window
+    [start_frac, end_frac] (as fractions of max_steps). Before the window it is
+    `start`, after it is `end`. Default schedule is 'log' (geometric), the right
+    choice when start/end span orders of magnitude; also supports 'linear'/'cosine'.
+    """
+    if max_steps is None or max_steps <= 0:
+        return start
+    frac = step / max_steps
+    if frac <= start_frac:
+        p = 0.0
+    elif frac >= end_frac:
+        p = 1.0
+    else:
+        p = (frac - start_frac) / max(end_frac - start_frac, 1e-8)
+    if schedule == "linear":
+        return start + (end - start) * p
+    if schedule == "cosine":
+        return end + (start - end) * 0.5 * (1 + math.cos(math.pi * p))
+    # 'log' / geometric (default)
+    if start <= 0 or end <= 0:
+        return start + (end - start) * p
+    return start * (end / start) ** p
+
+
+class InterventionAnnealCallback(TrainerCallback):
+    """
+    Anneal the intervention distribution's spread (model.intervention_scale) from
+    `scale_start` down to `scale_end` over training. Training starts on an easy,
+    large injected signal and ends on the endogenous-matched distribution
+    (scale ~1) the model must generalize to at test time.
+    """
+
+    def __init__(self, model, scale_start, scale_end, schedule="log",
+                 start_frac=0.0, end_frac=1.0, log_every=0):
+        self.model = model
+        self.scale_start = scale_start
+        self.scale_end = scale_end
+        self.schedule = schedule
+        self.start_frac = start_frac
+        self.end_frac = end_frac
+        self.log_every = log_every
+
+    def _set(self, state):
+        scale = anneal_value(state.global_step, state.max_steps,
+                             self.scale_start, self.scale_end,
+                             self.start_frac, self.end_frac, self.schedule)
+        self.model.set_intervention_scale(scale)
+        return scale
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        scale = self._set(state)
+        print(f"[anneal] start intervention_scale={scale:.4g} "
+              f"({self.scale_start:g} -> {self.scale_end:g}, schedule={self.schedule}, "
+              f"window=[{self.start_frac},{self.end_frac}])")
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        scale = self._set(state)
+        if self.log_every and state.global_step % self.log_every == 0:
+            print(f"[anneal] step {state.global_step}/{state.max_steps} intervention_scale={scale:.4g}")
 
 
 def load_regression_head(model, ckpt_dir):

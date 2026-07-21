@@ -42,6 +42,15 @@ class TrainingConfig(BaseModel):
     # how much wider than the empirical range to sample from when
     # intervention_signal_distribution == "extreme"
     intervention_extreme_scale: float = 1000.0
+    # anneal the intervention spread (range/std multiplier) from scale_start ->
+    # scale_end over the training window [start_frac, end_frac]; scale_end=1 lands
+    # on the endogenous-matched distribution the model must generalize to.
+    intervention_anneal: bool = False
+    intervention_scale_start: float = 100.0
+    intervention_scale_end: float = 1.0
+    intervention_anneal_schedule: str = "log"   # log | linear | cosine
+    intervention_anneal_start_frac: float = 0.0
+    intervention_anneal_end_frac: float = 1.0
 
 
 class EvalConfig(BaseModel):
