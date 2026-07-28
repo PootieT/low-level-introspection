@@ -54,6 +54,7 @@ def parse_args():
     p.add_argument("--config", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path, default=None,
                    help="Checkpoint dir override (default: latest under output_dir/experiment_name).")
+    p.add_argument("--no-success-filter", action="store_true", help="Disable success sample filtering.")
     p.add_argument("--n-examples", type=int, default=200,
                    help="Test examples used per ablation eval (subset for speed).")
     p.add_argument("--success-threshold", type=float, default=0.02,
@@ -64,6 +65,7 @@ def parse_args():
                    help="Comma-separated layer indices to ablate (default: all).")
     p.add_argument("--modules", type=str, default=None,
                    help="Comma-separated module names to ablate (default: all present).")
+    p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--output-dir", type=Path, default=None)
     return p.parse_args()
 
@@ -163,14 +165,16 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     model, tokenizer, test_dataset, test_raw, collator, signal_ranges = load_model_and_data(config, checkpoint)
-    # dataset = test_dataset.select(range(min(args.n_examples, len(test_dataset))))
-    # ---- select endogenous-success examples ----
-    preds, acts = endogenous_predictions(model, test_dataset, collator, args.batch_size)
-    idx = select_success_indices(preds, acts, args.success_threshold, args.n_examples, args.max_scan)
-    if not idx:
-        raise SystemExit("No success examples selected; loosen --success-threshold.")
-    dataset = test_dataset.select(idx)
-    print(f"{len(idx)} endogenous examples selected ...")
+    if args.no_success_filter:
+        dataset = test_dataset.select(range(min(args.n_examples, len(test_dataset))))
+    else:
+        # ---- select endogenous-success examples ----
+        preds, acts = endogenous_predictions(model, test_dataset, collator, args.batch_size)
+        idx = select_success_indices(preds, acts, args.success_threshold, args.n_examples, args.max_scan)
+        if not idx:
+            raise SystemExit("No success examples selected; loosen --success-threshold.")
+        dataset = test_dataset.select(idx)
+    print(f"{len(dataset)} endogenous examples selected ...")
 
     lora = find_lora_linears(model)
     if not lora:
