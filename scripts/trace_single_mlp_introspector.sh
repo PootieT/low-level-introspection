@@ -29,6 +29,6 @@ EXP_GROUP=intervention_train_regressor_extreme
 
 python trace_introspection_circuit.py \
     --config experiment_configs/$EXP_GROUP/$EXP_NAME.json \
-    --n-examples 1 \
-    --start-layer 9 \
+    --n-examples 200 \
+    --start-layer 0 \
     --output-dir outputs/circuit/"${EXP_GROUP}/${EXP_NAME}"

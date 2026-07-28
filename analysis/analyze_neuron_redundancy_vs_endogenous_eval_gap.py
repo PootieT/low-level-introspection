@@ -55,8 +55,7 @@ def parse_dir(exp_dir):
 
 REDUNDANCY_CSV = "outputs/circuit/intervention_train_regressor_extreme/intervention_train_reg_extreme10_300K/candidate_neurons.csv"
 
-
-def analyze_correlation(exp_group_path: str, redundancy_csv: str = REDUNDANCY_CSV):
+def analyze_correlation(exp_group_path: str, redundancy_csv: str=REDUNDANCY_CSV):
     exp_group_name = exp_group_path.split("/")[-1]
     all_res = []
     for p in tqdm(glob.glob(os.path.join(exp_group_path, "*/interventional_test_metrics_gaussian.json"))):

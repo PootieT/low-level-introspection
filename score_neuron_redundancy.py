@@ -84,7 +84,7 @@ def parse_args():
                         "covariance is overcomplete/ill-conditioned).")
     p.add_argument("--per-bin", type=int, default=4,
                    help="Neurons to select per R2 decile for the stratified candidate set.")
-    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--max-seq-length", type=int, default=None)
     p.add_argument("--output-dir", type=Path, default=None)
     return p.parse_args()
