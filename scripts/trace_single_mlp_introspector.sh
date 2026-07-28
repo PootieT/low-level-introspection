@@ -20,12 +20,18 @@ echo "Job ID : $JOB_ID  $SGE_TASK_ID"
 echo "=========================================================="
 nvidia-smi
 
-module load cuda/11.8   # 11.2
-module load miniconda/23.11.0
-conda activate /projectnb/llamagrp/peter/low-level-introspection/introspection_env
+#module load cuda/11.8   # 11.2
+#module load miniconda/23.11.0
+#conda activate /projectnb/llamagrp/peter/low-level-introspection/introspection_env
 
-EXP_NAME=intervention_train_reg_extreme10_300K
-EXP_GROUP=intervention_train_regressor_extreme
+#EXP_NAME=intervention_train_reg_extreme10_300K
+#EXP_GROUP=intervention_train_regressor_extreme
+
+# ===== local setup =====
+conda activate introspection
+EXP_NAME=intervention_train_reg_N10.24_3K_fixedPaddingBug
+EXP_GROUP=internvetion_train_regressor
+
 
 python trace_introspection_circuit.py \
     --config experiment_configs/$EXP_GROUP/$EXP_NAME.json \
