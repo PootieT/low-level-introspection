@@ -54,9 +54,67 @@ def parse_dir(exp_dir):
 
 
 REDUNDANCY_CSV = "outputs/circuit/intervention_train_regressor_extreme/intervention_train_reg_extreme10_300K/candidate_neurons.csv"
+SCORE_A_CSV = "outputs/plots/score_A_bypass_ceiling.csv"
 
 
-def analyze_correlation(exp_group_path: str, redundancy_csv: str = REDUNDANCY_CSV):
+def scatter_with_fits(merged, xcol, xlabel, out_png, stats_csv, eval_types, palette, covars, title):
+    """Scatter of test corr vs `xcol`, per-eval-type OLS + Spearman + partial-corr
+    (controlling `covars`), fitted lines + annotation. Returns/saves the stats."""
+    fig, ax = plt.subplots(figsize=(7, 5))
+    sns.scatterplot(x=xcol, y="corr", hue="eval_type", hue_order=eval_types,
+                    palette=palette, data=merged, ax=ax)
+    stat_lines, stat_rows = [], []
+    for et in eval_types:
+        sub = merged[merged["eval_type"] == et].dropna(subset=[xcol, "corr"] + covars)
+        if len(sub) < 3:
+            continue
+        lr = linregress(sub[xcol], sub["corr"])
+        rho, rho_p = spearmanr(sub[xcol], sub["corr"])
+        if covars:
+            pr, pr_p, _ = partial_corr(sub[xcol], sub["corr"], sub[covars].values)
+        else:
+            pr, pr_p = float("nan"), float("nan")
+        xs = np.linspace(sub[xcol].min(), sub[xcol].max(), 100)
+        ax.plot(xs, lr.intercept + lr.slope * xs, color=palette[et], lw=2)
+        stat_lines.append(
+            f"{et} (n={len(sub)}):\n"
+            f"  OLS   slope={lr.slope:+.3f} r={lr.rvalue:+.3f} p={lr.pvalue:.2g}\n"
+            f"  Spear rho={rho:+.3f} p={rho_p:.2g}\n"
+            f"  partial(|{','.join(covars)}) r={pr:+.3f} p={pr_p:.2g}")
+        stat_rows.append({"x": xcol, "eval_type": et, "n": len(sub), "ols_slope": lr.slope,
+                          "ols_r": lr.rvalue, "ols_p": lr.pvalue, "spearman_rho": rho,
+                          "spearman_p": rho_p, "partial_r": pr, "partial_p": pr_p,
+                          "controlled_for": ",".join(covars)})
+    ax.text(0.02, 0.02, "\n".join(stat_lines), transform=ax.transAxes, va="bottom",
+            fontsize=7, family="monospace", bbox=dict(boxstyle="round", fc="white", alpha=0.85))
+    ax.set_xlabel(xlabel); ax.set_ylabel("test correlation"); ax.set_title(title)
+    fig.tight_layout(); fig.savefig(out_png); plt.close(fig)
+    stats_df = pd.DataFrame(stat_rows)
+    stats_df.to_csv(stats_csv, index=False)
+    print(f"\n== corr vs {xcol} ==")
+    print(stats_df.to_string(index=False))
+    return stats_df
+
+
+def confound_colored(merged, xcol, xlabel, covars, eval_types, out_png, title):
+    """Same scatter, points colored by each covariate (visual confound check)."""
+    if not covars:
+        return
+    fig, axes = plt.subplots(len(covars), len(eval_types),
+                             figsize=(5.5 * len(eval_types), 4 * len(covars)), squeeze=False)
+    for i, cov in enumerate(covars):
+        for j, et in enumerate(eval_types):
+            sub = merged[merged["eval_type"] == et].dropna(subset=[xcol, "corr", cov])
+            axc = axes[i][j]
+            sc = axc.scatter(sub[xcol], sub["corr"], c=sub[cov], cmap="viridis", s=30)
+            fig.colorbar(sc, ax=axc, label=cov)
+            axc.set_title(et); axc.set_xlabel(xlabel); axc.set_ylabel("corr")
+    fig.suptitle(title)
+    fig.tight_layout(); fig.savefig(out_png); plt.close(fig)
+
+
+def analyze_correlation(exp_group_path: str, redundancy_csv: str = REDUNDANCY_CSV,
+                        score_a_csv: str = SCORE_A_CSV):
     exp_group_name = exp_group_path.split("/")[-1]
     all_res = []
     for p in tqdm(glob.glob(os.path.join(exp_group_path, "*/interventional_test_metrics_gaussian.json"))):
@@ -92,73 +150,42 @@ def analyze_correlation(exp_group_path: str, redundancy_csv: str = REDUNDANCY_CS
     plt.savefig("outputs/plots/box_test_correlation_vs_neuron_redundancy_bin.png")
     plt.close()
 
-    # 2) scatterplot vs actual redundancy R2, hue = eval type (+ robust stats)
+    # 2) merge in Score B (same-layer redundancy + covariates) and Score A
+    #    (base-model bypass ceiling), then correlate each vs test corr.
     red = pd.read_csv(redundancy_csv).rename(columns={"neuron": "neuron_index"})
     covars = [c for c in ["std", "firing_rate"] if c in red.columns]
     merged = long_df.merge(red[["neuron_index", "R2"] + covars], on="neuron_index", how="left")
+    if os.path.exists(score_a_csv):
+        sa = pd.read_csv(score_a_csv)[["neuron_index", "score_A"]]
+        merged = merged.merge(sa, on="neuron_index", how="left")
+    else:
+        print(f"[warn] Score A csv not found ({score_a_csv}); skipping Score A analysis.")
 
     eval_types = ["non_intervention", "intervention"]
     palette = dict(zip(eval_types, sns.color_palette(n_colors=len(eval_types))))
-    fig, ax = plt.subplots(figsize=(7, 5))
-    sns.scatterplot(x="R2", y="corr", hue="eval_type", hue_order=eval_types,
-                    palette=palette, data=merged, ax=ax)
 
-    # per-eval-type stats: OLS (leverage-sensitive) + Spearman (rank, robust) +
-    # partial correlation controlling std/firing (confound-adjusted)
-    stat_lines, stat_rows = [], []
-    for et in eval_types:
-        sub = merged[merged["eval_type"] == et].dropna(subset=["R2", "corr"] + covars)
-        if len(sub) < 3:
-            continue
-        lr = linregress(sub["R2"], sub["corr"])
-        rho, rho_p = spearmanr(sub["R2"], sub["corr"])
-        if covars:
-            pr, pr_p, dof = partial_corr(sub["R2"], sub["corr"], sub[covars].values)
-        else:
-            pr, pr_p = float("nan"), float("nan")
-        xs = np.linspace(sub["R2"].min(), sub["R2"].max(), 100)
-        ax.plot(xs, lr.intercept + lr.slope * xs, color=palette[et], lw=2)
-        stat_lines.append(
-            f"{et} (n={len(sub)}):\n"
-            f"  OLS   slope={lr.slope:+.3f} r={lr.rvalue:+.3f} p={lr.pvalue:.2g}\n"
-            f"  Spear rho={rho:+.3f} p={rho_p:.2g}\n"
-            f"  partial(|{','.join(covars)}) r={pr:+.3f} p={pr_p:.2g}")
-        stat_rows.append({"eval_type": et, "n": len(sub), "ols_slope": lr.slope,
-                          "ols_r": lr.rvalue, "ols_p": lr.pvalue, "spearman_rho": rho,
-                          "spearman_p": rho_p, "partial_r": pr, "partial_p": pr_p,
-                          "controlled_for": ",".join(covars)})
-    ax.text(0.02, 0.02, "\n".join(stat_lines), transform=ax.transAxes, va="bottom",
-            fontsize=7, family="monospace",
-            bbox=dict(boxstyle="round", fc="white", alpha=0.85))
-    ax.set_xlabel("same-layer redundancy R2 (context-predictability)")
-    ax.set_ylabel("test correlation")
-    ax.set_title("test correlation vs neuron redundancy R2")
-    fig.tight_layout()
-    fig.savefig("outputs/plots/scatter_test_correlation_vs_neuron_redundancy_R2.png")
-    plt.close(fig)
+    # Score B: same-layer redundancy R2
+    scatter_with_fits(
+        merged, xcol="R2", xlabel="same-layer redundancy R2 (Score B)",
+        out_png="outputs/plots/scatter_test_correlation_vs_neuron_redundancy_R2.png",
+        stats_csv="outputs/plots/redundancy_correlation_stats.csv",
+        eval_types=eval_types, palette=palette, covars=covars,
+        title="test correlation vs neuron redundancy R2 (Score B)")
+    confound_colored(merged, "R2", "redundancy R2", covars, eval_types,
+                     "outputs/plots/scatter_covariate_colored.png",
+                     "corr vs R2 colored by covariate (confound check)")
 
-    stats_df = pd.DataFrame(stat_rows)
-    stats_df.to_csv("outputs/plots/redundancy_correlation_stats.csv", index=False)
-    print(stats_df.to_string(index=False))
-
-    # 3) confound check: same scatter, points colored by each covariate.
-    # If the R2 trend is really a std/firing trend, the color gradient will run
-    # along R2 and the partial correlation above will be ~0.
-    if covars:
-        fig2, axes = plt.subplots(len(covars), len(eval_types),
-                                  figsize=(5.5 * len(eval_types), 4 * len(covars)), squeeze=False)
-        for i, cov in enumerate(covars):
-            for j, et in enumerate(eval_types):
-                sub = merged[merged["eval_type"] == et].dropna(subset=["R2", "corr", cov])
-                axc = axes[i][j]
-                sc = axc.scatter(sub["R2"], sub["corr"], c=sub[cov], cmap="viridis", s=30)
-                fig2.colorbar(sc, ax=axc, label=cov)
-                axc.set_title(f"{et}")
-                axc.set_xlabel("redundancy R2"); axc.set_ylabel("corr")
-        fig2.suptitle("corr vs R2 colored by covariate (confound check)")
-        fig2.tight_layout()
-        fig2.savefig("outputs/plots/scatter_covariate_colored.png")
-        plt.close(fig2)
+    # Score A: base-model bypass ceiling (faithful context-predictability at readout)
+    if "score_A" in merged.columns:
+        scatter_with_fits(
+            merged, xcol="score_A", xlabel="base-model bypass ceiling (Score A)",
+            out_png="outputs/plots/scatter_test_correlation_vs_score_A.png",
+            stats_csv="outputs/plots/score_A_correlation_stats.csv",
+            eval_types=eval_types, palette=palette, covars=covars,
+            title="test correlation vs base-model bypass ceiling (Score A)")
+        confound_colored(merged, "score_A", "bypass ceiling (Score A)", covars, eval_types,
+                         "outputs/plots/scatter_score_A_covariate_colored.png",
+                         "corr vs Score A colored by covariate (confound check)")
     return
 
 
