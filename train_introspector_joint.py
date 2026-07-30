@@ -39,10 +39,15 @@ from functools import partial
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from scipy.stats import pearsonr
+from sklearn.linear_model import Ridge
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from datasets import load_from_disk
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
@@ -50,7 +55,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 from src.introspector.config import ExperimentConfig
 from src.introspector.prompts import PROMPT_REGISTRY
 from src.introspector.training.collator import LoRAGatingCollator
-from src.introspector.training.metrics import compute_metrics
+from src.introspector.training.metrics import compute_metrics, compute_metrics_from_numericals
 from src.introspector.training.model import (
     IntrospectionRegressionModel,
     RegressionHeadSaveCallback,
@@ -74,6 +79,9 @@ def parse_args():
     p.add_argument("--joint-loss-weight", type=float, default=0.5,
                    help="Weight w on the ENDOGENOUS term; interventional gets (1-w). "
                         "Keep constant; sweep across runs to map the frontier.")
+    p.add_argument("--routing-probe-scale", type=float, default=10.0,
+                   help="Injection scale for the routing-probe diagnostic (use a LARGE learnable "
+                        "scale so 'does it reach the readout' is detectable above the bf16 floor).")
     return p.parse_args()
 
 
@@ -118,7 +126,10 @@ class JointInterventionTrainer(InterventionTrainer):
 
 @torch.no_grad()
 def eval_endogenous_test(model, dataset, collator, config, output_dir, suffix="_endogenous"):
-    """corr(head(no-injection), true activation) on the (for_prediction) test set."""
+    """
+    Endogenous eval (no injection): full metrics (corr, l2_dist, avg/std diff, ...)
+    matching the interventional eval, plus a predicted-vs-actual scatter.
+    """
     dl = DataLoader(dataset, batch_size=config.training_config.eval_batch_size,
                     collate_fn=collator, shuffle=False)
     head = model.regression_head
@@ -132,13 +143,121 @@ def eval_endogenous_test(model, dataset, collator, config, output_dir, suffix="_
         h = out.hidden_states[-1][:, -1, :]
         pred = head(h.to(device=head.weight.device, dtype=head.weight.dtype)).squeeze(-1)
         preds.append(pred.float().cpu()); acts.append(activation.float().cpu())
-    p, a = torch.cat(preds).numpy(), torch.cat(acts).numpy()
-    corr = float(pearsonr(p, a)[0]) if (np.std(p) > 1e-12 and np.std(a) > 1e-12) else float("nan")
-    metrics = {"corr": corr}
+    pred, act = torch.cat(preds).numpy(), torch.cat(acts).numpy()
+
+    metrics = compute_metrics_from_numericals(pred, act)   # corr, l2_dist, avg_diff, std_diff, ...
     with open(Path(output_dir) / f"endogenous_test_metrics{suffix}.json", "w") as f:
         json.dump(metrics, f, indent=2)
-    print(f"[joint] endogenous test corr = {corr:.4f}")
-    return corr
+    pd.DataFrame({"predictions": pred, "activation": act}).to_csv(
+        Path(output_dir) / f"endogenous_test_predictions{suffix}.csv", index=False)
+
+    plt.figure(figsize=(6, 6))
+    plt.scatter(act, pred, s=12, alpha=0.5)
+    lim = [float(min(act.min(), pred.min())), float(max(act.max(), pred.max()))]
+    plt.plot(lim, lim, "k--", lw=1, alpha=0.6)   # y = x reference
+    plt.xlabel("true activation"); plt.ylabel("prediction")
+    plt.title(f"endogenous: pred vs actual "
+              f"(corr={metrics['corr']:.3f}, l2={metrics['l2_dist']:.3f})")
+    plt.tight_layout()
+    plt.savefig(Path(output_dir) / f"endogenous_test_scatter{suffix}.png", dpi=150)
+    plt.close()
+    print(f"[joint] endogenous test: corr={metrics['corr']:.4f} l2={metrics['l2_dist']:.4f} "
+          f"avg_diff={metrics['avg_diff']:.4f} std_diff={metrics['std_diff']:.4f}")
+    return metrics
+
+
+# ======================================================================
+# Routing probe: does the injected value REACH the readout of the TRAINED
+# model (fresh-probe ceiling) vs does the TRAINED HEAD read it, by position.
+# ceiling high, head low -> routed but not read (optimization/head)
+# ceiling low            -> not routed (routing/capacity)
+# NB: this is the TRAINED model (a ceiling conditional on this run), NOT a
+# pre-LoRA base-model floor.
+# ======================================================================
+@torch.no_grad()
+def _extract_interv_readout(model, dataset, collator, config, scale, distribution="extreme"):
+    """Under injection at `scale`, collect readout features, injected values,
+    trained-head preds, and token_positions."""
+    prev_dist, prev_scale = model.intervention_distribution, model.intervention_scale
+    model.intervention_distribution, model.intervention_scale = distribution, scale
+    model.seed_intervention_rng(config.seed)
+    dl = DataLoader(dataset, batch_size=config.training_config.eval_batch_size,
+                    collate_fn=collator, shuffle=False)
+    head = model.regression_head
+    feats, inj, hpred, pos = [], [], [], []
+    for batch in dl:
+        batch = batch.to(model.device)
+        out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+                    lora_token_mask=batch.get("lora_token_mask"),
+                    token_position=batch["token_position"], signal_layer=batch["signal_layer"],
+                    signal_index=batch["signal_index"], do_intervention=True, output_hidden_states=True)
+        h = out.hidden_states[-1][:, -1, :]
+        feats.append(h.float().cpu())
+        inj.append(out.intervention_values.float().cpu())
+        hpred.append(head(h.to(device=head.weight.device, dtype=head.weight.dtype)).squeeze(-1).float().cpu())
+        pos.append(batch["token_position"].cpu())
+    model.intervention_distribution, model.intervention_scale = prev_dist, prev_scale
+    return (torch.cat(feats).numpy(), torch.cat(inj).numpy(),
+            torch.cat(hpred).numpy(), torch.cat(pos).numpy())
+
+
+def _probe_corr(X, y, seed, ridge=10.0, split=0.7):
+    """Held-out corr of a standardized ridge probe X->y (the routing ceiling)."""
+    n = len(y)
+    if n < 10:
+        return float("nan")
+    perm = np.random.RandomState(seed).permutation(n)
+    X, y = X[perm], y[perm]
+    ntr = int(n * split)
+    if ntr < 5 or n - ntr < 5:
+        return float("nan")
+    mu, sd = X[:ntr].mean(0), X[:ntr].std(0)
+    sd = np.where(sd < 1e-8, 1.0, sd)
+    Xs = (X - mu) / sd
+    reg = Ridge(alpha=ridge).fit(Xs[:ntr], y[:ntr])
+    p = reg.predict(Xs[ntr:])
+    if np.std(p) < 1e-12 or np.std(y[ntr:]) < 1e-12:
+        return float("nan")
+    return float(pearsonr(p, y[ntr:])[0])
+
+
+def _corr_or_nan(a, b):
+    return float(pearsonr(a, b)[0]) if (np.std(a) > 1e-12 and np.std(b) > 1e-12) else float("nan")
+
+
+def routing_probe_by_position(model, dataset, collator, config, output_dir, scale, n_bins=6):
+    X, inj, hpred, pos = _extract_interv_readout(model, dataset, collator, config, scale)
+    rows = [{"position_bin": "all", "pos_lo": float(pos.min()), "pos_hi": float(pos.max()),
+             "n": int(len(inj)), "ceiling_corr": _probe_corr(X, inj, config.seed),
+             "head_corr": _corr_or_nan(hpred, inj)}]
+    # stratify by token_position if it varies across the eval set
+    if len(np.unique(pos)) > 1:
+        edges = np.unique(np.quantile(pos, np.linspace(0, 1, n_bins + 1)))
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            m = (pos >= lo) & (pos <= hi)
+            if m.sum() < 20:
+                continue
+            rows.append({"position_bin": f"[{lo:.0f},{hi:.0f}]", "pos_lo": float(lo), "pos_hi": float(hi),
+                         "n": int(m.sum()), "ceiling_corr": _probe_corr(X[m], inj[m], config.seed),
+                         "head_corr": _corr_or_nan(hpred[m], inj[m])})
+    df = pd.DataFrame(rows)
+    df.to_csv(Path(output_dir) / "routing_probe_by_position.csv", index=False)
+    print(f"[joint] routing probe (inject scale={scale}):")
+    print(df.to_string(index=False))
+
+    binned = df[df["position_bin"] != "all"]
+    if len(binned) >= 2:
+        centers = (binned["pos_lo"] + binned["pos_hi"]) / 2
+        plt.figure(figsize=(7, 5))
+        plt.plot(centers, binned["ceiling_corr"], "o-", label="routing ceiling (fresh probe)")
+        plt.plot(centers, binned["head_corr"], "s--", label="trained head")
+        plt.xlabel("introspected token position"); plt.ylabel("interventional corr")
+        plt.title(f"routing vs reading by position (inject scale={scale})")
+        plt.ylim(-0.05, 1.02); plt.legend(); plt.grid(alpha=0.2)
+        plt.tight_layout()
+        plt.savefig(Path(output_dir) / "routing_probe_by_position.png", dpi=150)
+        plt.close()
+    return df
 
 
 def main():
@@ -255,6 +374,12 @@ def main():
                                  config=config, output_dir=output_dir,
                                  distribution="gaussian", suffix="_gaussian")
     eval_endogenous_test(model, test_dataset_pred, pred_collator, config, output_dir)
+
+    # diagnostic: is the injected value routed to the readout (ceiling) vs read by
+    # the trained head, stratified by token position -> tells us whether earlier-
+    # position failure is a routing (capacity) or reading (optimization) problem.
+    routing_probe_by_position(model, test_dataset_pred, pred_collator, config, output_dir,
+                              scale=args.routing_probe_scale)
 
 
 if __name__ == "__main__":
