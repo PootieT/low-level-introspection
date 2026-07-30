@@ -285,28 +285,36 @@ def routing_probe_by_position(model, dataset, collator, config, output_dir, scal
 
 
 def interventional_scale_sweep(model, dataset, collator, config, output_dir, scales,
-                               distribution="gaussian", suffix=""):
+                               distribution="gaussian", n_pca=256, suffix=""):
     """
-    Trained-head interventional corr vs injection scale (gaussian: N(mean, scale*std)).
-    A clean linear reader is scale-invariant, so corr RISING with scale is the
-    fingerprint of a numerical/noise floor (or saturation): natural-scale (scale=1)
-    signal is below the floor. Where the curve crosses into usable corr tells you
-    how far natural-scale reading is from working.
+    Interventional corr vs injection scale, for BOTH the trained head and a fresh
+    ceiling probe (gaussian: N(mean, scale*std)).
+
+    corr = 1 / sqrt(1 + sigma_eps^2 / (g^2 sigma_v^2)) for a linear channel with
+    routing gain g and fixed context-noise eps -> corr rises with scale purely
+    from SNR, no floor/nonlinearity needed. Decision:
+      * CEILING also rises with scale  -> SNR/routing-gain limited (fundamental;
+        natural-scale signal is swamped by context noise; needs higher gain).
+      * CEILING flat & high, head rises -> signal is linearly present at natural
+        scale; the head was just trained at large scale (distribution mismatch).
     """
     rows = []
     for s in scales:
-        _, inj, hpred, _ = _extract_interv_readout(model, dataset, collator, config, s, distribution=distribution)
-        rows.append({"scale": s, "head_corr": _corr_or_nan(hpred, inj), "inj_std": float(np.std(inj))})
+        X, inj, hpred, _ = _extract_interv_readout(model, dataset, collator, config, s, distribution=distribution)
+        ceil, head, alpha = _ceiling_and_head(X, inj, hpred, config.seed, n_pca)
+        rows.append({"scale": s, "head_corr": head, "ceiling_corr": ceil,
+                     "inj_std": float(np.std(inj)), "best_alpha": alpha})
     df = pd.DataFrame(rows)
     df.to_csv(Path(output_dir) / f"interventional_scale_sweep{suffix}.csv", index=False)
     print(f"[joint] interventional scale sweep ({distribution}, suffix={suffix or 'native'}):")
     print(df.to_string(index=False))
     plt.figure(figsize=(7, 5))
-    plt.plot(df["scale"], df["head_corr"], "o-")
+    plt.plot(df["scale"], df["ceiling_corr"], "o-", label="ceiling (fresh probe)")
+    plt.plot(df["scale"], df["head_corr"], "s--", label="trained head")
     plt.xscale("log")
-    plt.xlabel("injection scale (x natural std)"); plt.ylabel("trained-head interventional corr")
+    plt.xlabel("injection scale (x natural std)"); plt.ylabel("interventional corr")
     plt.title(f"interventional corr vs injection scale ({distribution}){suffix}")
-    plt.ylim(-0.05, 1.02); plt.grid(alpha=0.2, which="both")
+    plt.ylim(-0.05, 1.02); plt.grid(alpha=0.2, which="both"); plt.legend()
     plt.tight_layout()
     plt.savefig(Path(output_dir) / f"interventional_scale_sweep{suffix}.png", dpi=150)
     plt.close()
@@ -437,7 +445,8 @@ def main():
     # diagnostic: interventional corr vs injection scale -> reveals the numerical/
     # noise floor (corr rising with scale => natural scale is below the floor).
     scales = [float(x) for x in args.scale_sweep.split(",")]
-    interventional_scale_sweep(model, test_dataset_pred, pred_collator, config, output_dir, scales=scales)
+    interventional_scale_sweep(model, test_dataset_pred, pred_collator, config, output_dir,
+                               scales=scales, n_pca=args.routing_probe_pca)
 
     # fp32 overlay: if natural-scale corr lifts toward the large-scale plateau when
     # cast to fp32, the natural-scale failure was a bf16 numerical floor.
@@ -445,7 +454,7 @@ def main():
         print("[joint] casting model to fp32 and re-running diagnostics (_fp32) ...")
         model.float()
         interventional_scale_sweep(model, test_dataset_pred, pred_collator, config, output_dir,
-                                   scales=scales, suffix="_fp32")
+                                   scales=scales, n_pca=args.routing_probe_pca, suffix="_fp32")
         routing_probe_by_position(model, test_dataset_pred, pred_collator, config, output_dir,
                                   scale=args.routing_probe_scale, n_pca=args.routing_probe_pca, suffix="_fp32")
 
