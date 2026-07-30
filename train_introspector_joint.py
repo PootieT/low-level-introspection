@@ -44,7 +44,8 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from scipy.stats import pearsonr
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import RidgeCV
+from sklearn.decomposition import PCA
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -82,6 +83,11 @@ def parse_args():
     p.add_argument("--routing-probe-scale", type=float, default=10.0,
                    help="Injection scale for the routing-probe diagnostic (use a LARGE learnable "
                         "scale so 'does it reach the readout' is detectable above the bf16 floor).")
+    p.add_argument("--routing-probe-pca", type=int, default=256,
+                   help="PCA components for the routing-probe ceiling (regularize when n ~ n_features; "
+                        "0 disables PCA).")
+    p.add_argument("--scale-sweep", type=str, default="1,3,10,30,100",
+                   help="Comma-separated injection scales for the interventional scale sweep.")
     return p.parse_args()
 
 
@@ -201,45 +207,58 @@ def _extract_interv_readout(model, dataset, collator, config, scale, distributio
             torch.cat(hpred).numpy(), torch.cat(pos).numpy())
 
 
-def _probe_corr(X, y, seed, ridge=10.0, split=0.7):
-    """Held-out corr of a standardized ridge probe X->y (the routing ceiling)."""
-    n = len(y)
-    if n < 10:
-        return float("nan")
-    perm = np.random.RandomState(seed).permutation(n)
-    X, y = X[perm], y[perm]
-    ntr = int(n * split)
-    if ntr < 5 or n - ntr < 5:
-        return float("nan")
-    mu, sd = X[:ntr].mean(0), X[:ntr].std(0)
-    sd = np.where(sd < 1e-8, 1.0, sd)
-    Xs = (X - mu) / sd
-    reg = Ridge(alpha=ridge).fit(Xs[:ntr], y[:ntr])
-    p = reg.predict(Xs[ntr:])
-    if np.std(p) < 1e-12 or np.std(y[ntr:]) < 1e-12:
-        return float("nan")
-    return float(pearsonr(p, y[ntr:])[0])
-
-
 def _corr_or_nan(a, b):
     return float(pearsonr(a, b)[0]) if (np.std(a) > 1e-12 and np.std(b) > 1e-12) else float("nan")
 
 
-def routing_probe_by_position(model, dataset, collator, config, output_dir, scale, n_bins=6):
+ROUTING_ALPHAS = np.logspace(-1, 5, 13)   # wide grid so RidgeCV can regularize hard when n ~ H
+
+
+def _ceiling_and_head(X, inj, hpred, seed, n_pca, split=0.7):
+    """
+    On ONE seeded held-out split: fit a well-regularized probe (standardize ->
+    PCA -> RidgeCV) on train, and score BOTH the fresh probe (ceiling) and the
+    trained head on the SAME held-out rows. Regularizing + PCA is essential when
+    n_examples ~ n_features, else the ceiling overfits and comes out < head
+    (which is impossible for a true ceiling).
+    Returns (ceiling_corr, head_corr, best_alpha).
+    """
+    n = len(inj)
+    if n < 20:
+        return float("nan"), float("nan"), float("nan")
+    perm = np.random.RandomState(seed).permutation(n)
+    ntr = int(n * split)
+    tr, te = perm[:ntr], perm[ntr:]
+    if len(tr) < 5 or len(te) < 5:
+        return float("nan"), float("nan"), float("nan")
+    mu, sd = X[tr].mean(0), X[tr].std(0)
+    sd = np.where(sd < 1e-8, 1.0, sd)
+    Xtr, Xte = (X[tr] - mu) / sd, (X[te] - mu) / sd
+    if n_pca and n_pca < Xtr.shape[1]:
+        pca = PCA(n_components=min(n_pca, len(tr) - 1)).fit(Xtr)
+        Xtr, Xte = pca.transform(Xtr), pca.transform(Xte)
+    reg = RidgeCV(alphas=ROUTING_ALPHAS).fit(Xtr, inj[tr])
+    ceil = _corr_or_nan(reg.predict(Xte), inj[te])
+    head = _corr_or_nan(hpred[te], inj[te])          # head on the SAME held-out rows
+    return ceil, head, float(getattr(reg, "alpha_", np.nan))
+
+
+def routing_probe_by_position(model, dataset, collator, config, output_dir, scale, n_pca=256, n_bins=6):
     X, inj, hpred, pos = _extract_interv_readout(model, dataset, collator, config, scale)
-    rows = [{"position_bin": "all", "pos_lo": float(pos.min()), "pos_hi": float(pos.max()),
-             "n": int(len(inj)), "ceiling_corr": _probe_corr(X, inj, config.seed),
-             "head_corr": _corr_or_nan(hpred, inj)}]
-    # stratify by token_position if it varies across the eval set
+
+    def row(bin_label, m):
+        lo, hi = float(pos[m].min()), float(pos[m].max())
+        c, h, a = _ceiling_and_head(X[m], inj[m], hpred[m], config.seed, n_pca)
+        return {"position_bin": bin_label, "pos_lo": lo, "pos_hi": hi, "n": int(m.sum()),
+                "ceiling_corr": c, "head_corr": h, "best_alpha": a}
+
+    rows = [row("all", np.ones(len(inj), bool))]
     if len(np.unique(pos)) > 1:
         edges = np.unique(np.quantile(pos, np.linspace(0, 1, n_bins + 1)))
         for lo, hi in zip(edges[:-1], edges[1:]):
             m = (pos >= lo) & (pos <= hi)
-            if m.sum() < 20:
-                continue
-            rows.append({"position_bin": f"[{lo:.0f},{hi:.0f}]", "pos_lo": float(lo), "pos_hi": float(hi),
-                         "n": int(m.sum()), "ceiling_corr": _probe_corr(X[m], inj[m], config.seed),
-                         "head_corr": _corr_or_nan(hpred[m], inj[m])})
+            if m.sum() >= 40:
+                rows.append(row(f"[{lo:.0f},{hi:.0f}]", m))
     df = pd.DataFrame(rows)
     df.to_csv(Path(output_dir) / "routing_probe_by_position.csv", index=False)
     print(f"[joint] routing probe (inject scale={scale}):")
@@ -257,6 +276,34 @@ def routing_probe_by_position(model, dataset, collator, config, output_dir, scal
         plt.tight_layout()
         plt.savefig(Path(output_dir) / "routing_probe_by_position.png", dpi=150)
         plt.close()
+    return df
+
+
+def interventional_scale_sweep(model, dataset, collator, config, output_dir, scales, distribution="gaussian"):
+    """
+    Trained-head interventional corr vs injection scale (gaussian: N(mean, scale*std)).
+    A clean linear reader is scale-invariant, so corr RISING with scale is the
+    fingerprint of a numerical/noise floor (or saturation): natural-scale (scale=1)
+    signal is below the floor. Where the curve crosses into usable corr tells you
+    how far natural-scale reading is from working.
+    """
+    rows = []
+    for s in scales:
+        _, inj, hpred, _ = _extract_interv_readout(model, dataset, collator, config, s, distribution=distribution)
+        rows.append({"scale": s, "head_corr": _corr_or_nan(hpred, inj), "inj_std": float(np.std(inj))})
+    df = pd.DataFrame(rows)
+    df.to_csv(Path(output_dir) / "interventional_scale_sweep.csv", index=False)
+    print(f"[joint] interventional scale sweep ({distribution}):")
+    print(df.to_string(index=False))
+    plt.figure(figsize=(7, 5))
+    plt.plot(df["scale"], df["head_corr"], "o-")
+    plt.xscale("log")
+    plt.xlabel("injection scale (x natural std)"); plt.ylabel("trained-head interventional corr")
+    plt.title(f"interventional corr vs injection scale ({distribution})")
+    plt.ylim(-0.05, 1.02); plt.grid(alpha=0.2, which="both")
+    plt.tight_layout()
+    plt.savefig(Path(output_dir) / "interventional_scale_sweep.png", dpi=150)
+    plt.close()
     return df
 
 
@@ -379,7 +426,12 @@ def main():
     # the trained head, stratified by token position -> tells us whether earlier-
     # position failure is a routing (capacity) or reading (optimization) problem.
     routing_probe_by_position(model, test_dataset_pred, pred_collator, config, output_dir,
-                              scale=args.routing_probe_scale)
+                              scale=args.routing_probe_scale, n_pca=args.routing_probe_pca)
+
+    # diagnostic: interventional corr vs injection scale -> reveals the numerical/
+    # noise floor (corr rising with scale => natural scale is below the floor).
+    interventional_scale_sweep(model, test_dataset_pred, pred_collator, config, output_dir,
+                               scales=[float(x) for x in args.scale_sweep.split(",")])
 
 
 if __name__ == "__main__":
