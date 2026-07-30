@@ -88,6 +88,10 @@ def parse_args():
                         "0 disables PCA).")
     p.add_argument("--scale-sweep", type=str, default="1,3,10,30,100",
                    help="Comma-separated injection scales for the interventional scale sweep.")
+    p.add_argument("--diag-fp32", action="store_true",
+                   help="Also re-run the diagnostics (scale sweep + routing probe) with the model cast "
+                        "to fp32, to test whether natural-scale failure is a bf16 numerical floor. "
+                        "Cheap: resume the checkpoint (skips training) and pass this flag.")
     return p.parse_args()
 
 
@@ -243,7 +247,8 @@ def _ceiling_and_head(X, inj, hpred, seed, n_pca, split=0.7):
     return ceil, head, float(getattr(reg, "alpha_", np.nan))
 
 
-def routing_probe_by_position(model, dataset, collator, config, output_dir, scale, n_pca=256, n_bins=6):
+def routing_probe_by_position(model, dataset, collator, config, output_dir, scale, n_pca=256, n_bins=6,
+                              suffix=""):
     X, inj, hpred, pos = _extract_interv_readout(model, dataset, collator, config, scale)
 
     def row(bin_label, m):
@@ -260,8 +265,8 @@ def routing_probe_by_position(model, dataset, collator, config, output_dir, scal
             if m.sum() >= 40:
                 rows.append(row(f"[{lo:.0f},{hi:.0f}]", m))
     df = pd.DataFrame(rows)
-    df.to_csv(Path(output_dir) / "routing_probe_by_position.csv", index=False)
-    print(f"[joint] routing probe (inject scale={scale}):")
+    df.to_csv(Path(output_dir) / f"routing_probe_by_position{suffix}.csv", index=False)
+    print(f"[joint] routing probe (inject scale={scale}, suffix={suffix or 'native'}):")
     print(df.to_string(index=False))
 
     binned = df[df["position_bin"] != "all"]
@@ -271,15 +276,16 @@ def routing_probe_by_position(model, dataset, collator, config, output_dir, scal
         plt.plot(centers, binned["ceiling_corr"], "o-", label="routing ceiling (fresh probe)")
         plt.plot(centers, binned["head_corr"], "s--", label="trained head")
         plt.xlabel("introspected token position"); plt.ylabel("interventional corr")
-        plt.title(f"routing vs reading by position (inject scale={scale})")
+        plt.title(f"routing vs reading by position (inject scale={scale}){suffix}")
         plt.ylim(-0.05, 1.02); plt.legend(); plt.grid(alpha=0.2)
         plt.tight_layout()
-        plt.savefig(Path(output_dir) / "routing_probe_by_position.png", dpi=150)
+        plt.savefig(Path(output_dir) / f"routing_probe_by_position{suffix}.png", dpi=150)
         plt.close()
     return df
 
 
-def interventional_scale_sweep(model, dataset, collator, config, output_dir, scales, distribution="gaussian"):
+def interventional_scale_sweep(model, dataset, collator, config, output_dir, scales,
+                               distribution="gaussian", suffix=""):
     """
     Trained-head interventional corr vs injection scale (gaussian: N(mean, scale*std)).
     A clean linear reader is scale-invariant, so corr RISING with scale is the
@@ -292,17 +298,17 @@ def interventional_scale_sweep(model, dataset, collator, config, output_dir, sca
         _, inj, hpred, _ = _extract_interv_readout(model, dataset, collator, config, s, distribution=distribution)
         rows.append({"scale": s, "head_corr": _corr_or_nan(hpred, inj), "inj_std": float(np.std(inj))})
     df = pd.DataFrame(rows)
-    df.to_csv(Path(output_dir) / "interventional_scale_sweep.csv", index=False)
-    print(f"[joint] interventional scale sweep ({distribution}):")
+    df.to_csv(Path(output_dir) / f"interventional_scale_sweep{suffix}.csv", index=False)
+    print(f"[joint] interventional scale sweep ({distribution}, suffix={suffix or 'native'}):")
     print(df.to_string(index=False))
     plt.figure(figsize=(7, 5))
     plt.plot(df["scale"], df["head_corr"], "o-")
     plt.xscale("log")
     plt.xlabel("injection scale (x natural std)"); plt.ylabel("trained-head interventional corr")
-    plt.title(f"interventional corr vs injection scale ({distribution})")
+    plt.title(f"interventional corr vs injection scale ({distribution}){suffix}")
     plt.ylim(-0.05, 1.02); plt.grid(alpha=0.2, which="both")
     plt.tight_layout()
-    plt.savefig(Path(output_dir) / "interventional_scale_sweep.png", dpi=150)
+    plt.savefig(Path(output_dir) / f"interventional_scale_sweep{suffix}.png", dpi=150)
     plt.close()
     return df
 
@@ -430,8 +436,18 @@ def main():
 
     # diagnostic: interventional corr vs injection scale -> reveals the numerical/
     # noise floor (corr rising with scale => natural scale is below the floor).
-    interventional_scale_sweep(model, test_dataset_pred, pred_collator, config, output_dir,
-                               scales=[float(x) for x in args.scale_sweep.split(",")])
+    scales = [float(x) for x in args.scale_sweep.split(",")]
+    interventional_scale_sweep(model, test_dataset_pred, pred_collator, config, output_dir, scales=scales)
+
+    # fp32 overlay: if natural-scale corr lifts toward the large-scale plateau when
+    # cast to fp32, the natural-scale failure was a bf16 numerical floor.
+    if args.diag_fp32:
+        print("[joint] casting model to fp32 and re-running diagnostics (_fp32) ...")
+        model.float()
+        interventional_scale_sweep(model, test_dataset_pred, pred_collator, config, output_dir,
+                                   scales=scales, suffix="_fp32")
+        routing_probe_by_position(model, test_dataset_pred, pred_collator, config, output_dir,
+                                  scale=args.routing_probe_scale, n_pca=args.routing_probe_pca, suffix="_fp32")
 
 
 if __name__ == "__main__":
