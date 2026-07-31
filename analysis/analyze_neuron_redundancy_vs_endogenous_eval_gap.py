@@ -54,7 +54,7 @@ def parse_dir(exp_dir):
 
 
 REDUNDANCY_CSV = "outputs/circuit/intervention_train_regressor_extreme/intervention_train_reg_extreme10_300K/candidate_neurons.csv"
-SCORE_A_CSV = "outputs/plots/score_A_bypass_ceiling.csv"
+SCORE_A_CSV = "outputs/circuit/intervention_train_regressor_extreme/intervention_train_reg_extreme10_300K/score_A_bypass_ceiling.csv"
 
 
 def scatter_with_fits(merged, xcol, xlabel, out_png, stats_csv, eval_types, palette, covars, title):

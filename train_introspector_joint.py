@@ -336,8 +336,7 @@ def main():
     cache_dir = config.dataset_cache_dir
     output_dir = Path(config.output_dir) / config.experiment_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    if (output_dir / "interventional_test_metrics_gaussian.json").exists() \
-            and not args.overwrite_cache and not args.diag_only:
+    if (output_dir / "routing_probe_by_position.csv").exists() and not args.overwrite_cache and not args.diag_only:
         print(f"Experiments ran already, skipping.. {output_dir}")
         return
 

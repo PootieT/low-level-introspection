@@ -99,7 +99,7 @@ def main():
     sc = ax.scatter(df["interv_corr"], df["endo_corr"], c=df["w_endo"], cmap="viridis",
                     s=90, zorder=2, edgecolor="k", linewidth=0.5)
     for _, r in df.iterrows():
-        ax.annotate(f"{r.w_endo:.1f}", (r.interv_corr, r.endo_corr),
+        ax.annotate(f"{r.w_endo:.2f}", (r.interv_corr, r.endo_corr),
                     textcoords="offset points", xytext=(6, 4), fontsize=8)
     # Pareto-optimal frontier
     pf = df[df["pareto"]].sort_values("interv_corr")

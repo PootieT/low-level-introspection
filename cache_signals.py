@@ -75,6 +75,8 @@ def sample_token_position(
             stop = seq_len + stop
         start = max(0, start)
         stop = min(seq_len - 1, stop)
+        if start > stop:
+            start, stop = stop, start
         selected_pos = random.randint(start, stop)
 
     else:

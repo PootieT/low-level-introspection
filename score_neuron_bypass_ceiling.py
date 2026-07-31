@@ -66,7 +66,7 @@ def parse_args():
     p.add_argument("--split-frac", type=float, default=0.7, help="Train fraction for the probe.")
     p.add_argument("--ridge", type=float, default=10.0,
                    help="Ridge alpha for the bypass probe (readout features are high-variance).")
-    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--output-dir", type=Path, default=Path("outputs/plots"))
     return p.parse_args()
 
