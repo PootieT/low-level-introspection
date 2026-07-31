@@ -15,8 +15,8 @@ python scripts/generate_experiment_config.py \
     --signal-types mlp \
     --train-signals 10.1 \
     --test-signals 10.1 \
-    --train-token-position -1 \
-    --test-token-positions \
+    --train-token-selector -1 \
+    --test-token-selector -1 \
     --precision 3 \
     --output experiment_configs/mlp_l10_n200.json
 """
@@ -108,6 +108,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-batch-size", type=int, default=8)
     parser.add_argument("--eval-batch-size", type=int, default=16)
     parser.add_argument("--num-epochs", type=int, default=3)
+    parser.add_argument("--warmup-ratio", type=float, default=0.0)
+    parser.add_argument("--lr-scheduler-type", type=str, default="linear",
+                        help="LR schedule: linear | cosine | constant | ...")
+    parser.add_argument("--save-steps", type=float, default=0.0,
+                        help="Checkpoint frequency: 0 = per epoch; >0 = every save_steps "
+                             "(value <1 = ratio of total steps, e.g. 0.2 = 5 checkpoints/epoch).")
     # TODO check if this is possible/this might be the same as masking input as -100
     parser.add_argument("--disable-adapter-in-input", action="store_true",
                         help="Whether to deactivate LoRA adaptor in input")
@@ -156,6 +162,10 @@ def parse_args() -> argparse.Namespace:
     # ---- paths ----
     parser.add_argument("--cache-dir", default="data")
     parser.add_argument("--output-dir", default="outputs/runs")
+    parser.add_argument("--dataset-name", default=None,
+                        help="Identity of the cached signal dataset. Set the SAME value across runs "
+                             "that share data (rank/lr/w sweeps) to reuse one cache instead of "
+                             "re-caching per experiment. Defaults to experiment_name.")
 
     # ---- misc ----
     parser.add_argument("--overwrite-cache", action="store_true",
@@ -258,6 +268,9 @@ def main() -> None:
             intervention_anneal_start_frac=args.intervention_anneal_start_frac,
             intervention_anneal_end_frac=args.intervention_anneal_end_frac,
             learning_rate=args.learning_rate,
+            warmup_ratio=args.warmup_ratio,
+            lr_scheduler_type=args.lr_scheduler_type,
+            save_steps=args.save_steps,
             train_batch_size=args.train_batch_size,
             eval_batch_size=args.eval_batch_size,
             num_epochs=args.num_epochs,
@@ -280,6 +293,7 @@ def main() -> None:
 
         cache_dir=args.cache_dir,
         output_dir=args.output_dir,
+        dataset_name=args.dataset_name,
     )
 
     os.makedirs(Path(args.output_dir).parent, exist_ok=True)

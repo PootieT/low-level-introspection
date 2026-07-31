@@ -3,6 +3,7 @@
 """
 Schema classes for experiments, datasets, etc
 """
+from pathlib import Path
 from typing import List, Any, Optional, Union
 
 from pydantic import BaseModel
@@ -34,6 +35,12 @@ class TrainingConfig(BaseModel):
     prompt_type: str = "prompt_no_token_index"
     precision: int = 3
     bf16: bool = True
+    # LR schedule
+    warmup_ratio: float = 0.0
+    lr_scheduler_type: str = "linear"   # linear | cosine | constant | ...
+    # checkpoint frequency: 0 => per epoch; >0 => every save_steps (a value <1 is a
+    # ratio of total steps, e.g. 0.2 => 5 checkpoints/epoch for mid-run diagnostics)
+    save_steps: float = 0.0
     # distribution used to sample the random value injected at intervention time
     # "uniform": U(min, max) of the neuron's empirical range
     # "gaussian": N(mean, std) fit to the neuron's empirical activations
@@ -92,3 +99,13 @@ class ExperimentConfig(BaseModel):
 
     cache_dir: str
     output_dir: str
+    # identity of the cached signal dataset. Runs that share the SAME data (model,
+    # dataset, signal, token selector, seq length, precision) can set the same
+    # dataset_name to reuse one cache instead of re-caching per experiment_name.
+    # None => falls back to experiment_name (backward compatible).
+    dataset_name: Optional[str] = None
+
+    @property
+    def dataset_cache_dir(self) -> Path:
+        """Where the cached signal dataset lives (keyed by dataset_name if set)."""
+        return Path(self.cache_dir) / (self.dataset_name or self.experiment_name)

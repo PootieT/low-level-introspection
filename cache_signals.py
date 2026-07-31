@@ -257,7 +257,7 @@ def main():
     args = parse_args()
     config = ExperimentConfig.model_validate_json(Path(args.config).read_text())
 
-    output_dir = Path(config.cache_dir) / config.experiment_name
+    output_dir = config.dataset_cache_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     train_path = output_dir / "train"
     dev_path = output_dir / "dev"

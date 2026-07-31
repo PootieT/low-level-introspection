@@ -473,7 +473,7 @@ def main():
 
     config = ExperimentConfig.model_validate_json(args.config.read_text())
 
-    cache_dir = Path(config.cache_dir) / config.experiment_name
+    cache_dir = config.dataset_cache_dir
     train_path = cache_dir / "train"
     dev_path = cache_dir / "dev"
     test_path = cache_dir / "test"

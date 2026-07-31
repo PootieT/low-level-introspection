@@ -92,6 +92,12 @@ def parse_args():
                    help="Also re-run the diagnostics (scale sweep + routing probe) with the model cast "
                         "to fp32, to test whether natural-scale failure is a bf16 numerical floor. "
                         "Cheap: resume the checkpoint (skips training) and pass this flag.")
+    p.add_argument("--checkpoint", type=Path, default=None,
+                   help="Specific checkpoint dir to load (default: latest under output_dir).")
+    p.add_argument("--diag-only", action="store_true",
+                   help="Load --checkpoint's weights and run evals/diagnostics WITHOUT training. Use to "
+                        "eval a MID-RUN checkpoint (plain resume would continue training instead). "
+                        "Outputs go to output_dir/diag_<checkpoint>/ so they don't clobber the final run.")
     return p.parse_args()
 
 
@@ -327,10 +333,11 @@ def main():
     if not config.use_regressor:
         raise SystemExit("Joint training targets the regressor head (use_regressor must be True).")
 
-    cache_dir = Path(config.cache_dir) / config.experiment_name
+    cache_dir = config.dataset_cache_dir
     output_dir = Path(config.output_dir) / config.experiment_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    if (output_dir / "interventional_test_metrics_gaussian.json").exists() and not args.overwrite_cache:
+    if (output_dir / "interventional_test_metrics_gaussian.json").exists() \
+            and not args.overwrite_cache and not args.diag_only:
         print(f"Experiments ran already, skipping.. {output_dir}")
         return
 
@@ -387,16 +394,21 @@ def main():
     pred_collator = LoRAGatingCollator(tokenizer=tokenizer, model=model, padding=True,
                                        label_pad_token_id=-100, return_tensors="pt", for_prediction=True)
 
+    # checkpoint frequency: 0 => per epoch; >0 => every save_steps (float <1 = ratio of total steps)
+    save_kwargs = ({"save_strategy": "epoch"} if config.training_config.save_steps <= 0
+                   else {"save_strategy": "steps", "save_steps": config.training_config.save_steps})
     training_args = TrainingArguments(
         output_dir=str(output_dir), run_name=config.experiment_name,
         learning_rate=config.training_config.learning_rate,
+        warmup_ratio=config.training_config.warmup_ratio,
+        lr_scheduler_type=config.training_config.lr_scheduler_type,
         per_device_train_batch_size=config.training_config.train_batch_size,
         per_device_eval_batch_size=config.training_config.eval_batch_size,
         num_train_epochs=config.training_config.num_epochs,
         logging_steps=math.ceil(100 / config.training_config.train_batch_size),
         eval_strategy="steps", eval_steps=math.ceil(400 // config.training_config.train_batch_size),
-        save_strategy="epoch", bf16=config.training_config.bf16,
-        remove_unused_columns=False, report_to="wandb")
+        bf16=config.training_config.bf16,
+        remove_unused_columns=False, report_to="wandb", **save_kwargs)
 
     callbacks = [RegressionHeadSaveCallback(model)]
     if config.training_config.intervention_anneal:
@@ -421,8 +433,22 @@ def main():
           f"scale={model.intervention_scale}")
 
     ckpt_dirs = glob.glob(f"{output_dir}/checkpoint-*")
-    if ckpt_dirs and not args.overwrite_cache:
-        latest = max(ckpt_dirs, key=os.path.getctime)
+    eval_out_dir = output_dir
+    if args.diag_only:
+        # load weights and evaluate WITHOUT training (for mid-run checkpoints)
+        from safetensors.torch import load_file
+        ckpt = args.checkpoint or (max(ckpt_dirs, key=os.path.getctime) if ckpt_dirs else None)
+        if ckpt is None:
+            raise SystemExit("--diag-only needs a checkpoint (none found; pass --checkpoint).")
+        ckpt = Path(ckpt)
+        sd = load_file(str(ckpt / "adapter_model.safetensors"))
+        model.load_state_dict(sd, strict=False)   # loads adapter + embed/lm_head
+        load_regression_head(model, str(ckpt))
+        eval_out_dir = output_dir / f"diag_{ckpt.name}"
+        eval_out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[joint] diag-only: loaded {ckpt}; writing diagnostics to {eval_out_dir}")
+    elif ckpt_dirs and not args.overwrite_cache:
+        latest = str(args.checkpoint) if args.checkpoint else max(ckpt_dirs, key=os.path.getctime)
         print(f"Found checkpoint, resuming/loading from {latest}")
         train_results = trainer.train(resume_from_checkpoint=latest)
         load_regression_head(model, latest)
@@ -432,20 +458,20 @@ def main():
 
     # ---- frontier metrics: interventional@gaussian(scale=1) AND endogenous ----
     evaluate_interventional_test(model, eval_dataset=test_dataset_pred, collator=pred_collator,
-                                 config=config, output_dir=output_dir,
+                                 config=config, output_dir=eval_out_dir,
                                  distribution="gaussian", suffix="_gaussian")
-    eval_endogenous_test(model, test_dataset_pred, pred_collator, config, output_dir)
+    eval_endogenous_test(model, test_dataset_pred, pred_collator, config, eval_out_dir)
 
     # diagnostic: is the injected value routed to the readout (ceiling) vs read by
     # the trained head, stratified by token position -> tells us whether earlier-
     # position failure is a routing (capacity) or reading (optimization) problem.
-    routing_probe_by_position(model, test_dataset_pred, pred_collator, config, output_dir,
+    routing_probe_by_position(model, test_dataset_pred, pred_collator, config, eval_out_dir,
                               scale=args.routing_probe_scale, n_pca=args.routing_probe_pca)
 
     # diagnostic: interventional corr vs injection scale -> reveals the numerical/
     # noise floor (corr rising with scale => natural scale is below the floor).
     scales = [float(x) for x in args.scale_sweep.split(",")]
-    interventional_scale_sweep(model, test_dataset_pred, pred_collator, config, output_dir,
+    interventional_scale_sweep(model, test_dataset_pred, pred_collator, config, eval_out_dir,
                                scales=scales, n_pca=args.routing_probe_pca)
 
     # fp32 overlay: if natural-scale corr lifts toward the large-scale plateau when
@@ -453,9 +479,9 @@ def main():
     if args.diag_fp32:
         print("[joint] casting model to fp32 and re-running diagnostics (_fp32) ...")
         model.float()
-        interventional_scale_sweep(model, test_dataset_pred, pred_collator, config, output_dir,
+        interventional_scale_sweep(model, test_dataset_pred, pred_collator, config, eval_out_dir,
                                    scales=scales, n_pca=args.routing_probe_pca, suffix="_fp32")
-        routing_probe_by_position(model, test_dataset_pred, pred_collator, config, output_dir,
+        routing_probe_by_position(model, test_dataset_pred, pred_collator, config, eval_out_dir,
                                   scale=args.routing_probe_scale, n_pca=args.routing_probe_pca, suffix="_fp32")
 
 
