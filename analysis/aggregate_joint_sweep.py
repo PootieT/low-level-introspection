@@ -41,14 +41,17 @@ SCALE_RE = re.compile(r"scale([0-9]+)")
 R_RE = re.compile(r"_r([0-9]+)")
 LR_RE = re.compile(r"_lr([^_]+)")
 W_RE = re.compile(r"_w([^_]+)")
+STEP_RE = re.compile(r"checkpoint-([0-9]+)")   # per-checkpoint diag subdirs (convergence mode)
 
 
 def parse_run(name):
     def grab(rx):
         m = rx.search(name)
         return m.group(1) if m else None
+    sm = STEP_RE.search(name)
     return {"pos": grab(POS_RE), "scale": grab(SCALE_RE), "r": grab(R_RE),
-            "lr": grab(LR_RE) or "default", "w": grab(W_RE)}
+            "lr": grab(LR_RE) or "default", "w": grab(W_RE),
+            "step": int(sm.group(1)) if sm else None}
 
 
 def _json_corr(path, nested_key=None):
@@ -84,7 +87,8 @@ def main():
         if not rdp.is_dir():
             continue
         params = parse_run(rdp.name)
-        label = "_".join(f"{k}{params[k]}" for k in label_fields if params.get(k))
+        label = (f"step{params['step']}" if params.get("step") is not None
+                 else "_".join(f"{k}{params[k]}" for k in label_fields if params.get(k)))
 
         row = dict(params)
         row["run"] = rdp.name
@@ -117,9 +121,12 @@ def main():
 
     if not rows:
         raise SystemExit(f"No run dirs matched {args.runs_glob!r}")
-    df = pd.DataFrame(rows).sort_values(["scale", "r", "lr"], na_position="last")
-    cols = ["label", "pos", "scale", "r", "lr", "interv_gaussian", "endogenous",
-            "head@1", "ceil@1", "head@maxscale", "pos_head_mean", "pos_head_min"]
+    df = pd.DataFrame(rows)
+    checkpoint_mode = df["step"].notna().any()   # dirs are per-checkpoint diag subdirs
+    df = df.sort_values(["step"] if checkpoint_mode else ["scale", "r", "lr"], na_position="last")
+    cols = (["step"] if checkpoint_mode else ["label", "pos", "scale", "r", "lr"]) + \
+           ["interv_gaussian", "endogenous", "head@1", "ceil@1", "head@maxscale",
+            "pos_head_mean", "pos_head_min"]
     cols = [c for c in cols if c in df.columns]
     df[cols].to_csv(args.output_dir / f"{args.out_name}_summary.csv", index=False)
     print(df[cols].to_string(index=False))
@@ -155,7 +162,23 @@ def main():
         plt.savefig(args.output_dir / f"{args.out_name}_by_position_overlay.png", dpi=150)
         plt.close()
 
-    print(f"[aggregate] wrote summary + overlays for {len(df)} runs to {args.output_dir}")
+    # ---- convergence (metric vs training step), when dirs are per-checkpoint diags ----
+    if checkpoint_mode:
+        cd = df.dropna(subset=["step"]).sort_values("step")
+        plt.figure(figsize=(8, 5.5))
+        for metric in ["head@maxscale", "pos_head_mean", "ceil@1", "interv_gaussian", "endogenous"]:
+            if metric in cd.columns and cd[metric].notna().any():
+                plt.plot(cd["step"], cd[metric], "o-", label=metric, markersize=4)
+        plt.axhline(0, color="k", lw=0.5, alpha=0.3)
+        plt.xlabel("training step (checkpoint)"); plt.ylabel("corr")
+        plt.title("Metrics vs training step (convergence)")
+        plt.ylim(-0.05, 1.02); plt.grid(alpha=0.2); plt.legend(fontsize=8)
+        plt.tight_layout()
+        plt.savefig(args.output_dir / f"{args.out_name}_convergence.png", dpi=150)
+        plt.close()
+
+    print(f"[aggregate] wrote summary + plots for {len(df)} dirs to {args.output_dir} "
+          f"({'convergence' if checkpoint_mode else 'sweep'} mode)")
 
 
 if __name__ == "__main__":
