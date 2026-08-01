@@ -62,7 +62,9 @@ def _json_corr(path, nested_key=None):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--runs-glob", required=True, help="Glob matching run dirs to aggregate.")
+    p.add_argument("--runs-glob", required=True, nargs="+",
+                   help="One or more globs matching run dirs (pass multiple, space-separated and each "
+                        "quoted separately: --runs-glob '.../*_1M' '.../POS-28_scale*').")
     p.add_argument("--output-dir", type=Path, default=Path("outputs/plots"))
     p.add_argument("--out-name", default="joint_sweep")
     p.add_argument("--label-fields", default="scale,r,lr",
@@ -76,7 +78,8 @@ def main():
     label_fields = args.label_fields.split(",")
 
     rows, sweeps, positions = [], {}, {}
-    for rd in sorted(glob.glob(args.runs_glob)):
+    run_dirs = sorted({d for pat in args.runs_glob for d in glob.glob(pat)})
+    for rd in run_dirs:
         rdp = Path(rd)
         if not rdp.is_dir():
             continue
