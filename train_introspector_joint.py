@@ -373,20 +373,33 @@ def main():
     test_dataset_pred = test_raw.map(preprocess, remove_columns=test_raw.column_names)
 
     # ---- model (regressor + gated LoRA) ----
-    model = AutoModelForCausalLM.from_pretrained(
+    base = AutoModelForCausalLM.from_pretrained(
         config.model_name, device_map="auto",
         torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32)
-    model.resize_token_embeddings(len(tokenizer))
-    peft_config = LoraConfig(
-        r=config.training_config.lora_r, lora_alpha=config.training_config.lora_alpha,
-        target_modules=config.training_config.lora_target_modules,
-        lora_dropout=config.training_config.lora_dropout, bias="none", task_type="CAUSAL_LM")
-    model = get_peft_model(model, peft_config)
+    base.resize_token_embeddings(len(tokenizer))
+    diag_ckpt = None
+    if args.diag_only:
+        # load a specific (possibly mid-run) checkpoint's adapter for eval WITHOUT training
+        from peft import PeftModel
+        ckpts = glob.glob(f"{output_dir}/checkpoint-*")
+        diag_ckpt = Path(args.checkpoint) if args.checkpoint else (
+            Path(max(ckpts, key=os.path.getctime)) if ckpts else None)
+        if diag_ckpt is None:
+            raise SystemExit("--diag-only needs a checkpoint (none found; pass --checkpoint).")
+        model = PeftModel.from_pretrained(base, str(diag_ckpt), autocast_adapter_dtype=False)
+    else:
+        peft_config = LoraConfig(
+            r=config.training_config.lora_r, lora_alpha=config.training_config.lora_alpha,
+            target_modules=config.training_config.lora_target_modules,
+            lora_dropout=config.training_config.lora_dropout, bias="none", task_type="CAUSAL_LM")
+        model = get_peft_model(base, peft_config)
     model.resize_token_embeddings(len(tokenizer))
     model = IntrospectionRegressionModel(
         model, signal_ranges=signal_ranges,
         intervention_distribution=config.training_config.intervention_signal_distribution,
         intervention_extreme_scale=config.training_config.intervention_extreme_scale)
+    if args.diag_only:
+        load_regression_head(model, str(diag_ckpt))
     replace_model_with_gated_version(model)
     replace_lora_with_gated_version(model)
 
@@ -434,18 +447,10 @@ def main():
     ckpt_dirs = glob.glob(f"{output_dir}/checkpoint-*")
     eval_out_dir = output_dir
     if args.diag_only:
-        # load weights and evaluate WITHOUT training (for mid-run checkpoints)
-        from safetensors.torch import load_file
-        ckpt = args.checkpoint or (max(ckpt_dirs, key=os.path.getctime) if ckpt_dirs else None)
-        if ckpt is None:
-            raise SystemExit("--diag-only needs a checkpoint (none found; pass --checkpoint).")
-        ckpt = Path(ckpt)
-        sd = load_file(str(ckpt / "adapter_model.safetensors"))
-        model.load_state_dict(sd, strict=False)   # loads adapter + embed/lm_head
-        load_regression_head(model, str(ckpt))
-        eval_out_dir = output_dir / f"diag_{ckpt.name}"
+        # weights were already loaded from diag_ckpt via PeftModel.from_pretrained; no training
+        eval_out_dir = output_dir / f"diag_{diag_ckpt.name}"
         eval_out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[joint] diag-only: loaded {ckpt}; writing diagnostics to {eval_out_dir}")
+        print(f"[joint] diag-only: loaded {diag_ckpt}; writing diagnostics to {eval_out_dir}")
     elif ckpt_dirs and not args.overwrite_cache:
         latest = str(args.checkpoint) if args.checkpoint else max(ckpt_dirs, key=os.path.getctime)
         print(f"Found checkpoint, resuming/loading from {latest}")
