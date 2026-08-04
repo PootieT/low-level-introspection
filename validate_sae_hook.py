@@ -106,31 +106,43 @@ def main():
     feats = bundle.encode(resid)                            # [B, T, d_sae]
     recon = bundle.decode(feats)                            # [B, T, D]
 
-    # ---- reconstruction + sparsity over non-pad tokens ----
-    pdb.set_trace()
-    R = resid[mask]                                         # [N, D]
-    Rhat = recon[mask].to(R.device, R.dtype)
-    F = feats[mask]                                         # [N, d_sae]
+    # ---- exclude BOS before scoring. gemma-2 parks a massive-activation
+    #      attention sink on <bos> (residual norm ~thousands) that the SAE is not
+    #      trained to reconstruct; left in, its squared error dwarfs everything and
+    #      drives FVU > 1 while every "top feature" is just the sink. Standard
+    #      Gemma Scope reconstruction evals drop it. ----
+    keep = mask.clone()
+    if tok.bos_token_id is not None:
+        keep &= (enc["input_ids"] != tok.bos_token_id)
+    keep = keep.to(resid.device)
+
+    R = resid[keep]                                        # [N, D]
+    Rhat = recon[keep].to(R.device, R.dtype)
+    Fk = feats[keep]                                       # [N, d_sae]
     num = ((R - Rhat) ** 2).sum().item()
     den = ((R - R.mean(0, keepdim=True)) ** 2).sum().item()
     fvu = num / den if den > 0 else float("nan")
-    l0 = (F > 0).float().sum(-1).mean().item()
+    l0 = (Fk > 0).float().sum(-1).mean().item()
     resid_norm = R.norm(dim=-1).mean().item()
 
-    print("\n=== RECONSTRUCTION / SPARSITY ===")
-    print(f"  tokens (non-pad)     : {R.shape[0]}")
-    print(f"  mean |resid|         : {resid_norm:.3f}")
+    # confirm the sink is what was inflating FVU: report bos residual norm for contrast
+    bos_sel = (mask & (enc["input_ids"] == tok.bos_token_id)).to(resid.device)
+    bos_norm = resid[bos_sel].norm(dim=-1).mean().item() if bos_sel.any() else float("nan")
+
+    print("\n=== RECONSTRUCTION / SPARSITY (BOS excluded) ===")
+    print(f"  tokens kept          : {R.shape[0]}  (bos/pad dropped)")
+    print(f"  mean |resid| (kept)  : {resid_norm:.3f}")
+    print(f"  mean |resid| (bos)   : {bos_norm:.3f}   <- sink, excluded")
     print(f"  FVU (1-EV)           : {fvu:.4f}   (want << {args.fvu_warn})")
     print(f"  L0 (active/token)    : {l0:.2f}    (want > {args.l0_min}, << {bundle.d_sae})")
 
     # ---- top features + peak token for Neuronpedia eyeballing ----
     print("\n=== TOP FEATURES (open these ids on Neuronpedia and confirm the concept) ===")
-    mask = mask.to(R.device)
-    max_per_feat, _ = feats.masked_fill(~mask.unsqueeze(-1), 0.0).reshape(-1, bundle.d_sae).max(0)
+    max_per_feat, _ = feats.masked_fill(~keep.unsqueeze(-1), 0.0).reshape(-1, bundle.d_sae).max(0)
     top_vals, top_ids = max_per_feat.topk(min(args.top_features, bundle.d_sae))
     ids_flat = enc["input_ids"]
     for rank, (fid, val) in enumerate(zip(top_ids.tolist(), top_vals.tolist())):
-        fmap = feats[..., fid].masked_fill(~mask, -1.0)     # [B, T]
+        fmap = feats[..., fid].masked_fill(~keep, -1.0)     # [B, T]
         b, t = divmod(int(fmap.argmax().item()), fmap.shape[1])
         lo = max(0, t - args.context)
         ctx = tok.decode(ids_flat[b, lo:t + 1])
