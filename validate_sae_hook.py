@@ -29,12 +29,13 @@ Run on the cluster (needs torch + sae_lens + the 2b model), NOT the Mac box:
 """
 from __future__ import annotations
 
+import pdb
 import argparse
 import operator
 
+from nnsight import LanguageModel
 import torch
 from datasets import load_dataset
-from nnsight import LanguageModel
 
 from src.introspector.models.signal_paths import resolve_sae_hook_path
 from src.introspector.signals.sae import load_sae
@@ -65,10 +66,10 @@ def parse_args():
 @torch.no_grad()
 def capture_residual(model, hook_path, tokens):
     """nnsight trace: grab the decoder-layer output (residual post-block) at every
-    position. Layer output is a tuple -> take [0]."""
+    position."""
     getter = operator.attrgetter(hook_path)
     with model.trace(tokens):
-        resid = getter(model)[0].detach().save()   # [B, T, D]
+        resid = getter(model).detach().save()   # [B, T, D]
     return resid.value if hasattr(resid, "value") else resid
 
 
@@ -99,14 +100,14 @@ def main():
     texts = [ex["text"] for ex in ds.take(args.n_texts)]
     enc = tok(texts, return_tensors="pt", padding=True, truncation=True,
               max_length=args.max_seq_length, padding_side="right")
-    enc = {k: v.to(model.device) for k, v in enc.items()}
-    mask = enc["attention_mask"].bool()                     # [B, T]
+    mask = enc["attention_mask"].bool()                    # [B, T]
 
     resid = capture_residual(model, hook_path, enc).float() # [B, T, D]
     feats = bundle.encode(resid)                            # [B, T, d_sae]
     recon = bundle.decode(feats)                            # [B, T, D]
 
     # ---- reconstruction + sparsity over non-pad tokens ----
+    pdb.set_trace()
     R = resid[mask]                                         # [N, D]
     Rhat = recon[mask].to(R.device, R.dtype)
     F = feats[mask]                                         # [N, d_sae]
@@ -124,6 +125,7 @@ def main():
 
     # ---- top features + peak token for Neuronpedia eyeballing ----
     print("\n=== TOP FEATURES (open these ids on Neuronpedia and confirm the concept) ===")
+    mask = mask.to(R.device)
     max_per_feat, _ = feats.masked_fill(~mask.unsqueeze(-1), 0.0).reshape(-1, bundle.d_sae).max(0)
     top_vals, top_ids = max_per_feat.topk(min(args.top_features, bundle.d_sae))
     ids_flat = enc["input_ids"]
