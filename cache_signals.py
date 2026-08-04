@@ -35,10 +35,28 @@ from torch.utils.data import IterableDataset
 from transformers import AutoTokenizer, BatchEncoding
 
 from src.introspector.config import ExperimentConfig, DatasetConfig
-from src.introspector.models.signal_paths import resolve_mlp_signal_path, resolve_resid_signal_path
+from src.introspector.models.signal_paths import (
+    resolve_mlp_signal_path, resolve_resid_signal_path, resolve_sae_hook_path,
+)
 from src.introspector.prompts import PROMPT_REGISTRY
 from src.introspector.signals.schema import SignalSpec, TokenSelector
+from src.introspector.signals.sae import load_sae
 from src.introspector.utils import get_quantization_config, float_to_str_target
+
+
+# One SAE per (release, site, width, layer), loaded lazily and reused across
+# batches. Keyed off the SAEFeatureSpec so different SAEs never get mixed up.
+_SAE_BUNDLES: dict = {}
+
+
+def get_sae_bundle(spec, device):
+    key = (spec.sae_release, spec.sae_site, spec.sae_width, spec.layer)
+    if key not in _SAE_BUNDLES:
+        _SAE_BUNDLES[key] = load_sae(
+            release=spec.sae_release, site=spec.sae_site, width=spec.sae_width,
+            layer=spec.layer, device=str(device),
+        )
+    return _SAE_BUNDLES[key]
 
 
 def load_json(path: str | Path) -> dict[str, Any]:
@@ -103,7 +121,17 @@ def extract_activations_batch(
     mlp_signal_specs = [s for s in signal_specs if s.type == "mlp"]
     att_signal_specs = [s for s in signal_specs if s.type == "attention_score"]
     rs_signal_specs = [s for s in signal_specs if s.type == "residual_stream"]
+    sae_signal_specs = [s for s in signal_specs if s.type == "sae"]
     bs = len(batch_tokens["input_ids"])
+
+    # SAE features are a non-native (encoder) readout, so we cannot index them
+    # in-trace like a module output: we save the residual at the SAE's hook site
+    # and encode AFTER the trace. Resolve the (static) hook paths up front, mirror-
+    # ing how validate_sae_hook.py resolves before tracing.
+    sae_layers = sorted({s.layer for s in sae_signal_specs})
+    sae_hook_paths = {L: resolve_sae_hook_path(model, L, path_to_output=True) for L in sae_layers}
+    sae_resid_proxies = {}
+
     with torch.no_grad(), model.trace(batch_tokens):
         for layer in range(model.config.num_hidden_layers): # TODO llama3 path here, not sure for others
             # extract MLPs
@@ -129,6 +157,30 @@ def extract_activations_batch(
 
             if att_signal_specs:
                 raise NotImplementedError("avoiding the headache right now")
+
+        # save full residual [bs, token, h] at each SAE hook site (encode below)
+        for L in sae_layers:
+            sae_resid_proxies[L] = operator.attrgetter(sae_hook_paths[L])(model).detach().save()
+
+    # ---- SAE encode outside the trace: one bundle per (release,site,width,layer),
+    #      encode the residual once, then read each requested feature at its token.
+    for L in sae_layers:
+        proxy = sae_resid_proxies[L]
+        resid = (proxy.value if hasattr(proxy, "value") else proxy).float()  # [bs, token, h]
+        specs_layer = [s for s in sae_signal_specs if s.layer == L]
+        # group by SAE identity so we encode once per distinct SAE
+        by_bundle: dict = {}
+        for s in specs_layer:
+            by_bundle.setdefault((s.sae_release, s.sae_site, s.sae_width), []).append(s)
+        for _, specs in by_bundle.items():
+            bundle = get_sae_bundle(specs[0], device=resid.device)
+            feats = bundle.encode(resid)                     # [bs, token, d_sae]
+            # [bs, d_sae] at each example's target token, then pick the feature
+            feats_at_tok = feats[range(bs), batch_token_positions]   # [bs, d_sae]
+            for signal_spec in specs:
+                acts = feats_at_tok[:, signal_spec.index]
+                signal_activations[signal_spec] = acts.float().cpu().tolist()
+
     return signal_activations
 
 

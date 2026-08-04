@@ -82,9 +82,17 @@ class SAEFeatureSampler(BaseModel):
     sae_width: str = "16k"
     layers: list[int]
     features_per_layer: int
-    # keep features whose firing rate is within [min_density, max_density]
-    min_density: float = 1e-4
-    max_density: float = 0.2
+    # Keep features whose firing rate is within [min_density, max_density], with
+    # density computed BOS-excluded (matching Neuronpedia's "ignore BOS" default).
+    #   max_density=0.01 mirrors Neuronpedia's default "hide >1% density" filter,
+    #     which drops trivial position/always-on features (e.g. fires on every
+    #     "The"). Do not raise it without a reason.
+    #   min_density guards against features so rare they yield ~no active examples
+    #     in the training corpus (the sparse-target problem): with N training
+    #     tokens you want density * N active examples to be enough to learn from.
+    #     Tune this to the dataset size, not blindly.
+    min_density: float = 1e-3
+    max_density: float = 0.01
     # optional Neuronpedia auto-interp score floor (None => ignore)
     min_interp_score: float | None = None
     seed: int = 0

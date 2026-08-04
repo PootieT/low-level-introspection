@@ -4,7 +4,10 @@ from typing import List, Optional
 
 from transformers import PretrainedConfig
 
-from .schema import SignalSpec, MLPNeuronSpec, AttentionScoreSpec, ResidualStreamSpec, SignalSource
+from .schema import (
+    SignalSpec, MLPNeuronSpec, AttentionScoreSpec, ResidualStreamSpec,
+    SAEFeatureSpec, SignalSource,
+)
 
 
 def parse_signal(signal: str, precision: int) -> SignalSpec:
@@ -15,6 +18,11 @@ def parse_signal(signal: str, precision: int) -> SignalSpec:
         return AttentionScoreSpec(layer=int(layer),index=int(index),precision=precision)
     elif signal.upper().startswith("R"):
         return ResidualStreamSpec(layer=int(layer),index=int(index),precision=precision)
+    elif signal.upper().startswith("S"):
+        # e.g. "S9.12102"; SAE identity (release/site/width) uses SAEFeatureSpec
+        # defaults (Gemma Scope res 16k). Override those in the generated config if
+        # you point at a different SAE.
+        return SAEFeatureSpec(layer=int(layer),index=int(index),precision=precision)
     else:
         raise NotImplementedError(f"{signal} is not supported")
 

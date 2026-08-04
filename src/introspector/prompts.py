@@ -77,8 +77,26 @@ def residual_stream_prompt(
     return prompt
 
 
+def sae_prompt(
+    layer: int,
+    signal_index: int,
+    token: str,
+    token_index: int,
+) -> str:
+    templates = [
+        'At token "{TOKEN}", SAE feature {SIGNAL_IDX} at layer {LAYER} is',
+        'The SAE feature {SIGNAL_IDX} at layer {LAYER} for token "{TOKEN}" is',
+        'SAE feature {SIGNAL_IDX} at layer {LAYER} and token "{TOKEN}" has activation level of',
+        'SAE feature {LAYER}.{SIGNAL_IDX} at token "{TOKEN}" has activation of',
+    ]
+    prompt = random.choice(templates).format(
+        TOKEN=token, SIGNAL_IDX=signal_index, LAYER=layer
+    )
+    return prompt
+
+
 def prompt_no_token_index(
-    signal_type: Literal["mlp", "attention_score", "residual_stream"],
+    signal_type: Literal["mlp", "attention_score", "residual_stream", "sae"],
     **kwargs
 ):
     if signal_type == "mlp":
@@ -87,6 +105,8 @@ def prompt_no_token_index(
         return attention_score_prompt(**kwargs)
     elif signal_type == "residual_stream":
         return residual_stream_prompt(**kwargs)
+    elif signal_type == "sae":
+        return sae_prompt(**kwargs)
     else:
         raise ValueError()
 
