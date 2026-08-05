@@ -87,8 +87,11 @@ def preprocess_example(
 
     if detection:
         # binary readout for sparse features: the feature is active iff its
-        # (JumpReLU-thresholded) activation is > 0.
-        target = detection_active_word if float(example["activation"]) > 0 else detection_inactive_word
+        # (JumpReLU-thresholded) activation is > 0. strip() so the template's
+        # single separator space is the only space, regardless of whether the
+        # configured word carries a leading space.
+        word = detection_active_word if float(example["activation"]) > 0 else detection_inactive_word
+        target = word.strip()
     else:
         target = example["target"]
 

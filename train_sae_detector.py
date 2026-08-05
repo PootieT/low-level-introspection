@@ -103,8 +103,8 @@ def auroc_eval(model, ds_pred, activations, collator, tokenizer, tc, batch_size)
     # the label word is emitted AFTER the separator space the template inserts, so
     # tokenize it WITH a leading space to get the exact token id the model predicts
     # (" active" is a different token than "active").
-    active_ids = tokenizer(" " + tc.detection_active_word, add_special_tokens=False)["input_ids"]
-    inactive_ids = tokenizer(" " + tc.detection_inactive_word, add_special_tokens=False)["input_ids"]
+    active_ids = tokenizer(" " + tc.detection_active_word.strip(), add_special_tokens=False)["input_ids"]
+    inactive_ids = tokenizer(" " + tc.detection_inactive_word.strip(), add_special_tokens=False)["input_ids"]
     active_id, inactive_id = active_ids[0], inactive_ids[0]
     if active_id == inactive_id:
         raise ValueError(
