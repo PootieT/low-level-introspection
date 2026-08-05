@@ -100,8 +100,15 @@ def auroc_eval(model, ds_pred, activations, collator, tokenizer, tc, batch_size)
     ds_pred: for_prediction dataset (prompt only, left-padded).
     activations: aligned list of true feature activations (same order, no shuffle)."""
     model.eval()
-    active_id = tokenizer(tc.detection_active_word, add_special_tokens=False)["input_ids"][0]
-    inactive_id = tokenizer(tc.detection_inactive_word, add_special_tokens=False)["input_ids"][0]
+    # the label word is emitted AFTER the separator space the template inserts, so
+    # tokenize it WITH a leading space to get the exact token id the model predicts
+    # (" active" is a different token than "active").
+    active_ids = tokenizer(" " + tc.detection_active_word, add_special_tokens=False)["input_ids"]
+    inactive_ids = tokenizer(" " + tc.detection_inactive_word, add_special_tokens=False)["input_ids"]
+    active_id, inactive_id = active_ids[0], inactive_ids[0]
+    if active_id == inactive_id:
+        raise ValueError(
+            f"active/inactive share first token id {active_id}; pick more distinct words.")
     dl = DataLoader(ds_pred, batch_size=batch_size, collate_fn=collator, shuffle=False)
     scores = []
     for batch in dl:

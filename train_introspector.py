@@ -63,8 +63,8 @@ def preprocess_example(
     return_frozen_input_len=False,
     for_prediction=False,
     detection=False,
-    detection_active_word=" active",
-    detection_inactive_word=" inactive",
+    detection_active_word="active",
+    detection_inactive_word="inactive",
 ):
     """
     preprocess dataset for training or prediction
