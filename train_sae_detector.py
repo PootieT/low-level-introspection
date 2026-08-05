@@ -50,7 +50,9 @@ from train_introspector import preprocess_example, INTROSPECTION_SEPARATOR
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=Path, required=True)
-    p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--overwrite-cache", action="store_true",
+                   help="Re-run even if metrics exist, and start training fresh instead of "
+                        "resuming from the latest checkpoint.")
     return p.parse_args()
 
 
@@ -178,7 +180,7 @@ def main():
     cache_dir = config.dataset_cache_dir
     out_dir = Path(config.output_dir) / config.experiment_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    if (out_dir / "sae_detection_metrics.json").exists() and not args.overwrite:
+    if (out_dir / "sae_detection_metrics.json").exists() and not args.overwrite_cache:
         print(f"Already ran, skipping {out_dir}")
         return
 
@@ -245,7 +247,7 @@ def main():
             preprocess_logits_for_detection, active_id=active_id, inactive_id=inactive_id),
     )
     ckpts = glob.glob(f"{out_dir}/checkpoint-*")
-    if ckpts and not args.overwrite:
+    if ckpts and not args.overwrite_cache:
         trainer.train(resume_from_checkpoint=max(ckpts, key=os.path.getctime))
     else:
         trainer.train()
