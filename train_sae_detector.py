@@ -94,21 +94,69 @@ def make_preprocess(config, tokenizer):
     )
 
 
+def label_token_ids(tokenizer, tc):
+    """First-token ids of the active/inactive words AS EMITTED (leading space, so
+    " active" != "active"). Shared by the post-hoc eval and the in-training hooks."""
+    active_id = tokenizer(" " + tc.detection_active_word.strip(), add_special_tokens=False)["input_ids"][0]
+    inactive_id = tokenizer(" " + tc.detection_inactive_word.strip(), add_special_tokens=False)["input_ids"][0]
+    if active_id == inactive_id:
+        raise ValueError(f"active/inactive share first token id {active_id}; pick more distinct words.")
+    return active_id, inactive_id
+
+
+def detection_metrics_from_scores(scores, labels):
+    """scores: active-minus-inactive logit gap; labels: binary (1=active). Returns
+    the threshold-free detection metrics (AP is the imbalance-honest headline)."""
+    scores = np.asarray(scores, dtype=float)
+    labels = np.asarray(labels, dtype=int)
+    base_rate = float(labels.mean()) if len(labels) else float("nan")
+    res = {"n": int(len(labels)), "base_rate_positive": base_rate}
+    if len(labels) == 0 or labels.min() == labels.max():
+        res.update({"auroc": float("nan"), "ap": float("nan"),
+                    "f1_at_0": float("nan"), "acc_at_0": float("nan"),
+                    "note": "single-class eval set"})
+        return res
+    res["auroc"] = float(roc_auc_score(labels, scores))
+    res["ap"] = float(average_precision_score(labels, scores))          # imbalance-honest headline
+    preds = (scores > 0).astype(int)
+    res["f1_at_0"] = float(f1_score(labels, preds, zero_division=0))
+    res["acc_at_0"] = float((preds == labels).mean())
+    return res
+
+
+def preprocess_logits_for_detection(logits, labels, active_id, inactive_id):
+    """Trainer hook: reduce eval logits [B,T,V] to just the (active, inactive)
+    logits at the row that predicts the first target token -> [B, 2]. Keeps eval
+    memory tiny (same reason train_introspector argmaxes), and is all we need for
+    AUROC/AP on the dev split during training."""
+    is_tgt = labels != -100                                 # [B,T]
+    first_j = is_tgt.float().argmax(dim=1)                  # first target-token position
+    pred_row = (first_j - 1).clamp(min=0)                   # logits[:, t] predicts token t+1
+    b = torch.arange(logits.shape[0], device=logits.device)
+    rows = logits[b, pred_row].float()                      # [B, V]
+    return torch.stack([rows[:, active_id], rows[:, inactive_id]], dim=-1)  # [B, 2]
+
+
+def compute_detection_metrics(eval_pred, active_id, inactive_id):
+    """Trainer compute_metrics for the dev split during training. preds are the
+    [B,2] (active,inactive) logits from preprocess_logits_for_detection; the gold
+    label is recovered from the first target token id in `labels`."""
+    preds, labels = eval_pred.predictions, eval_pred.label_ids
+    gap = preds[:, 0] - preds[:, 1]
+    first_j = (labels != -100).argmax(axis=1)
+    gold = labels[np.arange(len(labels)), first_j]          # first target token id
+    valid = (gold == active_id) | (gold == inactive_id)
+    y = (gold == active_id).astype(int)
+    return detection_metrics_from_scores(gap[valid], y[valid])
+
+
 @torch.no_grad()
 def auroc_eval(model, ds_pred, activations, collator, tokenizer, tc, batch_size):
-    """Threshold-free detection metrics on the natural distribution.
+    """Threshold-free detection metrics on the natural distribution (post-hoc).
     ds_pred: for_prediction dataset (prompt only, left-padded).
     activations: aligned list of true feature activations (same order, no shuffle)."""
     model.eval()
-    # the label word is emitted AFTER the separator space the template inserts, so
-    # tokenize it WITH a leading space to get the exact token id the model predicts
-    # (" active" is a different token than "active").
-    active_ids = tokenizer(" " + tc.detection_active_word.strip(), add_special_tokens=False)["input_ids"]
-    inactive_ids = tokenizer(" " + tc.detection_inactive_word.strip(), add_special_tokens=False)["input_ids"]
-    active_id, inactive_id = active_ids[0], inactive_ids[0]
-    if active_id == inactive_id:
-        raise ValueError(
-            f"active/inactive share first token id {active_id}; pick more distinct words.")
+    active_id, inactive_id = label_token_ids(tokenizer, tc)
     dl = DataLoader(ds_pred, batch_size=batch_size, collate_fn=collator, shuffle=False)
     scores = []
     for batch in dl:
@@ -119,18 +167,7 @@ def auroc_eval(model, ds_pred, activations, collator, tokenizer, tc, batch_size)
         scores.append((last[:, active_id] - last[:, inactive_id]).cpu())
     scores = torch.cat(scores).numpy()
     labels = np.array([1 if is_active(a) else 0 for a in activations])
-
-    base_rate = float(labels.mean())
-    res = {"n": int(len(labels)), "base_rate_positive": base_rate}
-    if labels.min() == labels.max():
-        res.update({"auroc": float("nan"), "ap": float("nan"), "note": "single-class eval set"})
-        return res, scores, labels
-    res["auroc"] = float(roc_auc_score(labels, scores))
-    res["ap"] = float(average_precision_score(labels, scores))          # imbalance-honest headline
-    preds = (scores > 0).astype(int)
-    res["f1_at_0"] = float(f1_score(labels, preds, zero_division=0))
-    res["acc_at_0"] = float((preds == labels).mean())
-    return res, scores, labels
+    return detection_metrics_from_scores(scores, labels), scores, labels
 
 
 def main():
@@ -197,8 +234,16 @@ def main():
         eval_strategy="steps", eval_steps=math.ceil(400 // tc.train_batch_size),
         save_strategy="epoch", bf16=tc.bf16, remove_unused_columns=False, report_to="wandb",
     )
-    trainer = Trainer(model=model, args=training_args, train_dataset=train_ds,
-                      eval_dataset=dev_ds, data_collator=collator)
+    # dev AUROC/AP/F1 logged every eval step (wandb + history), not just eval_loss.
+    # preprocess_logits_for_metrics shrinks eval logits to [B,2] so this is cheap.
+    active_id, inactive_id = label_token_ids(tokenizer, tc)
+    trainer = Trainer(
+        model=model, args=training_args, train_dataset=train_ds,
+        eval_dataset=dev_ds, data_collator=collator,
+        compute_metrics=partial(compute_detection_metrics, active_id=active_id, inactive_id=inactive_id),
+        preprocess_logits_for_metrics=partial(
+            preprocess_logits_for_detection, active_id=active_id, inactive_id=inactive_id),
+    )
     ckpts = glob.glob(f"{out_dir}/checkpoint-*")
     if ckpts and not args.overwrite:
         trainer.train(resume_from_checkpoint=max(ckpts, key=os.path.getctime))
