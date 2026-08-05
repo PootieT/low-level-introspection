@@ -62,6 +62,9 @@ def preprocess_example(
     max_length,
     return_frozen_input_len=False,
     for_prediction=False,
+    detection=False,
+    detection_active_word=" active",
+    detection_inactive_word=" inactive",
 ):
     """
     preprocess dataset for training or prediction
@@ -82,7 +85,12 @@ def preprocess_example(
     )
     full_prompt = f"{example['text']} {INTROSPECTION_SEPARATOR}{introspection_prompt}"
 
-    target = example["target"]
+    if detection:
+        # binary readout for sparse features: the feature is active iff its
+        # (JumpReLU-thresholded) activation is > 0.
+        target = detection_active_word if float(example["activation"]) > 0 else detection_inactive_word
+    else:
+        target = example["target"]
 
     if for_prediction:
         full_text = f"{full_prompt}"

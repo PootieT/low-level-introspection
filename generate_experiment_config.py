@@ -120,6 +120,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-type", type=str, default="prompt_no_token_index")
     parser.add_argument("--use-regressor", action="store_true",
                         help="Whether to use regressor or default language head")
+    parser.add_argument("--objective", type=str, default="generate_value",
+                        choices=["generate_value", "detection"],
+                        help="'detection' => binary active/inactive readout for sparse SAE features "
+                             "(train with train_sae_detector.py).")
+    parser.add_argument("--detection-balance-pos-frac", type=float, default=0.5,
+                        help="Oversample feature-active rows in TRAIN up to this fraction (detection only).")
     parser.add_argument("--intervention-signal-distribution", type=str, default="uniform",
                         choices=["uniform", "gaussian", "extreme"],
                         help="Distribution to sample the injected value from at intervention time. "
@@ -282,7 +288,9 @@ def main() -> None:
             lora_alpha=args.lora_alpha,
             lora_target_modules=args.lora_target_modules if "," not in args.lora_target_modules else args.lora_target_modules.split(","),
             lora_dropout=args.lora_dropout,
-            bf16=args.bf16
+            bf16=args.bf16,
+            objective=args.objective,
+            detection_balance_pos_frac=args.detection_balance_pos_frac,
         ),
         eval_config = EvalConfig(
             do_sample=args.do_sample,

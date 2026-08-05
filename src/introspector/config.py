@@ -35,6 +35,16 @@ class TrainingConfig(BaseModel):
     prompt_type: str = "prompt_no_token_index"
     precision: int = 3
     bf16: bool = True
+    # objective: "generate_value" (default numeric SFT) | "detection" (binary
+    # active/inactive readout for sparse SAE features -- the model emits a word,
+    # scored threshold-free by the active-vs-inactive token logits => AUROC/AP).
+    objective: str = "generate_value"
+    detection_active_word: str = " active"
+    detection_inactive_word: str = " inactive"
+    # oversample positive (feature-active) rows in the TRAIN split up to this
+    # fraction so a sparse feature can't be learned as "always inactive". Eval/test
+    # keep the natural distribution; metrics are AUROC/AP (imbalance-robust).
+    detection_balance_pos_frac: float = 0.5
     # LR schedule
     warmup_ratio: float = 0.0
     lr_scheduler_type: str = "linear"   # linear | cosine | constant | ...
