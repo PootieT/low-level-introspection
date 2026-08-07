@@ -248,7 +248,7 @@ def main():
     cache_dir = config.dataset_cache_dir
     out_dir = Path(config.output_dir) / config.experiment_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    if (out_dir / "sae_detection_metrics.json").exists() and not args.overwrite_cache:
+    if (out_dir / "sae_interventional_scores.png").exists() and not args.overwrite_cache:
         print(f"Already ran, skipping {out_dir}")
         return
 

@@ -98,6 +98,8 @@ def main():
     # ---- data ----
     ds = load_dataset(args.dataset, args.dataset_config, split=args.split, streaming=True)
     texts = [ex["text"] for ex in ds.take(args.n_texts)]
+    print("=== Example texts ===")
+    print(f"1: {texts[0]}")
     enc = tok(texts, return_tensors="pt", padding=True, truncation=True,
               max_length=args.max_seq_length, padding_side="right")
     mask = enc["attention_mask"].bool()                    # [B, T]

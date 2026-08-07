@@ -14,6 +14,7 @@ one line per feature. Interventional columns are included automatically if prese
 """
 from __future__ import annotations
 
+import os
 import re
 import json
 from pathlib import Path
@@ -95,7 +96,9 @@ def plot_sweep(parent_dir: str, split: str = "test", out_name: str = "sweep_pos_
             ax.set_ylim(0, 1)
     g.tight_layout()
 
-    out_path = Path(parent_dir) / out_name
+    out_dir = Path(parent_dir).parents[1] / "plots" / Path(parent_dir).name
+    os.makedirs(out_dir, exist_ok=True)
+    out_path =out_dir / out_name
     g.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"[plot] wrote {out_path}")
     print(sub.pivot_table(index=["feature", "position"], columns="metric",

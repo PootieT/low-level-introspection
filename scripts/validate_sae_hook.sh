@@ -10,5 +10,5 @@ python validate_sae_hook.py \
 --layer 9 \
 --width 16k \
 --site res \
---n-texts 64 \
---max-seq-length 64
+--n-texts 1 \
+--max-seq-length 16

@@ -33,11 +33,13 @@ from __future__ import annotations
 import argparse
 import operator
 from pathlib import Path
+import tqdm
 
+from nnsight import LanguageModel
 import torch
 import pandas as pd
 from datasets import load_dataset
-from nnsight import LanguageModel
+
 
 from src.introspector.models.signal_paths import resolve_sae_hook_path
 from src.introspector.signals.sae import load_sae
@@ -97,6 +99,7 @@ def main():
     getter = operator.attrgetter(hook_path)
     ds = load_dataset(args.dataset, args.dataset_config, split=args.split, streaming=True)
     buf = []
+    bar = tqdm.tqdm(total=args.n_tokens)
     for ex in ds:
         buf.append(ex["text"])
         if len(buf) < args.batch_size:
@@ -132,6 +135,7 @@ def main():
         pos_active_count += ((feats_pos > 0) & pos_ok.unsqueeze(-1)).sum(0).double()
         seq_count += int(pos_ok.sum().item())
 
+        bar.update(int(keep.sum().item()))
         if tok_count >= args.n_tokens:
             break
 
