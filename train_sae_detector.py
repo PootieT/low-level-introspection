@@ -26,6 +26,7 @@ import glob
 import json
 import math
 import argparse
+import operator
 from functools import partial
 from pathlib import Path
 
@@ -39,9 +40,11 @@ from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
 
 from src.introspector.config import ExperimentConfig
+from src.introspector.models.signal_paths import resolve_sae_hook_path
+from src.introspector.signals.sae import load_sae_for_spec
 from src.introspector.training.collator import LoRAGatingCollator
 from src.introspector.training.model import (
-    replace_model_with_gated_version, replace_lora_with_gated_version,
+    replace_model_with_gated_version, replace_lora_with_gated_version, SAEInterventionHook,
 )
 from src.introspector.prompts import PROMPT_REGISTRY
 from train_introspector import preprocess_example, INTROSPECTION_SEPARATOR
@@ -172,6 +175,71 @@ def auroc_eval(model, ds_pred, activations, collator, tokenizer, tc, batch_size)
     return detection_metrics_from_scores(scores, labels), scores, labels
 
 
+def active_on_value(train_raw):
+    """A representative 'on' magnitude to steer to: the median of the feature's
+    naturally-active activations. Robust to the sparse zero mass and to outliers."""
+    acts = np.array([float(a) for a in train_raw["activation"]])
+    active = acts[acts > 0]
+    return float(np.median(active)) if len(active) else 1.0
+
+
+@torch.no_grad()
+def interventional_detection_eval(model, spec, test_raw, ds_pred, collator, tokenizer, tc,
+                                  on_value, batch_size):
+    """Paired counterfactual faithfulness test. For each context we steer the SAE
+    feature to `on_value` and to 0 at the SAME target token, and read the report's
+    active-vs-inactive logit gap each time. If the detector causally reads the
+    feature, gap(on) > gap(off); if it rides context correlations, the two are
+    indistinguishable. Reports interventional AUROC/AP (on vs off across all
+    contexts) and a paired directional accuracy (fraction with gap_on > gap_off).
+
+    ds_pred: for_prediction (prompt-only, left-padded) dataset, SAME row order as
+    test_raw (shuffle=False), so token positions line up by a running pointer.
+    """
+    model.eval()
+    active_id, inactive_id = label_token_ids(tokenizer, tc)
+    bundle = load_sae_for_spec(spec, device=str(model.device))
+    module_path = resolve_sae_hook_path(model, spec.layer, site=spec.sae_site, path_to_output=False)
+    module = operator.attrgetter(module_path)(model)
+    token_positions_all = np.asarray(test_raw["token_position"])
+
+    dl = DataLoader(ds_pred, batch_size=batch_size, collate_fn=collator, shuffle=False)
+    gaps = {"on": [], "off": []}
+    ptr = 0
+    for batch in dl:
+        batch = batch.to(model.device)
+        n = batch["input_ids"].shape[0]
+        # token_position is relative to the (unpadded) text, which starts after the
+        # left pad; shift by the leading pad count to hit the intended token.
+        tok_pos = torch.tensor(token_positions_all[ptr:ptr + n], device=model.device)
+        ptr += n
+        num_left_pad = (batch["attention_mask"] == 0).sum(dim=1)
+        abs_pos = tok_pos + num_left_pad
+        for state in ("on", "off"):
+            tv = torch.full((n,), on_value if state == "on" else 0.0,
+                            device=model.device, dtype=torch.float32)
+            hook = SAEInterventionHook(bundle, abs_pos, spec.index, tv)
+            handle = module.register_forward_hook(hook)
+            try:
+                out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+                            lora_token_mask=batch.get("lora_token_mask"))
+            finally:
+                handle.remove()
+            last = out.logits[:, -1, :].float()
+            gaps[state].append((last[:, active_id] - last[:, inactive_id]).cpu())
+
+    gap_on = torch.cat(gaps["on"]).numpy()
+    gap_off = torch.cat(gaps["off"]).numpy()
+    scores = np.concatenate([gap_on, gap_off])
+    labels = np.concatenate([np.ones_like(gap_on), np.zeros_like(gap_off)])
+    res = detection_metrics_from_scores(scores, labels)
+    res["paired_directional_acc"] = float((gap_on > gap_off).mean())
+    res["on_value"] = float(on_value)
+    res["mean_gap_on"] = float(gap_on.mean())
+    res["mean_gap_off"] = float(gap_off.mean())
+    return res, gap_on, gap_off
+
+
 def main():
     args = parse_args()
     config = ExperimentConfig.model_validate_json(args.config.read_text())
@@ -258,6 +326,28 @@ def main():
     test_metrics, test_scores, test_labels = auroc_eval(
         model, test_pred, test_raw["activation"], pred_collator, tokenizer, tc, tc.eval_batch_size)
     metrics = {"dev": dev_metrics, "test": test_metrics}
+
+    # ---- interventional (causal) faithfulness: steer the feature on vs off on the
+    #      SAME contexts and see whether the report follows. Only for SAE specs. ----
+    sae_specs = [s for s in config.test_signals if getattr(s, "type", None) == "sae"]
+    if sae_specs:
+        spec = sae_specs[0]
+        on_value = active_on_value(train_raw)
+        interv_metrics, gap_on, gap_off = interventional_detection_eval(
+            model, spec, test_raw, test_pred, pred_collator, tokenizer, tc, on_value, tc.eval_batch_size)
+        metrics["test_interventional"] = interv_metrics
+        # paired on/off gap distribution: separation == causal readability
+        plt.figure(figsize=(6, 4))
+        plt.hist(gap_off, bins=40, alpha=0.5, label=f"steered OFF (n={len(gap_off)})", density=True)
+        plt.hist(gap_on, bins=40, alpha=0.5, label=f"steered ON (n={len(gap_on)})", density=True)
+        plt.axvline(0, color="k", lw=1)
+        plt.xlabel("active - inactive logit gap"); plt.ylabel("density")
+        plt.title(f"interventional AUROC={interv_metrics.get('auroc', float('nan')):.3f} "
+                  f"paired_dir_acc={interv_metrics.get('paired_directional_acc', float('nan')):.3f}")
+        plt.legend(); plt.tight_layout()
+        plt.savefig(out_dir / "sae_interventional_scores.png", dpi=150)
+        plt.close()
+
     print(json.dumps(metrics, indent=2))
     with open(out_dir / "sae_detection_metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)

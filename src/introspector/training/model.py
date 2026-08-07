@@ -168,6 +168,44 @@ class InterventionHook:
 
         return outputs
 
+
+class SAEInterventionHook:
+    """Forward hook on a decoder LAYER (the residual site a Gemma Scope res SAE was
+    trained on) that clamps ONE SAE feature to a target value at given token
+    positions, via decoder-direction steering (bundle.steer_delta):
+
+        resid[b, pos] += decode(feat[b,pos] with feature:=target) - decode(feat[b,pos])
+
+    computed as a difference so the SAE reconstruction error is preserved and only
+    feature `feature_index`'s contribution changes. Used for the interventional
+    faithfulness eval: force the feature on vs off on the same context and see
+    whether the introspector's report follows.
+
+    token_positions/target_values: [bs] tensors (positions are absolute, i.e.
+    already padding-adjusted). Handles decoder layers whose forward returns either
+    a bare tensor or a (hidden, ...) tuple.
+    """
+
+    def __init__(self, bundle, token_positions, feature_index, target_values):
+        self.bundle = bundle
+        self.token_positions = token_positions
+        self.feature_index = feature_index
+        self.target_values = target_values
+
+    def __call__(self, module, inputs, output):
+        is_tuple = isinstance(output, tuple)
+        hidden = output[0] if is_tuple else output          # [bs, seq, d]
+        hidden = hidden.clone()
+        bs = hidden.shape[0]
+        bidx = torch.arange(bs, device=hidden.device)
+        resid_at = hidden[bidx, self.token_positions]        # [bs, d]
+        delta = self.bundle.steer_delta(resid_at, self.feature_index, self.target_values)
+        hidden[bidx, self.token_positions] = resid_at + delta.to(hidden.dtype)
+        if is_tuple:
+            return (hidden,) + tuple(output[1:])
+        return hidden
+
+
 class IntrospectionRegressionModel(PeftModelForCausalLM):
 
     def __init__(
