@@ -23,6 +23,19 @@ from pathlib import Path
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+# metrics whose natural range is [0,1] (get a 0..1 y-axis)
+RANGE01 = {"ap", "auroc", "f1_at_0", "acc_at_0", "paired_directional_acc"}
+# metrics where 0.5 is the chance baseline (get a dashed reference line)
+REF05 = {"auroc", "paired_directional_acc"}
+
+
+def _style_ax(ax, metric):
+    if metric in REF05:
+        ax.axhline(0.5, color="grey", ls="--", lw=1)
+    if metric in RANGE01:
+        ax.set_ylim(0, 1)
 
 # dir name -> feature + position (lr / train captured for optional faceting)
 RUN_RE = re.compile(r"sae_sample(?P<sample>\d+)_S(?P<layer>\d+)\.(?P<index>\d+)_POS(?P<pos>-?\d+)"
@@ -50,6 +63,8 @@ def load_sweep(parent_dir: str) -> pd.DataFrame:
         base = {
             "feature": f"S{m['layer']}.{m['index']}",
             "layer": int(m["layer"]), "index": int(m["index"]),
+            # sample index == density stratum from the sweep picker (0=rarest -> 9=most frequent)
+            "sample": int(m["sample"]),
             "position": int(m["pos"]),
             "lr": m.group("lr"), "train": m.group("train"),
         }
@@ -68,20 +83,13 @@ def load_sweep(parent_dir: str) -> pd.DataFrame:
     return df
 
 
-def plot_sweep(parent_dir: str, split: str = "test", out_name: str = "sweep_pos_metrics.png"):
-    df = load_sweep(parent_dir)
-    sub = df[df["split"] == split].copy()
-    if sub.empty:
-        raise SystemExit(f"No rows for split={split!r}; available: {sorted(df['split'].unique())}")
-    sub = sub.sort_values(["feature", "metric", "position"])
-
-    # one panel per metric; one line per feature over position. If the sweep spans
-    # multiple lr/train configs, distinguish them with line style.
+def plot_overview(sub, out_dir, split):
+    """Combined facet: one panel per metric, one line per feature over position."""
     style = None
     if sub[["lr", "train"]].drop_duplicates().shape[0] > 1:
+        sub = sub.copy()
         sub["config"] = "lr" + sub["lr"].astype(str) + "_" + sub["train"].astype(str)
         style = "config"
-
     n_feat = sub["feature"].nunique()
     g = sns.relplot(
         data=sub, x="position", y="value", hue="feature", style=style,
@@ -91,25 +99,88 @@ def plot_sweep(parent_dir: str, split: str = "test", out_name: str = "sweep_pos_
     )
     g.set_titles("{col_name}")
     g.figure.suptitle(f"SAE detection ({split}) vs token position — {n_feat} features", y=1.02)
-    # reference lines where meaningful
     for ax in g.axes.flat:
-        title = ax.get_title()
-        if title == "auroc":
-            ax.axhline(0.5, color="grey", ls="--", lw=1)
-        if title in ("ap", "auroc"):
-            ax.set_ylim(0, 1)
+        _style_ax(ax, ax.get_title())
     g.tight_layout()
+    out_path = out_dir / f"{split}__overview.png"
+    g.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(g.figure)
+    print(f"[plot] wrote {out_path}")
+
+
+def plot_per_metric_by_feature(sub, out_dir, split):
+    """One file per metric: every feature is its own line over position."""
+    for metric in sorted(sub["metric"].unique()):
+        m = sub[sub["metric"] == metric]
+        fig, ax = plt.subplots(figsize=(7, 5))
+        sns.lineplot(data=m, x="position", y="value", hue="feature",
+                     marker="o", ax=ax, legend="brief")
+        _style_ax(ax, metric)
+        ax.set_title(f"SAE detection ({split}) — {metric} — {m['feature'].nunique()} features")
+        ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=6, ncol=1)
+        fig.tight_layout()
+        out_path = out_dir / f"{split}__by_feature__{metric}.png"
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[plot] wrote {out_path}")
+
+
+def plot_per_metric_agg(sub, out_dir, split, by="layer", by_label=None, palette_name="viridis"):
+    """One file per metric: one line per level of `by` (e.g. layer, or sample =
+    density bin), aggregating over all other features at each (level, position)
+    with a shaded ±1 standard-error band (seaborn errorbar='se'). This is the same
+    idea as the by-layer view but with a swappable aggregation column."""
+    by_label = by_label or by
+    agg = sub.copy()
+    levels = sorted(agg[by].unique())
+    agg[by] = pd.Categorical(agg[by], categories=levels, ordered=True)
+    palette = dict(zip(levels, sns.color_palette(palette_name, len(levels))))
+    for metric in sorted(agg["metric"].unique()):
+        m = agg[agg["metric"] == metric]
+        fig, ax = plt.subplots(figsize=(7, 5))
+        sns.lineplot(
+            data=m, x="position", y="value", hue=by, palette=palette,
+            errorbar="se", marker="o", ax=ax,
+        )
+        _style_ax(ax, metric)
+        n_per = m.groupby(by, observed=True)["feature"].nunique().max()
+        ax.set_title(f"SAE detection ({split}) — {metric} — mean±SE by {by_label} "
+                     f"(≤{n_per} feats/level)")
+        ax.legend(title=by_label, bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=7)
+        fig.tight_layout()
+        out_path = out_dir / f"{split}__agg_{by}__{metric}.png"
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[plot] wrote {out_path}")
+
+
+def plot_sweep(parent_dir: str, split: str = "test", df=None):
+    df = load_sweep(parent_dir) if df is None else df
+    sub = df[df["split"] == split].copy()
+    if sub.empty:
+        raise SystemExit(f"No rows for split={split!r}; available: {sorted(df['split'].unique())}")
+    sub = sub.sort_values(["layer", "feature", "metric", "position"])
 
     out_dir = Path(parent_dir).parents[1] / "plots" / Path(parent_dir).name
     os.makedirs(out_dir, exist_ok=True)
-    out_path =out_dir / out_name
-    g.savefig(out_path, dpi=150, bbox_inches="tight")
-    print(f"[plot] wrote {out_path}")
-    print(sub.pivot_table(index=["feature", "position"], columns="metric",
-                          values="value").to_string())
-    plt.close(g.figure)
+
+    plot_overview(sub, out_dir, split)              # combined facet (busy but complete)
+    plot_per_metric_by_feature(sub, out_dir, split) # per-metric, one line per feature
+    plot_per_metric_agg(sub, out_dir, split, by="layer", by_label="layer")
+    # sample index == density stratum (0=rarest -> 9=most frequent): does activation
+    # frequency change how detectable/faithful the feature is?
+    plot_per_metric_agg(sub, out_dir, split, by="sample",
+                        by_label="density bin (0=rare→9=frequent)", palette_name="rocket")
+
+
+def plot_all_splits(parent_dir: str):
+    """Plot every split present (test, dev, test_interventional, ...)."""
+    df = load_sweep(parent_dir)
+    for split in sorted(df["split"].unique()):
+        print(f"\n===== plotting split={split} =====")
+        plot_sweep(parent_dir, split=split, df=df)
 
 
 if __name__ == "__main__":
     # plot_sweep("/projectnb/llamagrp/peter/low-level-introspection/outputs/runs/single_sae_detection_sweep_pos")
-    plot_sweep("/projectnb/llamagrp/peter/low-level-introspection/outputs/runs/single_sae_detection_sweep_layer_pos")
+    plot_all_splits("/projectnb/llamagrp/peter/low-level-introspection/outputs/runs/single_sae_detection_sweep_layer_pos")

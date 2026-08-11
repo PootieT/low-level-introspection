@@ -11,7 +11,7 @@ import seaborn as sns
 
 ROOT=Path(__file__).parents[1]
 
-def plot_token_overlap_vs_test_metrics(exp_pattern:str):
+def plot_token_overlap_vs_test_metrics(exp_pattern:str, output_dir:str="single_neuron"):
     data_dirs = sorted(glob.glob(f"{ROOT}/data/{exp_pattern}*"))
     out_dirs = sorted(glob.glob(f"{ROOT}/outputs/runs/{exp_pattern}*"))
     assert len(data_dirs) == len(out_dirs)
@@ -50,7 +50,7 @@ def plot_token_overlap_vs_test_metrics(exp_pattern:str):
         plt.close()
 
 
-def plot_sweep_eval_metrics(exp_name: str):
+def plot_sweep_eval_metrics(exp_name: str, output_dir:str="single_neuron"):
     eval_dirs = sorted(glob.glob(f"{ROOT}/outputs/runs/{exp_name}/*"))
     rows = []
     for eval_dir in tqdm(eval_dirs):
@@ -65,10 +65,11 @@ def plot_sweep_eval_metrics(exp_name: str):
             test_results = {f"test_{k}": v for k, v in test_res.items()}
             test_pred_results = {f"test_pred_{k}": v for k, v in test_pred_res.items()}
             intervention_results = {f"intervention_{k}": v for k, v in intervention_res[list(intervention_res.keys())[0]].items()}
+            exp_dir_splits = eval_dir.split("/")[-1].split("_")
             rows.append({
-                "sample_index": int(eval_dir.split("/")[-1].split("_")[1].replace("sample","")),
-                "layer": int(eval_dir.split("/")[-1].split("_")[0].replace("l","")),
-                "token_pos": int(eval_dir.split("/")[-1].split("_")[2].replace("pos","")),
+                "sample_index": int(exp_dir_splits[1].replace("sample","")) if "sample" in exp_dir_splits[1] else int(exp_dir_splits[2].replace("sample","")),
+                "layer": int(exp_dir_splits[0].replace("l","")),
+                "token_pos": int(exp_dir_splits[2].replace("pos","")) if "pos" in exp_dir_splits[2] else int(exp_dir_splits[1].replace("pos","")),
                 **test_results,
                 **test_pred_results,
                 **intervention_results,
@@ -144,7 +145,63 @@ def correlate_sweep_metrics_with_data_stats(exp_name: str):
     for metric in ["test_corr", "test_l2_dist", "test_pred_corr", "test_pred_l2_dist", "intervention_corr", "intervention_l2_dist"]:
         for sig in ["layer", "token_pos", "sample_index", "dev_token_overlaps", "train_signal_mean", "train_signal_std", "dev_signal_mean", "dev_signal_std"]:
             print(f"Metric {metric} vs. attribute {sig} correlation: {df[metric].corr(df[sig])}")
+
+def plot_sweep_eval_metrics_intervention_train(exp_name: str, output_dir:str="single_neuron_intervention_train"):
+    """ Plot interventional train results (no joint loss yet) """
+    eval_dirs = sorted(glob.glob(f"{ROOT}/outputs/runs/{exp_name}/*"))
+    rows = []
+    fail_cnt = 0
+    for eval_dir in tqdm(eval_dirs):
+        try:
+            with open(f"{eval_dir}/test_alt_intervention_results.json", encoding="utf-8") as f:
+                test_res = json.load(f)
+            with open(f"{eval_dir}/interventional_test_metrics_gaussian.json", encoding="utf-8") as f:
+                intervention_res = json.load(f)
+
+            test_results = {f"test_{k}": v for k, v in test_res.items()}
+            intervention_results = {f"intervention_{k}": v for k, v in intervention_res["test"].items()}
+            exp_dir_splits = eval_dir.split("/")[-1].split("_")
+            rows.append({
+                "sample_index": int(exp_dir_splits[2].replace("sample","")),
+                "layer": int(exp_dir_splits[0].replace("l","")),
+                "token_pos": int(exp_dir_splits[1].replace("pos","")),
+                **test_results,
+                **intervention_results,
+            })
+        except Exception as e:
+            print(f"failed at {eval_dir}: {e}")
+            fail_cnt += 1
+            continue
+
+    df = pd.DataFrame(rows)
+    for metric in tqdm(["test_corr", "test_l2_dist", "intervention_corr", "intervention_l2_dist"]):
+        df[metric] = df[metric] * 100
+        pivot_df = df.pivot_table(index="layer", columns="token_pos", values=metric, aggfunc="mean")
+        pivot_df_std = df.pivot_table(index="layer", columns="token_pos", values=metric, aggfunc="std")
+
+        annot_df = pd.DataFrame()
+        for col in pivot_df.columns:
+            annot_df[col] = pivot_df[col].map(lambda x: f"{x:.1f}") + "±" + \
+                            pivot_df_std[col].map(lambda x: f"{x:.1f}")
+
+        plt.figure(figsize=[14,14])
+        sns.heatmap(
+            pivot_df,
+            annot=annot_df,  # Pass your custom annotation DataFrame here
+            fmt="",
+            vmin=0, vmax=100
+        )
+        plt.title(f"{metric}(X100) across layers and tokens")
+        plt.tight_layout()
+        plot_dir = f"{ROOT}/outputs/plots/{output_dir}"
+        os.makedirs(plot_dir, exist_ok=True)
+        plt.savefig(f"{plot_dir}/sweep_eval_metrics_{metric}.png")
+        plt.close()
+
+
 if __name__ == "__main__":
     # plot_token_overlap_vs_test_metrics("single_mlp_l10_n24_train")
-    plot_sweep_eval_metrics("single_mlp_sweep")
+    # plot_sweep_eval_metrics("single_mlp_sweep")
     # correlate_sweep_metrics_with_data_stats("single_mlp_sweep")
+    plot_sweep_eval_metrics_intervention_train("intervention_train_regressor_sweep_layer_token_old_fixed_scale10")
+
