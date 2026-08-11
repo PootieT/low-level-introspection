@@ -83,26 +83,33 @@ def load_sweep(parent_dir: str) -> pd.DataFrame:
     return df
 
 
-def plot_overview(sub, out_dir, split):
-    """Combined facet: one panel per metric, one line per feature over position."""
-    style = None
-    if sub[["lr", "train"]].drop_duplicates().shape[0] > 1:
-        sub = sub.copy()
-        sub["config"] = "lr" + sub["lr"].astype(str) + "_" + sub["train"].astype(str)
-        style = "config"
-    n_feat = sub["feature"].nunique()
+def plot_overview(sub, out_dir, split, by="feature", by_label=None,
+                  palette_name=None, errorbar=None):
+    """Combined facet (one panel per metric) with a swappable hue/aggregation:
+      by='feature' -> one line per feature (no aggregation);
+      by='layer'   -> one line per layer, mean±SE over its features (errorbar='se');
+      by='sample'  -> one line per density bin, mean±SE over layers."""
+    by_label = by_label or by
+    data = sub.copy()
+    palette = None
+    if by in ("layer", "sample"):
+        levels = sorted(data[by].unique())
+        data[by] = pd.Categorical(data[by], categories=levels, ordered=True)
+        palette = dict(zip(levels, sns.color_palette(palette_name or "viridis", len(levels))))
     g = sns.relplot(
-        data=sub, x="position", y="value", hue="feature", style=style,
-        col="metric", col_wrap=min(3, sub["metric"].nunique()),
-        kind="line", marker="o", facet_kws={"sharey": False},
-        height=3.5, aspect=1.3,
+        data=data, x="position", y="value", hue=by, palette=palette,
+        col="metric", col_wrap=min(3, data["metric"].nunique()),
+        kind="line", marker="o", errorbar=errorbar,
+        facet_kws={"sharey": False}, height=3.5, aspect=1.3,
+        legend="brief" if by != "feature" else "auto",
     )
     g.set_titles("{col_name}")
-    g.figure.suptitle(f"SAE detection ({split}) vs token position — {n_feat} features", y=1.02)
+    tail = " (mean±SE)" if errorbar else f" — {data['feature'].nunique()} features"
+    g.figure.suptitle(f"SAE detection ({split}) vs token position — by {by_label}{tail}", y=1.02)
     for ax in g.axes.flat:
         _style_ax(ax, ax.get_title())
     g.tight_layout()
-    out_path = out_dir / f"{split}__overview.png"
+    out_path = out_dir / f"{split}__overview_{by}.png"
     g.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(g.figure)
     print(f"[plot] wrote {out_path}")
@@ -154,7 +161,10 @@ def plot_per_metric_agg(sub, out_dir, split, by="layer", by_label=None, palette_
         print(f"[plot] wrote {out_path}")
 
 
-def plot_sweep(parent_dir: str, split: str = "test", df=None):
+SAMPLE_LABEL = "density bin (0=rare→9=frequent)"
+
+
+def plot_sweep(parent_dir: str, split: str = "test", df=None, individual_metrics: bool = False):
     df = load_sweep(parent_dir) if df is None else df
     sub = df[df["split"] == split].copy()
     if sub.empty:
@@ -164,21 +174,28 @@ def plot_sweep(parent_dir: str, split: str = "test", df=None):
     out_dir = Path(parent_dir).parents[1] / "plots" / Path(parent_dir).name
     os.makedirs(out_dir, exist_ok=True)
 
-    plot_overview(sub, out_dir, split)              # combined facet (busy but complete)
-    plot_per_metric_by_feature(sub, out_dir, split) # per-metric, one line per feature
-    plot_per_metric_agg(sub, out_dir, split, by="layer", by_label="layer")
-    # sample index == density stratum (0=rarest -> 9=most frequent): does activation
-    # frequency change how detectable/faithful the feature is?
-    plot_per_metric_agg(sub, out_dir, split, by="sample",
-                        by_label="density bin (0=rare→9=frequent)", palette_name="rocket")
+    # faceted overviews: raw (per feature) + the two aggregations (mean±SE)
+    plot_overview(sub, out_dir, split, by="feature")
+    plot_overview(sub, out_dir, split, by="layer", by_label="layer", errorbar="se")
+    plot_overview(sub, out_dir, split, by="sample", by_label=SAMPLE_LABEL,
+                  palette_name="rocket", errorbar="se")
+
+    # per-metric individual files (one PNG per metric) -- off by default
+    if individual_metrics:
+        plot_per_metric_by_feature(sub, out_dir, split)
+        plot_per_metric_agg(sub, out_dir, split, by="layer", by_label="layer")
+        plot_per_metric_agg(sub, out_dir, split, by="sample",
+                            by_label=SAMPLE_LABEL, palette_name="rocket")
 
 
-def plot_all_splits(parent_dir: str):
-    """Plot every split present (test, dev, test_interventional, ...)."""
+def plot_all_splits(parent_dir: str, individual_metrics: bool = False):
+    """Plot every split present except dev (test, test_interventional, ...)."""
     df = load_sweep(parent_dir)
     for split in sorted(df["split"].unique()):
+        if split == "dev":
+            continue
         print(f"\n===== plotting split={split} =====")
-        plot_sweep(parent_dir, split=split, df=df)
+        plot_sweep(parent_dir, split=split, df=df, individual_metrics=individual_metrics)
 
 
 if __name__ == "__main__":
