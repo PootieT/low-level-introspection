@@ -5,10 +5,10 @@
 #$ -l gpus=1
 #$ -l gpu_c=8.5
 #$ -l gpu_memory=47G
-#$ -l h_rt=08:00:00
+#$ -l h_rt=1:00:00
 #$ -o log
 #$ -j y
-#$ -t 1-8    # one task per swept layer
+#$ -t 1-7    # one task per swept layer
 
 # Precompute per-layer SAE feature density stats used by the sweep to pick
 # density-valid, non-punctuation features. Run this BEFORE the sweep, e.g.:

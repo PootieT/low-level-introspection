@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import pdb
 import json
 from pathlib import Path
 
@@ -24,17 +25,20 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 
 # dir name -> feature + position (lr / train captured for optional faceting)
-RUN_RE = re.compile(r"sae_S(?P<layer>\d+)\.(?P<index>\d+)_POS(?P<pos>-?\d+)"
+RUN_RE = re.compile(r"sae_sample(?P<sample>\d+)_S(?P<layer>\d+)\.(?P<index>\d+)_POS(?P<pos>-?\d+)"
                     r"(?:_lr(?P<lr>[0-9.e-]+))?(?:_train(?P<train>\w+))?")
 
 # metrics to pull from each split's dict (skipped silently if absent)
-METRICS = ["ap", "auroc", "f1_at_0", "acc_at_0", "base_rate_positive"]
+METRICS = [
+    "ap", "auroc", "f1_at_0", "acc_at_0", "base_rate_positive", # non intervention metrics
+    "paired_directional_acc", "on_value", "mean_gap_on", "mean_gap_off" # interventional metrics
+]
 
 
 def load_sweep(parent_dir: str) -> pd.DataFrame:
     parent = Path(parent_dir)
     rows, skipped = [], 0
-    for d in sorted(parent.iterdir()):
+    for d in tqdm(sorted(parent.iterdir())):
         if not d.is_dir():
             continue
         m = RUN_RE.search(d.name)
@@ -107,6 +111,5 @@ def plot_sweep(parent_dir: str, split: str = "test", out_name: str = "sweep_pos_
 
 
 if __name__ == "__main__":
-    plot_sweep(
-        "/projectnb/llamagrp/peter/low-level-introspection/outputs/runs/single_sae_detection_sweep_pos"
-    )
+    # plot_sweep("/projectnb/llamagrp/peter/low-level-introspection/outputs/runs/single_sae_detection_sweep_pos")
+    plot_sweep("/projectnb/llamagrp/peter/low-level-introspection/outputs/runs/single_sae_detection_sweep_layer_pos")

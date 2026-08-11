@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #$ -P llamagrp
-#$ -N single_sae_sweep
+#$ -N single_sae_sweep_layer_pos
 #$ -pe omp 8
 #$ -l gpus=1
 #$ -l gpu_c=8.5
@@ -77,7 +77,7 @@ print(chosen[sample])
 ')
 
 SIG="S${LAYER}.${IDX}"
-EXP_NAME="sae_${SIG}_POS${TOKEN_POS}_lr${LR}_train300K"
+EXP_NAME="sae_sample${SAMPLE}_${SIG}_POS${TOKEN_POS}_lr${LR}_train300K"
 echo "Running Experiment: ${EXP_NAME}  (layer=$LAYER pos=$TOKEN_POS sample=$SAMPLE)"
 
 ### generate experiment config first as JSON
@@ -107,13 +107,15 @@ python generate_experiment_config.py \
     --num-epochs 1 \
     --disable-adapter-in-input \
     --bf16 \
+    --cache-dir data/$EXP_GROUP \
     --output-dir outputs/runs/$EXP_GROUP \
-    --output experiment_configs/$EXP_GROUP/$EXP_NAME.json
-#    --overwrite-cache
+    --output experiment_configs/$EXP_GROUP/$EXP_NAME.json \
+    --overwrite-cache
 
 ## cache activations and generate dataset
 python cache_signals.py \
-    --config experiment_configs/$EXP_GROUP/$EXP_NAME.json
+    --config experiment_configs/$EXP_GROUP/$EXP_NAME.json \
+    --overwrite-cache
 
 ## train detector (endogenous + interventional eval)
 python train_sae_detector.py \
@@ -122,4 +124,4 @@ python train_sae_detector.py \
 ## delete model checkpoints to save space
 python utils/delete_checkpoint_after_experiment_completion.py \
     --config experiment_configs/$EXP_GROUP/$EXP_NAME.json \
-    --expected-files "sae_detection_metrics.json"
+    --expected-files "sae_interventional_scores.json"

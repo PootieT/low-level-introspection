@@ -85,5 +85,5 @@ def analyze_anneal_hyper(exp_group_path: str):
     return
 
 if __name__ == "__main__":
-    # analyze_reg_extreme_hyper("outputs/runs/intervention_train_regressor_sweep_layer_token")
-    analyze_anneal_hyper("outputs/runs/intervention_train_regressor_anneal_hyper")
+    analyze_reg_extreme_hyper("outputs/runs/intervention_train_regressor_sweep_layer_token")
+    # analyze_anneal_hyper("outputs/runs/intervention_train_regressor_anneal_hyper")

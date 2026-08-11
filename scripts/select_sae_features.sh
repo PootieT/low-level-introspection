@@ -4,18 +4,21 @@ conda activate /projectnb/llamagrp/peter/low-level-introspection/introspection_e
 
 export HF_HOME=/projectnb/ivc-ml/SharedHuggingFaceCache
 
-python select_sae_features.py \
---model google/gemma-2-2b \
---sae-release gemma-scope-2b-pt-res-canonical \
---layer 9 \
---width 16k \
---n-tokens 1000000 \
---max-seq-length 128 \
---fixed-position -1 \
---cache-size 20000 \
---out data/sae_stats/gemma2-2b_res9_16k.parquet
+for LAYER in 0 3 6 9 12 15 18 21 24; do
+  python select_sae_features.py \
+    --model google/gemma-2-2b \
+    --sae-release gemma-scope-2b-pt-res-canonical \
+    --layer $LAYER \
+    --width 16k \
+    --n-tokens 1000000 \
+    --max-seq-length 128 \
+    --fixed-position -1 \
+    --cache-size 20000 \
+    --out data/sae_stats/gemma2-2b_res9_16k.parquet
 
+done
 
+# for layer 9
 # [select] wrote 16384 rows -> data/sae_stats/gemma2-2b_res9_16k.parquet  (tokens=1000083, seqs=8800, selected=7897)
   #
   #=== TOP 40 SELECTED FEATURES (density in [0.001,0.01]) ===

@@ -29,6 +29,7 @@ export WANDB_PROJECT=low-level-introspection
 export WANDB_WATCH=all
 export HF_HOME=/projectnb/ivc-ml/SharedHuggingFaceCache
 
+
 # batch job variables
 index=$(($SGE_TASK_ID-1))
 
@@ -48,7 +49,6 @@ EXP_GROUP="single_sae_detection"
 #EXP_GROUP="single_sae_detection_sweep_pos"
 DATASET_NAME="c4_gemma2b_${SIG}_pos${TOKEN_POS}_seq32_300K"
 export WANDB_RUN_GROUP=$EXP_GROUP
-
 
 python generate_experiment_config.py \
     --experiment-name $EXP_NAME \
@@ -97,3 +97,5 @@ python train_sae_detector.py \
 # lr=5e-5, ap=0.596, f1=0.562
 # lr=1e-4, ap=0.632, f1=0.570
 # lr=2e-5, ap=0.611, f1=0.583
+
+# okay now we need to sweep across tokens and layers for random sae features
