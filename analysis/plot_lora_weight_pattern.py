@@ -150,9 +150,16 @@ def main(
     plt.close()
 
     # ---- line plot ----
+    # MLP modules get a dashed line + square marker so attn (solid/circle) vs
+    # MLP (dashed/square) is separable at a glance.
+    mlp_modules = {"gate_proj", "up_proj", "down_proj"}
     plt.figure(figsize=(12, 8))
     for j, m in enumerate(modules):
-        plt.plot(layers, norm_mat[:, j], marker="o", markersize=9, linewidth=2.5, label=m)
+        is_mlp = m in mlp_modules
+        plt.plot(layers, norm_mat[:, j],
+                 marker="s" if is_mlp else "o", markersize=9, linewidth=2.5,
+                 linestyle="--" if is_mlp else "-",
+                 label=f"{m} (MLP)" if is_mlp else f"{m} (attn)")
     if highlight_layer is not None:
         plt.axvline(highlight_layer, color="k", ls="--", alpha=0.6, linewidth=2.5,
                     label=f"layer {highlight_layer}")
