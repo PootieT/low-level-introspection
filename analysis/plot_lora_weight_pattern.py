@@ -33,6 +33,18 @@ from safetensors import safe_open
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+# Poster-scale fonts: large enough to read from a few feet away.
+plt.rcParams.update({
+    "font.size": 20,
+    "axes.titlesize": 24,
+    "axes.labelsize": 22,
+    "xtick.labelsize": 18,
+    "ytick.labelsize": 18,
+    "legend.fontsize": 18,
+    "legend.title_fontsize": 20,
+    "figure.titlesize": 26,
+})
+
 # fixed column order (Llama attn + gated MLP); unexpected modules appended after
 MODULE_ORDER = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 LAYER_RE = re.compile(r"layers\.(\d+)\.")
@@ -124,11 +136,13 @@ def main(
     pd.DataFrame(norm_mat, index=layers, columns=modules).to_csv(out_dir / "lora_frobenius_normalized.csv")
 
     # ---- heatmap ----
-    plt.figure(figsize=(1.1 * len(modules) + 2, 0.34 * len(layers) + 2))
-    sns.heatmap(norm_mat, xticklabels=modules, yticklabels=layers,
+    plt.figure(figsize=(1.6 * len(modules) + 3, 0.5 * len(layers) + 3))
+    hm = sns.heatmap(norm_mat, xticklabels=modules, yticklabels=layers,
                 vmin=0, vmax=1, cmap="viridis", annot=True, fmt=".2f",
-                annot_kws={"size": 7},
+                annot_kws={"size": 14},
                 cbar_kws={"label": "||dW||_F (per-module normalized)"})
+    hm.figure.axes[-1].yaxis.label.set_size(20)  # colorbar label
+    hm.figure.axes[-1].tick_params(labelsize=16)  # colorbar ticks
     plt.xlabel("module"); plt.ylabel("layer")
     plt.title("LoRA update magnitude (per-module normalized)")
     plt.tight_layout()
@@ -136,16 +150,16 @@ def main(
     plt.close()
 
     # ---- line plot ----
-    plt.figure(figsize=(8, 5))
+    plt.figure(figsize=(12, 8))
     for j, m in enumerate(modules):
-        plt.plot(layers, norm_mat[:, j], marker="o", label=m)
+        plt.plot(layers, norm_mat[:, j], marker="o", markersize=9, linewidth=2.5, label=m)
     if highlight_layer is not None:
-        plt.axvline(highlight_layer, color="k", ls="--", alpha=0.6,
+        plt.axvline(highlight_layer, color="k", ls="--", alpha=0.6, linewidth=2.5,
                     label=f"layer {highlight_layer}")
     plt.xlabel("layer"); plt.ylabel("||dW||_F (per-module normalized)")
     plt.title("LoRA update magnitude across layers")
     plt.ylim(0, 1.02)
-    plt.legend(ncol=2, fontsize=8)
+    plt.legend(ncol=2)
     plt.tight_layout()
     plt.savefig(out_dir / "lora_frobenius_lineplot.png", dpi=150)
     plt.close()

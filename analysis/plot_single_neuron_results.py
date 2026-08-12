@@ -9,6 +9,18 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+# Poster-scale fonts: large enough to read from a few feet away.
+plt.rcParams.update({
+    "font.size": 20,
+    "axes.titlesize": 26,
+    "axes.labelsize": 22,
+    "xtick.labelsize": 18,
+    "ytick.labelsize": 18,
+    "legend.fontsize": 18,
+    "legend.title_fontsize": 20,
+    "figure.titlesize": 28,
+})
+
 ROOT=Path(__file__).parents[1]
 
 def plot_token_overlap_vs_test_metrics(exp_pattern:str, output_dir:str="single_neuron"):
@@ -89,13 +101,18 @@ def plot_sweep_eval_metrics(exp_name: str, output_dir:str="single_neuron"):
             annot_df[col] = pivot_df[col].map(lambda x: f"{x:.1f}") + "±" + \
                             pivot_df_std[col].map(lambda x: f"{x:.1f}")
 
-        plt.figure(figsize=[14,14])
-        sns.heatmap(
+        plt.figure(figsize=[16,16])
+        hm = sns.heatmap(
             pivot_df,
             annot=annot_df,  # Pass your custom annotation DataFrame here
             fmt="",
-            vmin=0, vmax=100
+            vmin=0, vmax=100,
+            annot_kws={"size": 14},
+            cbar_kws={"label": metric},
         )
+        hm.figure.axes[-1].yaxis.label.set_size(20)  # colorbar label
+        hm.figure.axes[-1].tick_params(labelsize=16)  # colorbar ticks
+        plt.xlabel("token position"); plt.ylabel("layer")
         plt.title(f"{metric}(X100) across layers and tokens")
         plt.tight_layout()
         plot_dir = f"{ROOT}/outputs/plots/single_neuron"
@@ -184,13 +201,18 @@ def plot_sweep_eval_metrics_intervention_train(exp_name: str, output_dir:str="si
             annot_df[col] = pivot_df[col].map(lambda x: f"{x:.1f}") + "±" + \
                             pivot_df_std[col].map(lambda x: f"{x:.1f}")
 
-        plt.figure(figsize=[14,14])
-        sns.heatmap(
+        plt.figure(figsize=[16,16])
+        hm = sns.heatmap(
             pivot_df,
             annot=annot_df,  # Pass your custom annotation DataFrame here
             fmt="",
-            vmin=0, vmax=100
+            vmin=0, vmax=100,
+            annot_kws={"size": 14},
+            cbar_kws={"label": metric},
         )
+        hm.figure.axes[-1].yaxis.label.set_size(20)  # colorbar label
+        hm.figure.axes[-1].tick_params(labelsize=16)  # colorbar ticks
+        plt.xlabel("token position"); plt.ylabel("layer")
         plt.title(f"{metric}(X100) across layers and tokens")
         plt.tight_layout()
         plot_dir = f"{ROOT}/outputs/plots/{output_dir}"

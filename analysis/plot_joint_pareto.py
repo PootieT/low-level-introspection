@@ -32,6 +32,18 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# Poster-scale fonts: large enough to read from a few feet away.
+plt.rcParams.update({
+    "font.size": 20,
+    "axes.titlesize": 24,
+    "axes.labelsize": 22,
+    "xtick.labelsize": 18,
+    "ytick.labelsize": 18,
+    "legend.fontsize": 18,
+    "legend.title_fontsize": 20,
+    "figure.titlesize": 26,
+})
+
 W_RE = re.compile(r"_w([0-9]*\.?[0-9]+)")
 
 
@@ -93,23 +105,24 @@ def main():
     df.to_csv(args.output_dir / f"{args.out_name}.csv", index=False)
     print(df[["w_endo", "interv_corr", "endo_corr", "pareto"]].to_string(index=False))
 
-    fig, ax = plt.subplots(figsize=(7.5, 6))
+    fig, ax = plt.subplots(figsize=(11, 9))
     # trajectory in order of w (shows how the balance moves the operating point)
     ax.plot(df["interv_corr"], df["endo_corr"], "-", color="0.7", lw=1, zorder=1)
     sc = ax.scatter(df["interv_corr"], df["endo_corr"], c=df["w_endo"], cmap="viridis",
-                    s=90, zorder=2, edgecolor="k", linewidth=0.5)
+                    s=200, zorder=2, edgecolor="k", linewidth=0.5)
     for _, r in df.iterrows():
         ax.annotate(f"{r.w_endo:.2f}", (r.interv_corr, r.endo_corr),
-                    textcoords="offset points", xytext=(6, 4), fontsize=8)
+                    textcoords="offset points", xytext=(6, 4), fontsize=16)
     # Pareto-optimal frontier
     pf = df[df["pareto"]].sort_values("interv_corr")
     if len(pf):
-        ax.plot(pf["interv_corr"], pf["endo_corr"], "r--", lw=1.5, zorder=1, label="Pareto front")
-        ax.scatter(pf["interv_corr"], pf["endo_corr"], marker="*", s=260, facecolor="none",
-                   edgecolor="red", linewidth=1.5, zorder=3, label="Pareto-optimal")
-        ax.legend(loc="lower left", fontsize=9)
+        ax.plot(pf["interv_corr"], pf["endo_corr"], "r--", lw=2.5, zorder=1, label="Pareto front")
+        ax.scatter(pf["interv_corr"], pf["endo_corr"], marker="*", s=600, facecolor="none",
+                   edgecolor="red", linewidth=2.5, zorder=3, label="Pareto-optimal")
+        ax.legend(loc="lower left")
 
-    fig.colorbar(sc, ax=ax, label="w (endogenous weight)")
+    cbar = fig.colorbar(sc, ax=ax, label="w (endogenous weight)")
+    cbar.ax.tick_params(labelsize=18)
     ax.axhline(0, color="k", lw=0.5, alpha=0.3)
     ax.axvline(0, color="k", lw=0.5, alpha=0.3)
     ax.grid(True, alpha=0.2)
