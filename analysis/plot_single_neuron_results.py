@@ -110,10 +110,12 @@ def plot_sweep_eval_metrics(exp_name: str, output_dir:str="single_neuron"):
             annot_kws={"size": 14},
             cbar_kws={"label": metric},
         )
-        hm.figure.axes[-1].yaxis.label.set_size(20)  # colorbar label
-        hm.figure.axes[-1].tick_params(labelsize=16)  # colorbar ticks
-        plt.xlabel("token position"); plt.ylabel("layer")
-        plt.title(f"{metric}(X100) across layers and tokens")
+        hm.figure.axes[-1].yaxis.label.set_size(28)  # colorbar label
+        hm.figure.axes[-1].tick_params(labelsize=22)  # colorbar ticks
+        hm.tick_params(axis="x", labelsize=30)
+        hm.tick_params(axis="y", labelsize=30)
+        plt.xlabel("token position", fontsize=38); plt.ylabel("layer", fontsize=38)
+        plt.title(f"{metric}(X100) across layers and tokens", fontsize=40)
         plt.tight_layout()
         plot_dir = f"{ROOT}/outputs/plots/single_neuron"
         os.makedirs(plot_dir, exist_ok=True)
@@ -210,10 +212,12 @@ def plot_sweep_eval_metrics_intervention_train(exp_name: str, output_dir:str="si
             annot_kws={"size": 14},
             cbar_kws={"label": metric},
         )
-        hm.figure.axes[-1].yaxis.label.set_size(20)  # colorbar label
-        hm.figure.axes[-1].tick_params(labelsize=16)  # colorbar ticks
-        plt.xlabel("token position"); plt.ylabel("layer")
-        plt.title(f"{metric}(X100) across layers and tokens")
+        hm.figure.axes[-1].yaxis.label.set_size(28)  # colorbar label
+        hm.figure.axes[-1].tick_params(labelsize=22)  # colorbar ticks
+        hm.tick_params(axis="x", labelsize=30)
+        hm.tick_params(axis="y", labelsize=30)
+        plt.xlabel("token position", fontsize=38); plt.ylabel("layer", fontsize=38)
+        plt.title(f"{metric}(X100) across layers and tokens", fontsize=40)
         plt.tight_layout()
         plot_dir = f"{ROOT}/outputs/plots/{output_dir}"
         os.makedirs(plot_dir, exist_ok=True)

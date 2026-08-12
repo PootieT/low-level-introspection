@@ -141,10 +141,12 @@ def main(
                 vmin=0, vmax=1, cmap="viridis", annot=True, fmt=".2f",
                 annot_kws={"size": 14},
                 cbar_kws={"label": "||dW||_F (per-module normalized)"})
-    hm.figure.axes[-1].yaxis.label.set_size(20)  # colorbar label
-    hm.figure.axes[-1].tick_params(labelsize=16)  # colorbar ticks
-    plt.xlabel("module"); plt.ylabel("layer")
-    plt.title("LoRA update magnitude (per-module normalized)")
+    hm.figure.axes[-1].yaxis.label.set_size(28)  # colorbar label
+    hm.figure.axes[-1].tick_params(labelsize=22)  # colorbar ticks
+    hm.tick_params(axis="x", labelsize=30)
+    hm.tick_params(axis="y", labelsize=30)
+    plt.xlabel("module", fontsize=38); plt.ylabel("layer", fontsize=38)
+    plt.title("LoRA update magnitude (per-module normalized)", fontsize=40)
     plt.tight_layout()
     plt.savefig(out_dir / "lora_frobenius_heatmap.png", dpi=150)
     plt.close()
