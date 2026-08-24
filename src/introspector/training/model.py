@@ -39,7 +39,12 @@ class GatedLinear(Linear):
 
             lora_A = self.lora_A[active_adapter]
             lora_B = self.lora_B[active_adapter]
-            x_cast = x.to(lora_A.weight.dtype)
+            # peft's Linear.forward applies lora_dropout to the adapter input; this
+            # hand-rolled forward used to skip it, silently training every gated run
+            # at dropout=0 no matter what lora_dropout was configured to. Default
+            # lora_dropout is now 0.0 so that behavior is the explicit default.
+            dropout = self.lora_dropout[active_adapter]
+            x_cast = dropout(x.to(lora_A.weight.dtype))
             lora_out = lora_B(lora_A(x_cast)) * self.scaling[active_adapter]
             lora_out = lora_out.to(result.dtype)
 

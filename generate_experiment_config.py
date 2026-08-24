@@ -127,7 +127,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--detection-balance-pos-frac", type=float, default=0.5,
                         help="Oversample feature-active rows in TRAIN up to this fraction (detection only).")
     parser.add_argument("--intervention-signal-distribution", type=str, default="uniform",
-                        choices=["uniform", "gaussian", "extreme"],
+                        choices=["uniform", "gaussian", "extreme", "empirical"],
                         help="Distribution to sample the injected value from at intervention time. "
                              "'uniform' draws U(min, max); 'gaussian' fits N(mean, std) to the neuron's "
                              "empirical activations (better matches the real, skewed activation distribution); "
@@ -157,7 +157,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-target-modules", type=str, default="all-linear",
                         help="Comma separated list of names of modules to use for lora adaptor, all-linear targets all "
                              "linear modules")
-    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--lora-dropout", type=float, default=0.0,
+                        help="LoRA dropout. Default 0.0: the gated LoRA path never actually "
+                             "applied dropout until it was fixed, so 0.0 reproduces every "
+                             "previous run.")
 
     # ---- evaluation (generation params for now) ----
     parser.add_argument("--do-sample",action="store_true")

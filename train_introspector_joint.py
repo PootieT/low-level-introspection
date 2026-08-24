@@ -109,6 +109,31 @@ def _var_norm_mse(pred, target):
     return nn.functional.mse_loss(pred, target) / var
 
 
+class UngatedCollator(LoRAGatingCollator):
+    """LoRAGatingCollator minus the gate, selected when training_config.
+    disable_adapter_in_input is False (matching train_introspector.py, where that
+    flag has always chosen between gated and plain LoRA).
+
+    It drops `lora_token_mask` from the batch, so replace_model_with_gated_version
+    sets every LoRA layer's mask to None and GatedLinear reduces to stock LoRA over
+    the WHOLE sequence, input text included. Everything else -- left padding for
+    prediction, frozen_input_len popping -- is unchanged, so the trainer, evals and
+    diagnostics need no modification.
+
+    Why this matters here: with the gate ON, no trainable parameter touches the
+    computation at the introspected token, so the injected signal is routed
+    downstream at fixed base-model gain -- the suspected reason earlier token
+    positions fail. With it OFF the adapter can boost that gain AT THE ORIGIN.
+    Caveat: the model's own activation then drifts from the CACHED endogenous
+    target; the interventional loss/metric is unaffected, since the injected value
+    is ground truth by construction."""
+
+    def __call__(self, features):
+        batch = super().__call__(features)
+        batch.pop("lora_token_mask", None)
+        return batch
+
+
 class JointInterventionTrainer(InterventionTrainer):
     """Two-forward joint loss: w*endogenous + (1-w)*interventional (both var-normed)."""
 
@@ -146,6 +171,9 @@ def eval_endogenous_test(model, dataset, collator, config, output_dir, suffix="_
     Endogenous eval (no injection): full metrics (corr, l2_dist, avg/std diff, ...)
     matching the interventional eval, plus a predicted-vs-actual scatter.
     """
+    # dropout is a no-op under eval(); before the GatedLinear dropout fix it was a
+    # no-op either way, so these forwards used to inherit train mode harmlessly.
+    model.eval()
     dl = DataLoader(dataset, batch_size=config.training_config.eval_batch_size,
                     collate_fn=collator, shuffle=False)
     head = model.regression_head
@@ -194,6 +222,9 @@ def eval_endogenous_test(model, dataset, collator, config, output_dir, suffix="_
 def _extract_interv_readout(model, dataset, collator, config, scale, distribution="extreme"):
     """Under injection at `scale`, collect readout features, injected values,
     trained-head preds, and token_positions."""
+    # dropout is a no-op under eval(); before the GatedLinear dropout fix it was a
+    # no-op either way, so these forwards used to inherit train mode harmlessly.
+    model.eval()
     prev_dist, prev_scale = model.intervention_distribution, model.intervention_scale
     model.intervention_distribution, model.intervention_scale = distribution, scale
     model.seed_intervention_rng(config.seed)
@@ -403,8 +434,14 @@ def main():
     replace_model_with_gated_version(model)
     replace_lora_with_gated_version(model)
 
-    pred_collator = LoRAGatingCollator(tokenizer=tokenizer, model=model, padding=True,
-                                       label_pad_token_id=-100, return_tensors="pt", for_prediction=True)
+    gate_input = config.training_config.disable_adapter_in_input
+    collator_cls = LoRAGatingCollator if gate_input else UngatedCollator
+    print(f"[joint] LoRA input gate: "
+          f"{'ON -- adapter gated to the introspection prompt' if gate_input else 'OFF -- adapter active over the input text too'} "
+          f"(training_config.disable_adapter_in_input={gate_input}); lora_dropout="
+          f"{config.training_config.lora_dropout}")
+    pred_collator = collator_cls(tokenizer=tokenizer, model=model, padding=True,
+                                 label_pad_token_id=-100, return_tensors="pt", for_prediction=True)
 
     # checkpoint frequency: 0 => per epoch; >0 => every save_steps (float <1 = ratio of total steps)
     save_kwargs = ({"save_strategy": "epoch"} if config.training_config.save_steps <= 0

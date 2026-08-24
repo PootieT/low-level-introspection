@@ -30,7 +30,10 @@ class TrainingConfig(BaseModel):
     lora_r: int = 16
     lora_alpha: int = 32
     lora_target_modules: Union[str,List[str]] = "all-linear"
-    lora_dropout: float = 0.05
+    # 0.0 by default: GatedLinear used to drop lora_dropout on the floor, so every
+    # gated run to date trained at dropout=0 regardless of this value. The gate now
+    # applies dropout correctly, and this default preserves the old behavior.
+    lora_dropout: float = 0.0
     disable_adapter_in_input: bool = False
     prompt_type: str = "prompt_no_token_index"
     precision: int = 3
