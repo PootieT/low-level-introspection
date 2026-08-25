@@ -35,6 +35,7 @@ import glob
 import json
 import math
 import argparse
+import operator
 from functools import partial
 from pathlib import Path
 
@@ -54,6 +55,7 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 
 from src.introspector.config import ExperimentConfig
+from src.introspector.models.signal_paths import resolve_mlp_signal_path
 from src.introspector.prompts import PROMPT_REGISTRY
 from src.introspector.training.collator import LoRAGatingCollator
 from src.introspector.training.metrics import compute_metrics, compute_metrics_from_numericals
@@ -80,6 +82,14 @@ def parse_args():
     p.add_argument("--joint-loss-weight", type=float, default=0.5,
                    help="Weight w on the ENDOGENOUS term; interventional gets (1-w). "
                         "Keep constant; sweep across runs to map the frontier.")
+    p.add_argument("--skip-drift-eval", action="store_true",
+                   help="Skip the activation-drift measurement (see measure_activation_drift). It runs "
+                        "automatically whenever the adapter is active over the input text, because that "
+                        "is when the cached endogenous target can go stale.")
+    p.add_argument("--force-drift-eval", action="store_true",
+                   help="Run the drift measurement even when the input gate is ON. Drift is ~0 by "
+                        "construction there (no trainable parameter touches the text), so this is a null "
+                        "control -- and the cache-alignment check it prints is useful on any run.")
     p.add_argument("--routing-probe-scale", type=float, default=10.0,
                    help="Injection scale for the routing-probe diagnostic (use a LARGE learnable "
                         "scale so 'does it reach the readout' is detectable above the bf16 floor).")
@@ -207,6 +217,238 @@ def eval_endogenous_test(model, dataset, collator, config, output_dir, suffix="_
     plt.close()
     print(f"[joint] endogenous test: corr={metrics['corr']:.4f} l2={metrics['l2_dist']:.4f} "
           f"avg_diff={metrics['avg_diff']:.4f} std_diff={metrics['std_diff']:.4f}")
+    return metrics
+
+
+# ======================================================================
+# Activation drift + cache alignment
+#
+# With the adapter gated to the introspection prompt, no trainable parameter
+# touches the input text, so the neuron the model computes at the introspected
+# token IS the cached (base-model) value and the endogenous target is exact.
+# With the gate off that guarantee is gone, and a high endogenous corr has two
+# readings that the interventional metric cannot tell apart:
+#   (a) drift is small -- the model reads its own, barely-moved neuron;
+#   (b) drift is large and the adapter RECOMPUTES what the base model's neuron
+#       would have been, as a side channel, instead of reading the live one.
+# corr(tuned_live, base_live) at the same site separates them.
+#
+# The same pass also settles a cache/training ALIGNMENT question. cache_signals.py
+# tokenizes with add_special_tokens defaulting to True (BOS at index 0), while
+# preprocess_example tokenizes with add_special_tokens=False, so a cached
+# token_position p may correspond to training position p-1 -- exactly the -1 that
+# intervene_introspector.py applies ("offset of -1 is label shift I think") and
+# that IntrospectionRegressionModel.forward does NOT. Running the model with
+# adapters DISABLED reproduces the model that built the cache, so the offset whose
+# captured activation correlates ~1.0 with the cached column is the true
+# convention. Anything else is an off-by-one in the intervention site.
+# ======================================================================
+
+DRIFT_OFFSETS = (-1, 0, 1)
+# what IntrospectionRegressionModel.forward currently assumes (left-pad shift only)
+TRAIN_OFFSET = 0
+
+
+class ActivationCaptureHook:
+    """Forward hook that RECORDS the target neuron without modifying it (returns
+    None, so the module output passes through untouched).
+
+    Indexing mirrors InterventionHook -- absolute, left-pad-adjusted positions --
+    except that it handles a SUBSET of the batch (`row_indices`, the rows whose
+    signal lives in this layer) and captures several `offsets` around the position
+    in one forward, which is what the alignment check needs. Offsets are clamped
+    into range, so a row whose introspected token sits at a sequence edge may
+    report a padded/edge position for the outer offsets; that only affects the
+    diagnostic offsets, never offset 0.
+    """
+
+    def __init__(self, row_indices, token_positions, signal_indices, offsets=DRIFT_OFFSETS):
+        self.row_indices = row_indices
+        self.token_positions = token_positions
+        self.neuron_indices = signal_indices
+        self.offsets = tuple(offsets)
+        self.captured = {}
+
+    def __call__(self, module, inputs, outputs):
+        seq_len = outputs.shape[1]
+        for off in self.offsets:
+            pos = (self.token_positions + off).clamp(0, seq_len - 1)
+            self.captured[off] = outputs[self.row_indices, pos, self.neuron_indices].detach().float().cpu()
+        return None
+
+
+def _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offsets):
+    """One forward over `batch`, capturing the target neuron at every offset.
+    Returns {offset: [bs] float tensor}. Registers one hook per distinct signal
+    layer, so a multi-neuron / multi-layer batch still needs only one forward."""
+    bs = abs_pos.shape[0]
+    out = {off: torch.full((bs,), float("nan")) for off in offsets}
+    hooks, handles = [], []
+    try:
+        for layer in torch.unique(signal_layer).tolist():
+            m = signal_layer == layer
+            rows = torch.nonzero(m, as_tuple=True)[0]
+            hook = ActivationCaptureHook(rows, abs_pos[m], signal_index[m], offsets)
+            module = operator.attrgetter(resolve_mlp_signal_path(model, layer, path_to_output=False))(model)
+            handles.append(module.register_forward_hook(hook))
+            hooks.append((rows, hook))
+        model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+              lora_token_mask=batch.get("lora_token_mask"), do_intervention=False)
+    finally:
+        for h in handles:
+            h.remove()
+    for rows, hook in hooks:
+        for off in offsets:
+            out[off][rows.cpu()] = hook.captured[off]
+    return out
+
+
+def _drift_stats(x, ref):
+    """Agreement of `x` with reference `ref`: correlation, spread ratio, mean
+    shift, and RMSE in units of the reference's std (so it reads as 'how big is
+    the discrepancy compared to the signal we are trying to predict')."""
+    ref_std = float(np.std(ref))
+    return {
+        "corr": _corr_or_nan(x, ref),
+        "std_ratio": float(np.std(x) / ref_std) if ref_std > 1e-12 else float("nan"),
+        "mean_shift": float(np.mean(x) - np.mean(ref)),
+        "rel_rmse": float(np.sqrt(np.mean((x - ref) ** 2)) / ref_std) if ref_std > 1e-12 else float("nan"),
+    }
+
+
+@torch.no_grad()
+def measure_activation_drift(model, dataset, collator, config, output_dir, suffix="",
+                             offsets=DRIFT_OFFSETS, n_bins=6):
+    """
+    Capture the introspected neuron's LIVE activation twice on the test split --
+    once with the adapter active (tuned) and once with adapters disabled (base) --
+    and compare both against the cached activation the endogenous loss trains on.
+
+    Writes activation_drift{suffix}.{json,csv,png} and returns the metrics dict.
+    Two questions answered:
+
+    ALIGNMENT  corr(base, cached) per offset. The adapter-disabled model IS the one
+               that built the cache, so exactly one offset should be ~1.0. If that
+               offset is not TRAIN_OFFSET, the intervention hook has been injecting
+               into the wrong token.
+    DRIFT      corr(tuned, base) at TRAIN_OFFSET -- alignment-independent, since
+               both are read at the same site. ~1.0 with std_ratio ~1.0 means the
+               endogenous target is still valid and reading (a) is right; a low
+               corr with a still-high endogenous score points at recompute (b).
+    """
+    model.eval()
+    dl = DataLoader(dataset, batch_size=config.training_config.eval_batch_size,
+                    collate_fn=collator, shuffle=False)
+    cached_all, pos_all = [], []
+    tuned_all = {off: [] for off in offsets}
+    base_all = {off: [] for off in offsets}
+
+    for batch in dl:
+        batch = batch.to(model.device)
+        token_position = batch["token_position"]
+        # same left-pad correction the intervention hook applies (prediction
+        # batches are left-padded, so the text starts at index num_left_pad)
+        num_left_pad = (batch["attention_mask"] == 0).sum(dim=1).to(token_position.device)
+        abs_pos = token_position + num_left_pad
+        signal_layer, signal_index = batch["signal_layer"], batch["signal_index"]
+
+        tuned = _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offsets)
+        with model.disable_adapter():
+            base = _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offsets)
+
+        cached_all.append(batch["activation"].float().cpu())
+        pos_all.append(token_position.cpu())
+        for off in offsets:
+            tuned_all[off].append(tuned[off])
+            base_all[off].append(base[off])
+
+    cached = torch.cat(cached_all).numpy()
+    pos = torch.cat(pos_all).numpy()
+    tuned = {off: torch.cat(v).numpy() for off, v in tuned_all.items()}
+    base = {off: torch.cat(v).numpy() for off, v in base_all.items()}
+
+    # ---- alignment: which offset reproduces the cache? ----
+    alignment = [dict(offset=off, **_drift_stats(base[off], cached)) for off in offsets]
+    align_df = pd.DataFrame(alignment)
+    best = max(offsets, key=lambda o: (-np.inf if np.isnan(_corr_or_nan(base[o], cached))
+                                       else _corr_or_nan(base[o], cached)))
+    best_corr = _corr_or_nan(base[best], cached)
+
+    # ---- drift at the offset training actually uses ----
+    drift_vs_base = _drift_stats(tuned[TRAIN_OFFSET], base[TRAIN_OFFSET])
+    drift_vs_cached = _drift_stats(tuned[TRAIN_OFFSET], cached)
+
+    rows = [{"position_bin": "all", "pos_lo": float(pos.min()), "pos_hi": float(pos.max()),
+             "n": int(len(pos)), **drift_vs_base}]
+    if len(np.unique(pos)) > 1:
+        edges = np.unique(np.quantile(pos, np.linspace(0, 1, n_bins + 1)))
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            m = (pos >= lo) & (pos <= hi)
+            if m.sum() >= 40:
+                rows.append({"position_bin": f"[{lo:.0f},{hi:.0f}]", "pos_lo": float(lo),
+                             "pos_hi": float(hi), "n": int(m.sum()),
+                             **_drift_stats(tuned[TRAIN_OFFSET][m], base[TRAIN_OFFSET][m])})
+    by_pos = pd.DataFrame(rows)
+
+    metrics = {
+        "train_offset": TRAIN_OFFSET,
+        "alignment": alignment,
+        "best_alignment_offset": int(best),
+        "best_alignment_corr": best_corr,
+        "alignment_ok": bool(best == TRAIN_OFFSET and best_corr > 0.99),
+        "drift_tuned_vs_base": drift_vs_base,
+        "drift_tuned_vs_cached": drift_vs_cached,
+        "drift_by_position": rows,
+    }
+    out = Path(output_dir)
+    with open(out / f"activation_drift{suffix}.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+    pd.DataFrame({"token_position": pos, "cached": cached,
+                  **{f"base_off{off}": base[off] for off in offsets},
+                  **{f"tuned_off{off}": tuned[off] for off in offsets}}
+                 ).to_csv(out / f"activation_drift{suffix}.csv", index=False)
+    by_pos.to_csv(out / f"activation_drift_by_position{suffix}.csv", index=False)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
+    axes[0].scatter(cached, base[best], s=10, alpha=0.4)
+    axes[0].set_xlabel("cached activation"); axes[0].set_ylabel(f"live, adapters OFF (offset {best:+d})")
+    axes[0].set_title(f"cache alignment (corr={best_corr:.4f})")
+    axes[1].scatter(base[TRAIN_OFFSET], tuned[TRAIN_OFFSET], s=10, alpha=0.4)
+    axes[1].set_xlabel("live, adapters OFF"); axes[1].set_ylabel("live, adapter ON")
+    axes[1].set_title(f"drift (corr={drift_vs_base['corr']:.4f}, "
+                      f"std ratio={drift_vs_base['std_ratio']:.3f})")
+    for ax in axes:
+        lim = [min(ax.get_xlim()[0], ax.get_ylim()[0]), max(ax.get_xlim()[1], ax.get_ylim()[1])]
+        ax.plot(lim, lim, "k--", lw=1, alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(out / f"activation_drift{suffix}.png", dpi=150)
+    plt.close()
+
+    print("[drift] cache alignment (live activation with adapters OFF vs cached column):")
+    print(align_df.to_string(index=False))
+    if metrics["alignment_ok"]:
+        print(f"[drift] alignment OK: offset {TRAIN_OFFSET:+d} reproduces the cache "
+              f"(corr={best_corr:.4f}); the intervention hook targets the intended token.")
+    else:
+        print(f"[drift] *** ALIGNMENT MISMATCH *** best offset is {best:+d} (corr={best_corr:.4f}), "
+              f"but training/intervention assumes {TRAIN_OFFSET:+d}. The hook is injecting into the "
+              f"token at cached_position{TRAIN_OFFSET - best:+d}, i.e. NOT the token the prompt names. "
+              f"Interventional metrics stay valid (the injected value is ground truth wherever it "
+              f"lands) but the endogenous target and the 'reads the named token' claim do not.")
+    print(f"[drift] tuned vs base @offset {TRAIN_OFFSET:+d}: corr={drift_vs_base['corr']:.4f} "
+          f"std_ratio={drift_vs_base['std_ratio']:.3f} mean_shift={drift_vs_base['mean_shift']:+.4f} "
+          f"rel_rmse={drift_vs_base['rel_rmse']:.3f}")
+    print(f"[drift] tuned vs cached @offset {TRAIN_OFFSET:+d}: corr={drift_vs_cached['corr']:.4f} "
+          f"rel_rmse={drift_vs_cached['rel_rmse']:.3f}")
+    if drift_vs_base["corr"] > 0.99 and 0.95 <= drift_vs_base["std_ratio"] <= 1.05:
+        print("[drift] => drift is negligible: the cached endogenous target is still what the model "
+              "computes, so endogenous corr means what it did under the gated setup.")
+    else:
+        print("[drift] => the adapter MOVED the neuron. A high endogenous corr against the CACHED "
+              "target now needs the recompute explanation ruled out: check whether corr(tuned,cached) "
+              "exceeds corr(tuned,base) -- reading the live neuron cannot beat the live neuron itself.")
+    print("[drift] by position:")
+    print(by_pos.to_string(index=False))
     return metrics
 
 
@@ -501,6 +743,11 @@ def main():
     evaluate_interventional_test(model, eval_dataset=test_dataset_pred, collator=pred_collator,
                                  config=config, output_dir=eval_out_dir,
                                  distribution="gaussian", suffix="_gaussian")
+    # is the cached endogenous target still what the model computes? (auto-runs
+    # whenever the adapter is active over the input text, where it can go stale)
+    if not args.skip_drift_eval and (not gate_input or args.force_drift_eval):
+        measure_activation_drift(model, test_dataset_pred, pred_collator, config, eval_out_dir)
+
     eval_endogenous_test(model, test_dataset_pred, pred_collator, config, eval_out_dir)
 
     # diagnostic: is the injected value routed to the readout (ceiling) vs read by
