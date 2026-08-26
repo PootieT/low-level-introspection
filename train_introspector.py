@@ -100,25 +100,40 @@ def preprocess_example(
     else:
         full_text = f"{full_prompt} {target}{tokenizer.eos_token}"
 
+    # add_special_tokens=True (i.e. a leading BOS) on ALL THREE tokenizations, to
+    # match cache_signals.py, which tokenizes with the default add_special_tokens=True.
+    # Without BOS here the pipeline was wrong twice over:
+    #   POSITION  cached token_position indexes a BOS-prefixed sequence, so it pointed
+    #             one token to the RIGHT of the token the prompt names -- the
+    #             intervention hook injected into the neighbour. At pos=-1 that landed
+    #             one past the text, i.e. the first LoRA-ACTIVE token under gating,
+    #             which is why pos=-1 worked while earlier (frozen) positions did not.
+    #   FIDELITY  BOS is Llama's attention sink; dropping it perturbs every downstream
+    #             activation, so even at the right position the live neuron correlated
+    #             only ~0.81 with the cached target instead of ~1.0.
+    # Verified by probe_cache_alignment.py: (bos=True, offset=0) gives token-match 1.000
+    # and corr 0.9999 vs the cache; every other convention fails one or both. All three
+    # calls must stay consistent -- frozen_input_len and prompt_len both shift by the
+    # same one token, so the gate mask and label masking keep their boundaries.
     input_tokens = tokenizer(
         example['text'],
         truncation=True,
         max_length=max_length,
-        add_special_tokens=False,
+        add_special_tokens=True,
     )
 
     full_tokens = tokenizer(
         full_text,
         truncation=True,
         max_length=max_length,
-        add_special_tokens=False,
+        add_special_tokens=True,
     )
 
     prompt_tokens = tokenizer(
         full_prompt,
         truncation=True,
         max_length=max_length,
-        add_special_tokens=False,
+        add_special_tokens=True,
     )
 
     input_ids = full_tokens["input_ids"]

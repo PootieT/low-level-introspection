@@ -176,10 +176,13 @@ def verdict(df):
                 f"{best['token_match_rate']:.3f}). decode/re-encode does not round-trip, so the "
                 f"stored text cannot recover the cached tokenization. FIX: cache input_ids in "
                 f"cache_signals.py and REBUILD the datasets -- adding BOS alone will not do it.")
-    if best["corr_matched"] > 0.99 and best["frac_close_matched"] > 0.95:
+    # gate on corr + relative error, NOT frac_close: the activation column stores
+    # full-precision floats, so frac_close's absolute floor sits below bf16 forward
+    # noise and rejects exact matches (it read 0.85 on a verified-exact condition).
+    if best["corr_matched"] > 0.999 and best["rel_rmse_matched"] < 0.05:
         return (f"ALIGNED and FAITHFUL at {tag}: token match {best['token_match_rate']:.3f}, "
-                f"corr {best['corr_matched']:.4f}, {best['frac_close_matched']:.1%} of rows within "
-                f"cache precision. FIX: tokenize the training input the same way "
+                f"corr {best['corr_matched']:.4f}, rel_rmse {best['rel_rmse_matched']:.3f} "
+                f"(residual is forward-pass rounding). FIX: tokenize the training input the same way "
                 f"(add_special_tokens=True in preprocess_example) so cached position p maps to "
                 f"training position p. Caches stay valid -- retrain only, no re-caching.")
     return (f"ALIGNED but NOT faithful at {tag}: token match {best['token_match_rate']:.3f} yet "

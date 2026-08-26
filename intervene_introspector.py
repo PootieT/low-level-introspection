@@ -136,8 +136,11 @@ def main():
             bs, input_seq_len = batch["input_ids"].shape[0], batch["input_ids"].shape[1]
             random_signal_batch = random_signals[data_idx:data_idx + bs]
             og_token_positions = torch.tensor(test_dataset_raw["token_position"][data_idx:data_idx + bs]).to(device)
-            # prediction requires left padding, need to offset by padding tokens. offset of -1 is label shift I think
-            token_positions = og_token_positions + (batch["input_ids"] == tokenizer.pad_token_id).sum(dim=1).to(device) -1
+            # prediction requires left padding, so shift by the leading pad count.
+            # NOTE: the extra -1 that used to sit here was compensating for training
+            # tokenizing without BOS while the cache tokenized with it. preprocess_example
+            # now keeps BOS, so cached token_position maps directly and no offset applies.
+            token_positions = og_token_positions + (batch["input_ids"] == tokenizer.pad_token_id).sum(dim=1).to(device)
             with torch.no_grad(), gated_model.generate(batch, max_new_tokens=signal.precision+2, pad_token_id=tokenizer.pad_token_id):
                 # TODO extend to other signal types
                 mlp_layer_path = resolve_mlp_signal_path(gated_model, signal.layer)
