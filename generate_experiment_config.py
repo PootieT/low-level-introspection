@@ -31,6 +31,7 @@ from typing import Union
 from transformers import AutoConfig
 
 from src.introspector.utils import int_or_str
+from src.introspector.dataset_utils import canonical_dataset_name, parse_signal_filter
 from src.introspector.config import DatasetConfig, ExperimentConfig, TrainingConfig, EvalConfig
 from src.introspector.signals.schema import ExplicitSignalSpec, FixedTokenSelector, RandomRangeTokenSelector, \
     ExplicitSignalSpec, UniformLayerSampler, SignalSource
@@ -171,6 +172,10 @@ def parse_args() -> argparse.Namespace:
     # ---- paths ----
     parser.add_argument("--cache-dir", default="data")
     parser.add_argument("--output-dir", default="outputs/runs")
+    parser.add_argument("--signal-filter", default=None,
+                        help="Train on ONE signal from a shared multi-signal cache, e.g. 'N10.24'. "
+                             "Cache a (layer, position) cell once with all its neurons -- the forward "
+                             "pass is shared across signals -- then split it per neuron here.")
     parser.add_argument("--dataset-name", default=None,
                         help="Identity of the cached signal dataset. Set the SAME value across runs "
                              "that share data (rank/lr/w sweeps) to reuse one cache instead of "
@@ -305,7 +310,18 @@ def main() -> None:
         cache_dir=args.cache_dir,
         output_dir=args.output_dir,
         dataset_name=args.dataset_name,
+        signal_filter=args.signal_filter,
     )
+
+    # Derive the cache key from the fields that actually determine the cached
+    # content, so runs differing only in hyperparameters SHARE one dataset and runs
+    # differing in any content field can never collide. An explicit --dataset-name
+    # still wins, for reusing a cache built before this existed.
+    if config.dataset_name is None:
+        config.dataset_name = canonical_dataset_name(config)
+        print(f"Derived dataset_name: {config.dataset_name}")
+    if args.signal_filter:
+        parse_signal_filter(args.signal_filter)   # fail here, not 300 GPU-hours later
 
     os.makedirs(Path(args.output_dir).parent, exist_ok=True)
     with open(output_path, "w") as f:

@@ -103,6 +103,12 @@ class ExperimentConfig(BaseModel):
     test_token_selector: TokenSelector
 
     use_regressor: bool=False
+    # Restrict train/dev/test rows to ONE signal out of a shared multi-signal cache,
+    # e.g. "N10.24" (see dataset_utils.apply_signal_filter). This is what lets a
+    # sweep cache a (layer, position) cell ONCE with all its neurons -- one forward
+    # pass per text serves every neuron -- and still train one introspector per
+    # neuron. None => use every row in the cache (all signals jointly).
+    signal_filter: Optional[str] = None
 
     training_config: TrainingConfig
     eval_config: EvalConfig = EvalConfig(

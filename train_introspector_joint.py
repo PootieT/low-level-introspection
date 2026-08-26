@@ -55,6 +55,7 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 
 from src.introspector.config import ExperimentConfig
+from src.introspector.dataset_utils import apply_signal_filter
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
 from src.introspector.prompts import PROMPT_REGISTRY
 from src.introspector.training.collator import LoRAGatingCollator
@@ -623,6 +624,12 @@ def main():
     train_raw = load_from_disk(str(cache_dir / "train"))
     dev_raw = load_from_disk(str(cache_dir / "dev"))
     test_raw = load_from_disk(str(cache_dir / "test"))
+
+    # a shared cache may hold several signals (one forward pass per text serves them
+    # all); config.signal_filter picks this run's neuron out of it. No-op when unset.
+    train_raw = apply_signal_filter(train_raw, config.signal_filter, "train")
+    dev_raw = apply_signal_filter(dev_raw, config.signal_filter, "dev")
+    test_raw = apply_signal_filter(test_raw, config.signal_filter, "test")
 
     df = train_raw.to_pandas()
     signal_ranges = {}

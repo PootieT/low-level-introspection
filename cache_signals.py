@@ -23,6 +23,8 @@ import json
 import operator
 import pdb
 import random
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Dict
 
@@ -35,6 +37,9 @@ from torch.utils.data import IterableDataset
 from transformers import AutoTokenizer, BatchEncoding
 
 from src.introspector.config import ExperimentConfig, DatasetConfig
+from src.introspector.dataset_utils import (
+    canonical_dataset_name, dataset_identity, identity_hash,
+)
 from src.introspector.models.signal_paths import (
     resolve_mlp_signal_path, resolve_resid_signal_path, resolve_sae_hook_path,
 )
@@ -213,6 +218,14 @@ def create_batch_example(
 
     truncated_texts = model.tokenizer.decode(encoded["input_ids"], skip_special_tokens=True)
     for data_idx, text in enumerate(texts):
+        # The EXACT token ids the activations were read from. `text` is a decoded
+        # round trip, so re-tokenizing it downstream is an assumption; these ids make
+        # it checkable (and make training-from-ids possible later, which would remove
+        # the assumption entirely). Named text_input_ids, NOT input_ids, so it cannot
+        # collide with the tokenized-prompt column preprocess_example emits.
+        # Duplicated across a text's signal rows -- a few hundred bytes/row, worth it
+        # against the cost of an undetected off-by-one.
+        row_input_ids = encoded["input_ids"][data_idx][:int(seq_lens[data_idx])].tolist()
         for signal in signals:
             token_position = batch_token_positions[data_idx]
             token_str = model.tokenizer.decode(encoded["input_ids"][data_idx][token_position], clean_up_tokenization_spaces=False)
@@ -223,6 +236,7 @@ def create_batch_example(
                 "signal_index": signal.index,
                 "token_position": batch_token_positions[data_idx],
                 "token": token_str,
+                "text_input_ids": row_input_ids,
                 "activation": signals_activations[signal][data_idx],
                 "target": float_to_str_target(signals_activations[signal][data_idx], signal.precision) #f"{'+' if signals_activations[signal][data_idx]>0 else ''}{signals_activations[signal][data_idx]:.{signal.precision}f}",
             })
@@ -292,6 +306,61 @@ def report_token_overlap(train_dataset: Dataset, test_dataset: Dataset):
     }
 
 
+
+
+def _git_sha():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                       stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        return None
+
+
+def write_dataset_metadata(config: ExperimentConfig, output_dir: Path, model, row_counts: dict):
+    """
+    Make the cache self-describing, so "can these two runs share this dataset?" and
+    "what tokenization produced these activations?" are answerable from disk instead
+    of re-derived from a config (or, as happened once, from a week of debugging).
+
+    TOKENIZATION is the field that matters most: activations were captured from
+    tokenizer(..., add_special_tokens=True), i.e. WITH a leading BOS, right-padded.
+    Anything consuming token_position must tokenize the same way -- see
+    preprocess_example, which now does, and probe_cache_alignment.py, which checks it.
+    """
+    try:
+        dtype = str(next(model._model.parameters()).dtype)
+    except Exception:
+        try:
+            dtype = str(next(model.parameters()).dtype)
+        except Exception:
+            dtype = "unknown"
+    meta = {
+        "canonical_name": canonical_dataset_name(config),
+        "dataset_name": config.dataset_name,
+        "identity_hash": identity_hash(config),
+        "identity": dataset_identity(config),
+        "tokenization": {
+            "add_special_tokens": True,
+            "leading_bos": True,
+            "padding_side": "right",
+            "truncation": True,
+            "max_length_per_split": {
+                "train": config.train_dataset.max_seq_length,
+                "dev": config.dev_dataset.max_seq_length,
+                "test": config.test_dataset.max_seq_length,
+            },
+        },
+        "capture": {"model_dtype": dtype, "signal_site": "mlp.act_fn output (post-activation neuron)"},
+        "row_counts": row_counts,
+        "columns_include_text_input_ids": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_by_experiment": config.experiment_name,
+        "git_sha": _git_sha(),
+    }
+    path = output_dir / "metadata.json"
+    with open(path, "w") as f:
+        json.dump(meta, f, indent=2, default=str)
+    print(f"Wrote dataset metadata to: {path}")
 
 
 def parse_args():
@@ -411,6 +480,9 @@ def main():
     print(f"Saved dev dataset to: {dev_path}")
     test_dataset.save_to_disk(str(test_path))
     print(f"Saved test dataset to: {test_path}")
+
+    write_dataset_metadata(config, output_dir, model,
+                           {"train": len(train_dataset), "dev": len(dev_dataset), "test": len(test_dataset)})
 
 
 if __name__ == "__main__":
