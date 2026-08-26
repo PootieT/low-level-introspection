@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1-800
+#$ -t 400-800
 
 ## SCC env setup
 echo "=========================================================="
@@ -44,7 +44,7 @@ export WANDB_RUN_GROUP=$EXP_GROUP
 # ---- decode (layer, position, sample) from the flat array index ----
 # layout: layer outer (100 each) -> position (10 each) -> sample (10)
 index=$(($SGE_TASK_ID-1))
-LAYERS=(0 2 4 6 8 10 12 14)
+LAYERS=(0 2 4 6 8 10 12) # 14 was originally scheduled but takes too long so dropped
 POSS=(-1 -4 -7 -10 -13 -16 -19 -22 -25 -28)
 LAYER=${LAYERS[$((index / 100))]}
 rem=$((index % 100))
@@ -110,12 +110,12 @@ python generate_experiment_config.py \
     --cache-dir data/$EXP_GROUP \
     --output-dir outputs/runs/$EXP_GROUP \
     --output experiment_configs/$EXP_GROUP/$EXP_NAME.json \
-    --overwrite-cache
+#    --overwrite-cache
 
 ## cache activations and generate dataset
 python cache_signals.py \
     --config experiment_configs/$EXP_GROUP/$EXP_NAME.json \
-    --overwrite-cache
+#    --overwrite-cache
 
 ## train detector (endogenous + interventional eval)
 python train_sae_detector.py \
@@ -124,4 +124,4 @@ python train_sae_detector.py \
 ## delete model checkpoints to save space
 python utils/delete_checkpoint_after_experiment_completion.py \
     --config experiment_configs/$EXP_GROUP/$EXP_NAME.json \
-    --expected-files "sae_interventional_scores.json"
+    --expected-files "sae_interventional_scores.png"

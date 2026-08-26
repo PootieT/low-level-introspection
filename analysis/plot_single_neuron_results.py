@@ -227,7 +227,7 @@ def plot_sweep_eval_metrics_intervention_train(exp_name: str, output_dir:str="si
 
 if __name__ == "__main__":
     # plot_token_overlap_vs_test_metrics("single_mlp_l10_n24_train")
-    # plot_sweep_eval_metrics("single_mlp_sweep")
+    plot_sweep_eval_metrics("single_mlp_sweep")
     # correlate_sweep_metrics_with_data_stats("single_mlp_sweep")
-    plot_sweep_eval_metrics_intervention_train("intervention_train_regressor_sweep_layer_token_old_fixed_scale10")
+    # plot_sweep_eval_metrics_intervention_train("intervention_train_regressor_sweep_layer_token_old_fixed_scale10")
 

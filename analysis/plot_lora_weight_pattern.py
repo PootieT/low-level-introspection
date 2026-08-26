@@ -181,7 +181,7 @@ if __name__ == "__main__":
     # args = parse_args()
     # main(**vars(args))
     main(
-        checkpoint="/projectnb/llamagrp/peter/low-level-introspection/outputs/runs/internvetion_train/intervention_train_reg_extreme10_300K/checkpoint-9375",
+        checkpoint="/projectnb/llamagrp/peter/low-level-introspection/outputs/runs/intervention_train/intervention_train_reg_extreme10_300K/checkpoint-9375",
         output_dir="outputs/plots/lora_weight_pattern",
         highlight_layer=10,
     )
