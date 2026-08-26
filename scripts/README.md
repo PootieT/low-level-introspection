@@ -36,4 +36,6 @@ reuse — migrate a script into this directory rather than running it in place.
 |---|---|
 | `neuron/train_single_mlp_introspector_regressor_joint_loss_prev_token_hyper.sh` | learning rate (6 arms) for joint training on one neuron at random positions in [-31,-1]; `GATE` switches the gated control arm |
 
+| `neuron/train_single_mlp_introspector_endogenous_sweep_layer_token.sh` | 8 layers x 8 positions x 10 neurons, endogenous only (`W=1.0`); one array task per (layer, position) cell, 10 neurons inside it sharing one cached dataset |
+
 Others are migrated as the experiment list for the paper firms up.

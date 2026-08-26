@@ -1,5 +1,6 @@
 import pdb
 import random
+import hashlib
 from typing import List, Optional
 
 from transformers import PretrainedConfig
@@ -60,7 +61,18 @@ def resolve_signal_source(
             sampled_signals = []
             for layer in signal_source.layers:
                 available_indices = get_available_indices(layer, model_config, no_sample_signals)
-                sampled_indices = random.sample(available_indices, signal_source.signals_per_layer)
+                # Seed PER (seed, layer) instead of drawing from the global RNG.
+                # Previously signal_source.seed was declared and never read, so every
+                # config generation sampled different neurons from OS entropy: a sweep
+                # got a different neuron at every token position, which unpairs the
+                # position axis (neuron variance leaks into the position effect) and
+                # makes the choice unrecoverable from the spec. Mixing the layer in
+                # keeps layers from all drawing the SAME indices, since the candidate
+                # pool is identical across layers.
+                layer_seed = int(hashlib.sha256(
+                    f"{signal_source.seed}:{layer}".encode()).hexdigest()[:8], 16)
+                sampled_indices = random.Random(layer_seed).sample(
+                    available_indices, signal_source.signals_per_layer)
                 if signal_source.signal_type == "mlp":
                     layer_signals = [MLPNeuronSpec(layer=layer,index=i, precision=precision) for i in sampled_indices]
                 elif signal_source.signal_type == "attention_score":

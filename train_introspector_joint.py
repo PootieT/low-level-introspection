@@ -154,26 +154,40 @@ class JointInterventionTrainer(InterventionTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         inputs = inputs.copy()
-
-        # --- endogenous forward: no injection, target = true activation ---
-        endo_inputs = inputs.copy()
-        endo_inputs["labels"] = inputs["activation"]
-        endo_inputs["do_intervention"] = False
-        endo_out = model(**endo_inputs)
-        L_endo = _var_norm_mse(endo_out.logits, inputs["activation"])
-
-        # --- interventional forward: inject, target = injected value ---
-        interv_inputs = inputs.copy()
-        interv_inputs["labels"] = inputs["activation"]   # forward overwrites with injected value
-        interv_inputs["do_intervention"] = True
-        interv_out = model(**interv_inputs)
-        L_interv = _var_norm_mse(interv_out.logits, interv_out.intervention_values)
-
         w = self.joint_loss_weight
-        loss = w * L_endo + (1.0 - w) * L_interv
+        endo_out = interv_out = L_endo = L_interv = None
+
+        # A forward whose weight is 0 is skipped entirely. At w=1 (pure endogenous)
+        # or w=0 (pure interventional) the zero-weighted term adds no gradient, but
+        # `0.0 * L` still builds and traverses its graph on backward -- a silent 2x
+        # on every step. Skipping makes the endpoints cost exactly what the
+        # single-objective trainers cost, so one script can serve the whole frontier.
+        if w > 0.0:
+            # endogenous forward: no injection, target = true activation
+            endo_inputs = inputs.copy()
+            endo_inputs["labels"] = inputs["activation"]
+            endo_inputs["do_intervention"] = False
+            endo_out = model(**endo_inputs)
+            L_endo = _var_norm_mse(endo_out.logits, inputs["activation"])
+
+        if w < 1.0:
+            # interventional forward: inject, target = injected value
+            interv_inputs = inputs.copy()
+            interv_inputs["labels"] = inputs["activation"]   # forward overwrites with injected value
+            interv_inputs["do_intervention"] = True
+            interv_out = model(**interv_inputs)
+            L_interv = _var_norm_mse(interv_out.logits, interv_out.intervention_values)
+
+        loss = 0.0
+        if L_endo is not None:
+            loss = loss + w * L_endo
+        if L_interv is not None:
+            loss = loss + (1.0 - w) * L_interv
         if self.state.global_step % max(1, self.args.logging_steps) == 0:
-            self.log({"L_endo": float(L_endo.detach()), "L_interv": float(L_interv.detach())})
-        return (loss, interv_out) if return_outputs else loss
+            self.log({k: float(v.detach()) for k, v in
+                      (("L_endo", L_endo), ("L_interv", L_interv)) if v is not None})
+        out = interv_out if interv_out is not None else endo_out
+        return (loss, out) if return_outputs else loss
 
 
 @torch.no_grad()
@@ -725,7 +739,11 @@ def main():
         train_dataset=train_dataset, eval_dataset=dev_dataset, data_collator=pred_collator,
         compute_metrics=partial(compute_metrics, tokenizer=tokenizer),
         preprocess_logits_for_metrics=None, experiment_config=config,
-        do_intervention=True, callbacks=callbacks, joint_loss_weight=args.joint_loss_weight)
+        # at w=1 there is no interventional term to train, so mid-training eval
+        # reports the endogenous objective; the interventional TEST still runs
+        # afterwards, where it measures context bypass rather than training progress
+        do_intervention=(args.joint_loss_weight < 1.0),
+        callbacks=callbacks, joint_loss_weight=args.joint_loss_weight)
     print(f"[joint] joint_loss_weight (endo)={args.joint_loss_weight}  "
           f"interv_distribution={config.training_config.intervention_signal_distribution} "
           f"scale={model.intervention_scale}")
