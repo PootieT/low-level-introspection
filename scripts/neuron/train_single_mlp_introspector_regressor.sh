@@ -49,7 +49,7 @@ LR=5e-5
 ## dropout
 LORA_DOS=(0.1 0.15 0.2 0.3 0.4 0.5 0.6 0.7 0.8)
 LORA_DO=${LORA_DOS[$index]}
-LORA_DO=0.05
+LORA_DO=0 # previously 0.05 bug because of bug it's never passed in
 
 
 ### generate experiment config first as JSON

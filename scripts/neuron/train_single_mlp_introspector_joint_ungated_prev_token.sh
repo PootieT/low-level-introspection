@@ -75,7 +75,7 @@ SIG=10.24
 #    --save-steps 0.2 \
 ######## Setting 2: keep default hyperparameter to see if we can still do it
 LORA_R=16
-TOKEN_POS='-28'
+TOKEN_POS='-1'
 BS=32
 TRAIN_SAMPLES=300000
 LR=5e-5
@@ -90,52 +90,20 @@ LORA_ALPHA=$((LORA_R * 2))
 #DO=${DOS[$index]}
 
 EXP_NAME="intervention_train_reg_joint_ungated_POS${TOKEN_POS}_scale${SCALE}_w${W}_lrcos"
-DATASET_NAME="c4_N${SIG}_pos${TOKEN_POS}_seq32_300K"
-
 
 ### generate experiment config first as JSON
 EXP_GROUP=intervention_train_regressor_joint_ungated_prev_token
 # NOTE: cache dir deliberately points at the GATED sweep's group so the already
 # cached 1M-example dataset is reused as-is (cache_signals.py no-ops when
 # <cache-dir>/<dataset-name>/train exists). Only the outputs are new.
-CACHE_GROUP=intervention_train_regressor_joint_prev_token_hyper
 echo $EXP_NAME
-
-
-#RUN_DIR=outputs/runs/$EXP_GROUP/$EXP_NAME/diag_checkpoint-9375; python - <<EOF
-#import pandas as pd, numpy as np
-#d = pd.read_csv("$RUN_DIR/activation_drift.csv")
-#e = pd.read_csv("$RUN_DIR/endogenous_test_predictions_endogenous.csv")
-#assert len(d) == len(e), (len(d), len(e))
-#print("row alignment ok:", np.allclose(d["cached"], e["activation"], atol=1e-4))
-#d["pred"] = e["predictions"].values
-#for c in ["cached", "base_off-1", "base_off0", "tuned_off-1", "tuned_off0"]:
-#    print(f"corr(pred, {c:12s}) = {np.corrcoef(d['pred'], d[c])[0,1]: .4f}")
-#print(f"corr(tuned-1, base-1)  = {np.corrcoef(d['tuned_off-1'], d['base_off-1'])[0,1]: .4f}")
-#print(f"std ratio @-1          = {d['tuned_off-1'].std() / d['base_off-1'].std(): .4f}")
-#EOF
-#exit
-
-#python probe_cache_alignment.py --config experiment_configs/$EXP_GROUP/$EXP_NAME.json --n-examples 1024 --also-fp32
-#exit
-
-# temporary just for debugging
-#EXP_GROUP=intervention_train_regressor_joint_sweep
-#EXP_NAME=intervention_train_reg_joint_scale10_w0.01
-#
-#RUN_DIR=outputs/runs/intervention_train_regressor_joint_sweep/intervention_train_reg_joint_scale10_w0.01/diag_checkpoint-9375; python - <<EOF
-#import pandas as pd, numpy as np
-#d = pd.read_csv("$RUN_DIR/activation_drift.csv")
-#print("corr(tuned,base) @-1 =", np.corrcoef(d["tuned_off-1"], d["base_off-1"])[0,1])
-#print("corr(tuned,base) @ 0 =", np.corrcoef(d["tuned_off0"],  d["base_off0"])[0,1])
-#print("std ratio @-1 =", d["tuned_off-1"].std()/d["base_off-1"].std())
-#EOF
-python train_introspector_joint.py --config experiment_configs/intervention_train_regressor_joint_sweep/intervention_train_reg_joint_scale10_w0.01.json --joint-loss-weight 0.01 --diag-only --checkpoint outputs/runs/intervention_train_regressor_joint_sweep/intervention_train_reg_joint_scale10_w0.01/checkpoint-9375 --force-drift-eval
-exit
-
+# NOTE: no --dataset-name. generate_experiment_config derives the cache key from the
+# fields that determine the data (model/dataset/signals/selector/seq/samples + a hash),
+# so every arm of this LR sweep resolves to ONE shared dataset under data/<model>/...,
+# and the gated sweep with identical data lands on the same directory instead of
+# rebuilding it. Keep --cache-dir at the shared root for that to work across groups.
 python generate_experiment_config.py \
     --experiment-name $EXP_NAME \
-    --dataset-name $DATASET_NAME \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 \
     --train-dataset-split "train" \
@@ -164,7 +132,7 @@ python generate_experiment_config.py \
     --use-regressor \
     --intervention-signal-distribution extreme \
     --intervention-extreme-scale $SCALE \
-    --cache-dir data/$CACHE_GROUP \
+    --cache-dir data \
     --output-dir outputs/runs/$EXP_GROUP \
     --output experiment_configs/$EXP_GROUP/$EXP_NAME.json \
 #    --overwrite-cache
@@ -177,7 +145,7 @@ python generate_experiment_config.py \
 #    --save-steps 0.2 \
 
 
-### cache activations and generate dataset (no-op: reuses $CACHE_GROUP cache)
+### cache activations and generate dataset (no-op if another run already built it)
 python cache_signals.py \
     --config experiment_configs/$EXP_GROUP/$EXP_NAME.json \
 #    --overwrite-cache
