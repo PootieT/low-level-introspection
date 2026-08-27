@@ -83,6 +83,50 @@ def available_tasks() -> list[str]:
                      "`lighteval tasks list` and pass fully-qualified ids via --tasks.")
 
 
+def _registry_accepts(task_string: str) -> bool:
+    """Registry.__init__ eagerly expands and validates its `tasks` argument (that is
+    where the 'Cannot find task' error comes from), so constructing one is a real
+    format check."""
+    from lighteval.tasks.registry import Registry
+    try:
+        Registry(tasks=task_string)
+        return True
+    except Exception:
+        return False
+
+
+def _task_string_format(suite: str, task: str, few_shot: int) -> str:
+    """
+    Find the task-string layout THIS lighteval accepts.
+
+    The `suite|task|few_shot|truncate` form is only one of several across releases:
+    some versions look the whole string up against `suite|task` keys, so the trailing
+    `|0|0` becomes part of the key and nothing matches -- which is exactly how
+    `leaderboard|winogrande|0|0` failed while `winogrande` was plainly in the task
+    list. Probing beats guessing, and the answer is the same for every task, so this
+    runs once.
+    """
+    for fmt, template in (("suite|task|few_shot|truncate", f"{suite}|{task}|{few_shot}|0"),
+                          ("suite|task|few_shot", f"{suite}|{task}|{few_shot}"),
+                          ("suite|task", f"{suite}|{task}")):
+        if _registry_accepts(template):
+            print(f"[lighteval] task string format for this install: {fmt}")
+            if fmt == "suite|task" and few_shot:
+                print(f"[lighteval] WARNING: this format carries no few-shot field, so "
+                      f"--few-shot {few_shot} is NOT being applied. Set few-shot through the "
+                      f"task config or accept 0-shot.")
+            return fmt
+    raise SystemExit(
+        f"No task-string format was accepted for {suite}|{task}. Run "
+        f"`lighteval tasks list` and pass a working id verbatim via --tasks.")
+
+
+def _apply_format(fmt: str, suite: str, task: str, few_shot: int) -> str:
+    return {"suite|task|few_shot|truncate": f"{suite}|{task}|{few_shot}|0",
+            "suite|task|few_shot": f"{suite}|{task}|{few_shot}",
+            "suite|task": f"{suite}|{task}"}[fmt]
+
+
 def resolve_tasks(names: list[str], few_shot: int) -> str:
     """
     Bare names -> 'suite|task|few_shot|0', resolved against the installed registry.
@@ -97,7 +141,7 @@ def resolve_tasks(names: list[str], few_shot: int) -> str:
         suite, _, task = full.partition("|")
         by_task.setdefault(task, []).append(suite)
 
-    resolved = []
+    resolved, fmt = [], None
     for name in names:
         suites = by_task.get(name)
         matched = name
@@ -114,10 +158,22 @@ def resolve_tasks(names: list[str], few_shot: int) -> str:
                 f"  list them all: python {Path(__file__).name} --list-tasks")
         suite = min(suites, key=lambda s: (SUITE_PRIORITY.index(s) if s in SUITE_PRIORITY
                                            else len(SUITE_PRIORITY), s))
-        resolved.append(f"{suite}|{matched}|{few_shot}|0")
+        if fmt is None:
+            fmt = _task_string_format(suite, matched, few_shot)
+        resolved.append(_apply_format(fmt, suite, matched, few_shot))
         print(f"[lighteval] {name:12s} -> {resolved[-1]}"
               + (f"   (suites: {sorted(suites)})" if len(suites) > 1 else ""))
-    return ",".join(resolved)
+
+    joined = ",".join(resolved)
+    # one last check on the full set: a task can exist yet fail to expand (missing
+    # dataset, gated repo), and finding that out here beats finding it out after the
+    # base-model pass has already run
+    if not _registry_accepts(joined):
+        bad = [t for t in resolved if not _registry_accepts(t)]
+        raise SystemExit(f"lighteval rejected these resolved tasks: {bad or joined}\n"
+                         f"Inspect with `lighteval tasks inspect <task>`, or pass working ids "
+                         f"verbatim via --tasks.")
+    return joined
 
 
 def parse_args():
