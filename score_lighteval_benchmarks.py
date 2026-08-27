@@ -46,23 +46,93 @@ from transformers import AutoModelForCausalLM
 from src.introspector.config import ExperimentConfig
 from score_lm_degradation import load_adapter_model
 
-# suite|task|num_few_shot|truncate_few_shots -- lighteval's task syntax. Task ids move
-# between releases: verify with `lighteval tasks list | grep -i <name>` if one errors.
-DEFAULT_TASKS = ",".join([
-    "leaderboard|arc:easy|0|0",        # reasoning, well above chance at 1B
-    "leaderboard|winogrande|0|0",      # commonsense
-    "leaderboard|hellaswag|0|0",       # commonsense
-    "leaderboard|piqa|0|0",            # commonsense / physical
-    "lighteval|lambada:openai|0|0",    # next-token: most sensitive to LM damage
-])
+# Requested by BARE task name; the suite prefix is resolved against the installed
+# lighteval's own registry (see resolve_tasks). Hardcoding "leaderboard|winogrande"
+# breaks whenever a release reshuffles suites, which is exactly what happened.
+DEFAULT_TASK_NAMES = [
+    "arc:easy",     # reasoning, well above chance at 1B
+    "winogrande",   # commonsense
+    "hellaswag",    # commonsense
+    "piqa",         # commonsense / physical
+    "lambada",      # next-token: the closest benchmark analogue to LM damage
+]
+# deterministic tie-break when several suites carry the same task
+SUITE_PRIORITY = ["leaderboard", "lighteval", "harness", "helm", "original", "bigbench"]
+
+
+def _registry():
+    """Instantiate a task Registry across lighteval versions with different signatures."""
+    from lighteval.tasks.registry import Registry
+    for kwargs in ({"tasks": None}, {}, {"cache_dir": None}):
+        try:
+            return Registry(**kwargs)
+        except TypeError:
+            continue
+    raise SystemExit("Could not instantiate lighteval's Registry; run `lighteval tasks list` "
+                     "and pass fully-qualified ids via --tasks instead.")
+
+
+def available_tasks() -> list[str]:
+    """All 'suite|task' names the installed lighteval knows about."""
+    reg = _registry()
+    for attr in ("_task_registry", "task_registry", "TASK_REGISTRY"):
+        table = getattr(reg, attr, None)
+        if isinstance(table, dict) and table:
+            return sorted(table.keys())
+    raise SystemExit("Could not read the task table from lighteval's Registry; run "
+                     "`lighteval tasks list` and pass fully-qualified ids via --tasks.")
+
+
+def resolve_tasks(names: list[str], few_shot: int) -> str:
+    """
+    Bare names -> 'suite|task|few_shot|0', resolved against the installed registry.
+
+    Exact task match first, then prefix (so 'lambada' finds 'lambada:openai'), with
+    SUITE_PRIORITY breaking ties deterministically. Raises with candidates listed
+    rather than letting the Pipeline fail deep inside task expansion.
+    """
+    table = available_tasks()
+    by_task: dict[str, list[str]] = {}
+    for full in table:
+        suite, _, task = full.partition("|")
+        by_task.setdefault(task, []).append(suite)
+
+    resolved = []
+    for name in names:
+        suites = by_task.get(name)
+        matched = name
+        if not suites:                       # prefix match: 'lambada' -> 'lambada:openai'
+            cands = sorted(t for t in by_task if t == name or t.startswith(f"{name}:"))
+            if cands:
+                matched = cands[0]
+                suites = by_task[matched]
+        if not suites:
+            near = [t for t in by_task if name.split(":")[0] in t][:10]
+            raise SystemExit(
+                f"Task {name!r} not found in this lighteval install.\n"
+                f"  similar: {near or 'none'}\n"
+                f"  list them all: python {Path(__file__).name} --list-tasks")
+        suite = min(suites, key=lambda s: (SUITE_PRIORITY.index(s) if s in SUITE_PRIORITY
+                                           else len(SUITE_PRIORITY), s))
+        resolved.append(f"{suite}|{matched}|{few_shot}|0")
+        print(f"[lighteval] {name:12s} -> {resolved[-1]}"
+              + (f"   (suites: {sorted(suites)})" if len(suites) > 1 else ""))
+    return ",".join(resolved)
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--config", type=Path, required=True)
+    p.add_argument("--config", type=Path, required=False,
+                   help="Experiment config (not needed with --list-tasks).")
     p.add_argument("--checkpoint", type=Path, default=None,
                    help="Adapter checkpoint (default: latest under the run's output dir).")
-    p.add_argument("--tasks", type=str, default=DEFAULT_TASKS)
+    p.add_argument("--tasks", type=str, default=None,
+                   help="Comma-separated. Bare names (winogrande, arc:easy) are resolved against "
+                        "the installed lighteval registry; anything containing '|' is passed "
+                        "through verbatim. Default: " + ",".join(DEFAULT_TASK_NAMES))
+    p.add_argument("--few-shot", type=int, default=0)
+    p.add_argument("--list-tasks", action="store_true",
+                   help="Print every task the installed lighteval knows about, and exit.")
     p.add_argument("--max-samples", type=int, default=200,
                    help="Examples per task. Small values iterate fast but the noise floor is "
                         "several points -- fine for 'nothing broke', useless for '2 points worse'.")
@@ -134,6 +204,11 @@ def flatten_results(results: dict, condition: str) -> list[dict]:
 
 def main():
     args = parse_args()
+    if args.list_tasks:
+        print("\n".join(available_tasks()))
+        return
+    if args.config is None:
+        raise SystemExit("--config is required (except with --list-tasks).")
     config = ExperimentConfig.model_validate_json(args.config.read_text())
     run_dir = Path(config.output_dir) / config.experiment_name
     out_dir = args.output_dir or (run_dir / "lighteval")
@@ -150,7 +225,13 @@ def main():
         Path(max(ckpts, key=os.path.getctime)) if ckpts else None)
     if ckpt is None:
         raise SystemExit(f"No checkpoint found under {run_dir}; pass --checkpoint.")
-    print(f"[lighteval] checkpoint={ckpt}\n[lighteval] tasks={args.tasks}")
+    if args.tasks and "|" in args.tasks:
+        tasks = args.tasks                      # fully qualified, pass through
+    else:
+        names = [n.strip() for n in args.tasks.split(",")] if args.tasks else DEFAULT_TASK_NAMES
+        tasks = resolve_tasks(names, args.few_shot)
+    args.tasks = tasks
+    print(f"[lighteval] checkpoint={ckpt}\n[lighteval] tasks={tasks}")
 
     # NOT merged and NOT written to disk -- see the module docstring. Vocab is resized
     # to load (PEFT saved the resized embeddings) then trimmed back, so lighteval's own
