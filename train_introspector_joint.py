@@ -293,8 +293,12 @@ class ActivationCaptureHook:
 
 
 def _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offsets):
-    """One forward over `batch`, capturing the target neuron at every offset.
-    Returns {offset: [bs] float tensor}. Registers one hook per distinct signal
+    """One forward over `batch`, capturing the target neuron at every offset AND the
+    regression head's prediction from the same pass (the head reads the last-token
+    final hidden state, exactly as eval_endogenous_test does -- so the prediction
+    here is the endogenous readout, free of a second forward).
+
+    Returns ({offset: [bs] float tensor}, preds [bs]). One hook per distinct signal
     layer, so a multi-neuron / multi-layer batch still needs only one forward."""
     bs = abs_pos.shape[0]
     out = {off: torch.full((bs,), float("nan")) for off in offsets}
@@ -307,15 +311,18 @@ def _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offs
             module = operator.attrgetter(resolve_mlp_signal_path(model, layer, path_to_output=False))(model)
             handles.append(module.register_forward_hook(hook))
             hooks.append((rows, hook))
-        model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
-              lora_token_mask=batch.get("lora_token_mask"), do_intervention=False)
+        outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+                        lora_token_mask=batch.get("lora_token_mask"), do_intervention=False)
     finally:
         for h in handles:
             h.remove()
     for rows, hook in hooks:
         for off in offsets:
             out[off][rows.cpu()] = hook.captured[off]
-    return out
+    head = model.regression_head
+    h = outputs.hidden_states[-1][:, -1, :]
+    preds = head(h.to(device=head.weight.device, dtype=head.weight.dtype)).squeeze(-1).float().cpu()
+    return out, preds
 
 
 def _drift_stats(x, ref):
@@ -354,7 +361,7 @@ def measure_activation_drift(model, dataset, collator, config, output_dir, suffi
     model.eval()
     dl = DataLoader(dataset, batch_size=config.training_config.eval_batch_size,
                     collate_fn=collator, shuffle=False)
-    cached_all, pos_all = [], []
+    cached_all, pos_all, pred_all = [], [], []
     tuned_all = {off: [] for off in offsets}
     base_all = {off: [] for off in offsets}
 
@@ -367,17 +374,19 @@ def measure_activation_drift(model, dataset, collator, config, output_dir, suffi
         abs_pos = token_position + num_left_pad
         signal_layer, signal_index = batch["signal_layer"], batch["signal_index"]
 
-        tuned = _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offsets)
+        tuned, preds = _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offsets)
         with model.disable_adapter():
-            base = _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offsets)
+            base, _ = _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offsets)
 
         cached_all.append(batch["activation"].float().cpu())
+        pred_all.append(preds)
         pos_all.append(token_position.cpu())
         for off in offsets:
             tuned_all[off].append(tuned[off])
             base_all[off].append(base[off])
 
     cached = torch.cat(cached_all).numpy()
+    pred = torch.cat(pred_all).numpy()
     pos = torch.cat(pos_all).numpy()
     tuned = {off: torch.cat(v).numpy() for off, v in tuned_all.items()}
     base = {off: torch.cat(v).numpy() for off, v in base_all.items()}
@@ -392,6 +401,24 @@ def measure_activation_drift(model, dataset, collator, config, output_dir, suffi
     # ---- drift at the offset training actually uses ----
     drift_vs_base = _drift_stats(tuned[TRAIN_OFFSET], base[TRAIN_OFFSET])
     drift_vs_cached = _drift_stats(tuned[TRAIN_OFFSET], cached)
+
+    # ---- what is the readout actually tracking? (introspection coupling) ----
+    # The head was trained against CACHED activations -- the base model's, frozen at
+    # cache time. Once the adapter is active over the input text the model's own
+    # neuron moves, and the two stop being the same target:
+    #   corr(pred, tuned_live) > corr(pred, cached) -> COUPLED: the report follows the
+    #       model's CURRENT activation, i.e. it introspects on itself rather than
+    #       reproducing the value it was supervised on.
+    #   corr(pred, cached) > corr(pred, tuned_live) -> the head tracks the frozen
+    #       training target (or predicts it from context) rather than the live signal.
+    # corr(pred, cached) is the endogenous score itself, so it doubles as a
+    # cross-check against endogenous_test_metrics (same rows, same order).
+    readout = {
+        "corr_pred_cached": _corr_or_nan(pred, cached),
+        "corr_pred_tuned_live": _corr_or_nan(pred, tuned[TRAIN_OFFSET]),
+        "corr_pred_base_live": _corr_or_nan(pred, base[TRAIN_OFFSET]),
+    }
+    readout["coupling_gap"] = readout["corr_pred_tuned_live"] - readout["corr_pred_cached"]
 
     rows = [{"position_bin": "all", "pos_lo": float(pos.min()), "pos_hi": float(pos.max()),
              "n": int(len(pos)), **drift_vs_base}]
@@ -413,12 +440,13 @@ def measure_activation_drift(model, dataset, collator, config, output_dir, suffi
         "alignment_ok": bool(best == TRAIN_OFFSET and best_corr > 0.99),
         "drift_tuned_vs_base": drift_vs_base,
         "drift_tuned_vs_cached": drift_vs_cached,
+        "readout_tracking": readout,
         "drift_by_position": rows,
     }
     out = Path(output_dir)
     with open(out / f"activation_drift{suffix}.json", "w") as f:
         json.dump(metrics, f, indent=2)
-    pd.DataFrame({"token_position": pos, "cached": cached,
+    pd.DataFrame({"token_position": pos, "cached": cached, "prediction": pred,
                   **{f"base_off{off}": base[off] for off in offsets},
                   **{f"tuned_off{off}": tuned[off] for off in offsets}}
                  ).to_csv(out / f"activation_drift{suffix}.csv", index=False)
@@ -455,6 +483,21 @@ def measure_activation_drift(model, dataset, collator, config, output_dir, suffi
           f"rel_rmse={drift_vs_base['rel_rmse']:.3f}")
     print(f"[drift] tuned vs cached @offset {TRAIN_OFFSET:+d}: corr={drift_vs_cached['corr']:.4f} "
           f"rel_rmse={drift_vs_cached['rel_rmse']:.3f}")
+    print(f"[coupling] readout vs: cached(trained target)={readout['corr_pred_cached']:.4f}  "
+          f"tuned_live(own activation)={readout['corr_pred_tuned_live']:.4f}  "
+          f"base_live={readout['corr_pred_base_live']:.4f}  "
+          f"gap(tuned-cached)={readout['coupling_gap']:+.4f}")
+    if readout["coupling_gap"] > 0.01:
+        print("[coupling] => COUPLED: the report tracks the model's OWN current activation better "
+              "than the frozen target it was trained on -- introspection followed the signal as "
+              "the signal moved.")
+    elif readout["coupling_gap"] < -0.01:
+        print("[coupling] => NOT coupled: the report tracks the CACHED training target better than "
+              "the live neuron, so it is reproducing supervision (or predicting from context) "
+              "rather than reading the model's current state.")
+    else:
+        print("[coupling] => indistinguishable: live and cached activations are too similar here "
+              "for the two to separate (expected when drift is small).")
     if drift_vs_base["corr"] > 0.99 and 0.95 <= drift_vs_base["std_ratio"] <= 1.05:
         print("[drift] => drift is negligible: the cached endogenous target is still what the model "
               "computes, so endogenous corr means what it did under the gated setup.")

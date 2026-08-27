@@ -43,6 +43,12 @@
 #     and defaults to 0.0 to match the old effective behavior.
 #
 #  SCALE  10, not 30: scale 10 was consistently better at the unit-gaussian eval.
+#
+#  NO WARMUP / NO COSINE (config defaults: warmup_ratio 0.0, linear decay). Pre-fix,
+#     cosine+warmup looked NECESSARY at earlier positions; post-fix it is harmful --
+#     at pos=-28 gate-off it takes interventional corr 0.957 -> 0.356 and drives the
+#     neuron's std ratio to 0.29. That earlier finding was made while the injection
+#     was landing on the wrong token, i.e. on a different task.
 # ============================================================================
 
 ## SCC env setup
@@ -119,8 +125,6 @@ python generate_experiment_config.py \
     $GATE_FLAG \
     --bf16 \
     --learning-rate $LR \
-    --warmup-ratio 0.03 \
-    --lr-scheduler-type cosine \
     --save-steps 0.2 \
     --use-regressor \
     --intervention-signal-distribution extreme \
