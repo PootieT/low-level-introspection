@@ -44,6 +44,7 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM
 
 from src.introspector.config import ExperimentConfig
+from score_lm_degradation import load_adapter_model
 
 # suite|task|num_few_shot|truncate_few_shots -- lighteval's task syntax. Task ids move
 # between releases: verify with `lighteval tasks list | grep -i <name>` if one errors.
@@ -151,12 +152,10 @@ def main():
         raise SystemExit(f"No checkpoint found under {run_dir}; pass --checkpoint.")
     print(f"[lighteval] checkpoint={ckpt}\n[lighteval] tasks={args.tasks}")
 
-    base = AutoModelForCausalLM.from_pretrained(
-        config.model_name, device_map="auto",
-        torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32)
-    # NOT merged and NOT written to disk -- see the module docstring
-    model = PeftModel.from_pretrained(base, str(ckpt), autocast_adapter_dtype=False)
-    model.eval()
+    # NOT merged and NOT written to disk -- see the module docstring. Vocab is resized
+    # to load (PEFT saved the resized embeddings) then trimmed back, so lighteval's own
+    # base tokenizer matches the model and no phantom token can be generated.
+    model, _ = load_adapter_model(config, ckpt, trim_vocab=True)
 
     rows, raw = [], {}
     for condition in [c.strip() for c in args.conditions.split(",")]:

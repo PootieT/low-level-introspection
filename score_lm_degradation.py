@@ -48,11 +48,49 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.introspector.config import ExperimentConfig
+from train_introspector import INTROSPECTION_SEPARATOR
 
 # KL below this (nats/token) and top-1 agreement above the second value => the
 # adapter left ordinary language modelling essentially untouched. Calibration, not law.
 KL_NEGLIGIBLE = 0.01
 TOP1_NEGLIGIBLE = 0.99
+
+
+def load_adapter_model(config: ExperimentConfig, ckpt, trim_vocab: bool = True):
+    """
+    Load an introspection checkpoint for ORDINARY-text evaluation.
+
+    PEFT's save_pretrained uses save_embedding_layers="auto", which stores
+    embed_tokens/lm_head whenever the vocab was resized -- and every run here resizes
+    by one for the introspection separator. So the adapter cannot load onto a stock
+    base; resize first, exactly as training did.
+
+    Those rows were FROZEN during training (get_peft_model marks only LoRA
+    trainable), so the extra one is still the random init from
+    resize_token_embeddings: a junk logit for a token that never occurs in real text.
+    It is shared by both conditions, so KL and top-1 agreement are unaffected either
+    way, but it does sit in every softmax and perturbs absolute NLL/perplexity.
+    trim_vocab drops it again after loading, restoring the exact base vocabulary
+    (Llama-3.2 ties embed/lm_head, so both shrink together).
+
+    Returns (model, tokenizer) with the tokenizer matching the model's final vocab.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    orig_vocab = len(tokenizer)
+    added = tokenizer.add_special_tokens({"additional_special_tokens": [INTROSPECTION_SEPARATOR]})
+    base = AutoModelForCausalLM.from_pretrained(
+        config.model_name, device_map="auto",
+        torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32)
+    if added:
+        base.resize_token_embeddings(len(tokenizer))
+    model = PeftModel.from_pretrained(base, str(ckpt), autocast_adapter_dtype=False)
+    if added and trim_vocab:
+        model.get_base_model().resize_token_embeddings(orig_vocab)
+        print(f"[load] trimmed vocab {len(tokenizer)} -> {orig_vocab} "
+              f"(dropped the untrained separator row)")
+        tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    model.eval()
+    return model, tokenizer
 
 
 def parse_args():
@@ -69,6 +107,10 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--kl-chunk", type=int, default=128,
                    help="Positions per chunk when computing KL, to bound the fp32 softmax memory.")
+    p.add_argument("--no-trim-vocab", action="store_true",
+                   help="Keep the extra (untrained) separator row instead of trimming back to the "
+                        "base vocabulary. Shared by both conditions either way, so KL/top-1 are "
+                        "unaffected; only absolute NLL/perplexity shift.")
     p.add_argument("--force", action="store_true",
                    help="Run even on a gated checkpoint (the numbers will not describe the "
                         "trained model -- see the module docstring).")
@@ -190,21 +232,7 @@ def main():
         raise SystemExit(f"No checkpoint found under {run_dir}; pass --checkpoint.")
     print(f"[lm] config={args.config}\n[lm] checkpoint={ckpt}")
 
-    # base tokenizer on purpose: no introspection separator, since we are scoring
-    # ORDINARY text. "all-linear" never adapts embed_tokens/lm_head, so the adapter
-    # loads onto an unresized base.
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    base = AutoModelForCausalLM.from_pretrained(
-        config.model_name, device_map="auto",
-        torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32)
-    try:
-        model = PeftModel.from_pretrained(base, str(ckpt), autocast_adapter_dtype=False)
-    except Exception as e:
-        raise SystemExit(
-            f"Could not load the adapter onto an unresized base model: {e}\n"
-            f"If the adapter targets embed_tokens/lm_head, resize the base to "
-            f"len(tokenizer)+1 first (the runs add one introspection separator token).")
-    model.eval()
+    model, tokenizer = load_adapter_model(config, ckpt, trim_vocab=not args.no_trim_vocab)
     # NB: deliberately NOT patching GatedLinear -- a gate-off adapter's training-time
     # behaviour IS plain LoRA everywhere, which is exactly what plain PEFT does here.
 
