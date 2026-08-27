@@ -1,8 +1,11 @@
 import os
+import re
 import json
 import glob
 import pdb
 from pathlib import Path
+
+import numpy as np
 
 from tqdm import tqdm
 import pandas as pd
@@ -225,9 +228,207 @@ def plot_sweep_eval_metrics_intervention_train(exp_name: str, output_dir:str="si
         plt.close()
 
 
+
+# ============================================================
+# Endogenous (W=1.0) layer x token sweep
+#   scripts/neuron/train_single_mlp_introspector_endogenous_sweep_layer_token.sh
+#   run dirs: endo_N<layer>.<idx>_POS<pos>_gate<on|off>_r16_lr5e-5_w1.0_300K
+#
+# Each (layer, position) cell holds 10 neurons, so every point is a mean over 10
+# runs and the spread across them is NEURON HETEROGENEITY, not seed noise. The
+# neuron set is fixed per layer across all positions (resolution.py seeds per
+# (seed, layer)), so a neuron can be followed along the position axis -- which is
+# what hue="neuron" is for.
+#
+# Two evals per run:
+#   endogenous    -- predict the true activation (what the model was trained on)
+#   interventional -- inject a value and see whether the report follows. With no
+#                    interventional loss (W=1.0) this measures CONTEXT BYPASS: how
+#                    much of the endogenous score is causal reading rather than
+#                    prediction from context.
+# ============================================================
+
+NEURON_RE = re.compile(r"N(?P<layer>\d+)\.(?P<index>\d+)")
+POS_RE = re.compile(r"POS(?P<pos>-?\d+)")
+GATE_RE = re.compile(r"gate(?P<gate>on|off)")
+LR_RE = re.compile(r"_lr(?P<lr>[0-9.e+-]+?)_")
+W_RE = re.compile(r"_w(?P<w>[0-9.]+)")
+
+# (file, key path into the json, label). Both files are written by
+# train_introspector_joint.py at the end of a run.
+ENDO_EVALS = [
+    ("endogenous_test_metrics_endogenous.json", None, "endogenous"),
+    ("interventional_test_metrics_gaussian.json", "test", "interventional"),
+]
+ENDO_METRICS = ("corr", "l2_dist")
+# metrics whose natural range is [0, 1] -> fixed colour/axis scale
+RANGE01 = {"corr"}
+
+
+def load_endogenous_sweep(exp_group: str, metrics=ENDO_METRICS) -> pd.DataFrame:
+    """Long-form table: one row per (run, eval, metric). Runs missing a metrics
+    file are skipped and counted -- unfinished or crashed cells show up as gaps in
+    the coverage report rather than silently shifting a cell's mean."""
+    run_dirs = sorted(Path(f"{ROOT}/outputs/runs/{exp_group}").glob("endo_*"))
+    rows, skipped = [], []
+    for d in tqdm(run_dirs, desc=exp_group):
+        n, p = NEURON_RE.search(d.name), POS_RE.search(d.name)
+        if n is None or p is None:
+            skipped.append((d.name, "unparsable name"))
+            continue
+        g, lr, w = GATE_RE.search(d.name), LR_RE.search(d.name), W_RE.search(d.name)
+        base = {
+            "run": d.name,
+            "neuron": f"N{n['layer']}.{n['index']}",
+            "layer": int(n["layer"]), "index": int(n["index"]),
+            "position": int(p["pos"]),
+            "gate": g["gate"] if g else None,
+            "lr": lr["lr"] if lr else None,
+            "w": float(w["w"]) if w else None,
+        }
+        for fname, key, eval_name in ENDO_EVALS:
+            fpath = d / fname
+            if not fpath.exists():
+                skipped.append((d.name, f"missing {fname}"))
+                continue
+            payload = json.loads(fpath.read_text())
+            payload = payload[key] if key else payload
+            for metric in metrics:
+                if payload.get(metric) is not None:
+                    # column is eval_type, NOT eval: a column named "eval" shadows
+                    # DataFrame.eval, so df.eval == "endogenous" silently returns
+                    # all-False for anyone filtering the exported CSV interactively
+                    rows.append({**base, "eval_type": eval_name, "metric": metric,
+                                 "value": float(payload[metric])})
+    if skipped:
+        print(f"[endo] skipped {len(skipped)} run/file(s); first few: {skipped[:5]}")
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise SystemExit(f"No metrics parsed under {ROOT}/outputs/runs/{exp_group}")
+    df["panel"] = df["eval_type"] + " " + df["metric"]
+    n_nan = int(df["value"].isna().sum())
+    if n_nan:
+        # a dead / near-constant neuron gives a nan correlation; drop so it does not
+        # silently poison a cell mean, but say how many
+        print(f"[endo] dropping {n_nan} nan metric values (dead or constant neurons?)")
+        df = df.dropna(subset=["value"])
+    return df
+
+
+def summarize_endogenous_sweep(df: pd.DataFrame) -> pd.DataFrame:
+    """mean / standard error / n per (eval, metric, layer, position)."""
+    g = df.groupby(["eval_type", "metric", "layer", "position"])["value"]
+    out = g.agg(mean="mean", std="std", n="count").reset_index()
+    out["se"] = out["std"] / np.sqrt(out["n"].clip(lower=1))
+    return out
+
+
+def report_endogenous_coverage(df: pd.DataFrame, expected_neurons: int = 10):
+    """Which cells are short of their full complement of neurons (crashed runs,
+    dead neurons)? A cell averaging 3 neurons is not comparable to one averaging 10."""
+    cov = (df[df["metric"] == "corr"]
+           .groupby(["eval_type", "layer", "position"])["neuron"].nunique().reset_index(name="n_neurons"))
+    short = cov[cov["n_neurons"] < expected_neurons]
+    print(f"[endo] cells: {len(cov)} | complete: {(cov['n_neurons'] == expected_neurons).sum()}")
+    if len(short):
+        print(f"[endo] INCOMPLETE cells (<{expected_neurons} neurons):")
+        print(short.to_string(index=False))
+    return cov
+
+
+def plot_endogenous_heatmaps(df: pd.DataFrame, out_dir: str):
+    """One heatmap per (eval, metric): layer x position, annotated mean±SE over the
+    cell's neurons."""
+    os.makedirs(out_dir, exist_ok=True)
+    summary = summarize_endogenous_sweep(df)
+    summary.to_csv(f"{out_dir}/sweep_summary.csv", index=False)
+    for (eval_name, metric), sub in summary.groupby(["eval_type", "metric"]):
+        mean_df = sub.pivot(index="layer", columns="position", values="mean")
+        se_df = sub.pivot(index="layer", columns="position", values="se")
+        annot = mean_df.round(3).astype(str) + "\n±" + se_df.round(3).astype(str)
+        vmin, vmax = (0, 1) if metric in RANGE01 else (None, None)
+
+        plt.figure(figsize=[16, 12])
+        hm = sns.heatmap(mean_df, annot=annot, fmt="", vmin=vmin, vmax=vmax,
+                         annot_kws={"size": 13}, cmap="viridis",
+                         cbar_kws={"label": f"{eval_name} {metric}"})
+        hm.figure.axes[-1].yaxis.label.set_size(24)
+        hm.figure.axes[-1].tick_params(labelsize=18)
+        hm.tick_params(axis="x", labelsize=24)
+        hm.tick_params(axis="y", labelsize=24)
+        plt.xlabel("token position", fontsize=30)
+        plt.ylabel("layer", fontsize=30)
+        plt.title(f"{eval_name} {metric} (mean±SE over neurons)", fontsize=32)
+        plt.tight_layout()
+        path = f"{out_dir}/heatmap_{eval_name}_{metric}.png"
+        plt.savefig(path, dpi=150)
+        plt.close()
+        print(f"[endo] wrote {path}")
+
+
+def plot_endogenous_lines(df: pd.DataFrame, out_dir: str, hue: str = "layer"):
+    """Position on x, metric on y, one line per `hue`.
+
+    hue="layer"  -> mean over the cell's 10 neurons, shaded band = standard error
+                    across neurons (heterogeneity, not seed noise).
+    hue="neuron" -> every neuron as its own line; no aggregation, so the spaghetti
+                    shows whether the layer mean hides a split population. Only
+                    readable one layer at a time, so this writes one file per layer.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    panels = sorted(df["panel"].unique())
+
+    def _draw(data, title, path, hue_col, errorbar):
+        levels = sorted(data[hue_col].unique())
+        data = data.copy()
+        data[hue_col] = pd.Categorical(data[hue_col], categories=levels, ordered=True)
+        palette = dict(zip(levels, sns.color_palette("viridis", len(levels))))
+        g = sns.relplot(
+            data=data, x="position", y="value", hue=hue_col, palette=palette,
+            col="panel", col_order=panels, col_wrap=min(2, len(panels)),
+            kind="line", marker="o", errorbar=errorbar,
+            facet_kws={"sharey": False}, height=4.5, aspect=1.4, legend="brief",
+        )
+        g.set_titles("{col_name}")
+        g.set_axis_labels("token position", "")
+        for ax in g.axes.flat:
+            if any(m in ax.get_title() for m in RANGE01):
+                ax.set_ylim(-0.05, 1.02)
+                ax.axhline(0, color="grey", ls="--", lw=1)
+            ax.grid(alpha=0.2)
+        g.figure.suptitle(title, y=1.03)
+        g.tight_layout()
+        g.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(g.figure)
+        print(f"[endo] wrote {path}")
+
+    if hue == "layer":
+        _draw(df, "endogenous sweep: metric vs token position (mean±SE over 10 neurons)",
+              f"{out_dir}/lines_by_layer.png", "layer", "se")
+    elif hue == "neuron":
+        for layer, sub in df.groupby("layer"):
+            _draw(sub, f"layer {layer}: per-neuron lines (no aggregation)",
+                  f"{out_dir}/lines_by_neuron_l{layer}.png", "neuron", None)
+    else:
+        raise ValueError(f"hue must be 'layer' or 'neuron', got {hue!r}")
+
+
 if __name__ == "__main__":
+    # ---- endogenous (W=1.0) layer x token sweep -------------------------
+    EXP_GROUP = "mlp_endo_sweep_layer_token"
+    OUT_DIR = f"{ROOT}/outputs/plots/{EXP_GROUP}"
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    endo_df = load_endogenous_sweep(EXP_GROUP)
+    report_endogenous_coverage(endo_df, expected_neurons=10)
+    endo_df.to_csv(f"{OUT_DIR}/sweep_runs.csv", index=False)   # per-run long table
+    plot_endogenous_heatmaps(endo_df, OUT_DIR)
+    plot_endogenous_lines(endo_df, OUT_DIR, hue="layer")
+    plot_endogenous_lines(endo_df, OUT_DIR, hue="neuron")
+
+    # ---- older sweeps ---------------------------------------------------
     # plot_token_overlap_vs_test_metrics("single_mlp_l10_n24_train")
-    plot_sweep_eval_metrics("single_mlp_sweep")
+    # plot_sweep_eval_metrics("single_mlp_sweep")
     # correlate_sweep_metrics_with_data_stats("single_mlp_sweep")
     # plot_sweep_eval_metrics_intervention_train("intervention_train_regressor_sweep_layer_token_old_fixed_scale10")
 
