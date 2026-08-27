@@ -146,6 +146,7 @@ def _extract_readout_features(model, dataset, collator, config, readout_pos=-1, 
     for batch in dl:
         batch = batch.to(model.device)
         activation = batch.pop("activation")
+        batch.pop("anchor_region_mask", None)   # KL-anchor bookkeeping, not a model input
         outputs = model(**batch, do_intervention=do_intervention, output_hidden_states=True)
         h = outputs.hidden_states[-1][:, readout_pos, :].float().cpu()
         feats.append(h)

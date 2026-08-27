@@ -83,6 +83,22 @@ def parse_args():
     p.add_argument("--joint-loss-weight", type=float, default=0.5,
                    help="Weight w on the ENDOGENOUS term; interventional gets (1-w). "
                         "Keep constant; sweep across runs to map the frontier.")
+    p.add_argument("--kl-anchor-target", type=float, default=None,
+                   help="KL BUDGET in nats/token on the input text. The anchor coefficient is "
+                        "adapted multiplicatively to hold measured KL(base||tuned) near this "
+                        "value, so you set the behavioural drift you will tolerate instead of "
+                        "sweeping a weight. Sweeping the BUDGET against interventional corr is "
+                        "the 'cost of introspection' frontier. None => no adaptive anchor.")
+    p.add_argument("--kl-anchor-weight", type=float, default=0.0,
+                   help="Fixed anchor coefficient, used when --kl-anchor-target is not given. "
+                        "0 disables the anchor entirely (the pre-anchor behaviour).")
+    p.add_argument("--kl-anchor-positions", type=int, default=4,
+                   help="Text positions sampled per sequence for the KL estimate. A full-vocab "
+                        "fp32 KL over every position is ~GBs; a random subset is unbiased and "
+                        "cheap. Raise for a lower-variance estimate.")
+    p.add_argument("--kl-anchor-coef-init", type=float, default=1.0)
+    p.add_argument("--kl-anchor-coef-range", type=str, default="0.01,1000",
+                   help="Clamp for the adaptive coefficient (min,max).")
     p.add_argument("--skip-drift-eval", action="store_true",
                    help="Skip the activation-drift measurement (see measure_activation_drift). It runs "
                         "automatically whenever the adapter is active over the input text, because that "
@@ -120,6 +136,70 @@ def _var_norm_mse(pred, target):
     return nn.functional.mse_loss(pred, target) / var
 
 
+def _lm_head(model):
+    """The base model's LM head, through whatever wrappers are in the way."""
+    for get in (lambda m: m.get_base_model().lm_head,
+                lambda m: m.base_model.model.lm_head,
+                lambda m: m.lm_head):
+        try:
+            return get(model)
+        except AttributeError:
+            continue
+    raise AttributeError("Could not locate lm_head on the model for the KL anchor.")
+
+
+def _sample_text_positions(region_mask, attention_mask, k, generator=None):
+    """
+    Pick up to k INPUT-TEXT positions per sequence, uniformly at random.
+
+    Text is region_mask == 0 (the collator marks the introspection prompt with 1) and
+    attention_mask == 1 (prediction batches are left-padded, and padding also reads as
+    0 in the region mask). Returns [B, k] indices plus a validity mask -- short
+    sequences may have fewer than k text positions.
+    """
+    valid = (region_mask == 0) & (attention_mask == 1)                 # [B, L]
+    scores = torch.rand(valid.shape, device=valid.device, generator=generator)
+    scores = scores.masked_fill(~valid, -1.0)
+    k = min(k, valid.shape[1])
+    top = scores.topk(k, dim=1)
+    return top.indices, top.values >= 0.0                              # [B,k], [B,k]
+
+
+def kl_anchor_loss(model, inputs, tuned_hidden, region_mask, k):
+    """
+    Forward KL(base || tuned) over sampled input-text positions, in nats/token.
+
+    The reference is this same model with adapters disabled -- for LoRA that IS the
+    base model, so the anchor costs one no-grad forward and NO extra memory. The
+    direction matches score_lm_degradation.py, so the quantity trained against and the
+    quantity reported are the same thing.
+
+    Only the TEXT region is anchored. The introspection prompt is where the readout
+    lives and is supposed to change; anchoring it would fight the task directly.
+    """
+    attention_mask = inputs["attention_mask"]
+    idx, ok = _sample_text_positions(region_mask, attention_mask, k)
+    if not bool(ok.any()):
+        return None
+    bidx = torch.arange(idx.shape[0], device=idx.device).unsqueeze(1)
+
+    head = _lm_head(model)
+    sel_tuned = tuned_hidden[bidx, idx]                                # [B,k,H]
+    logits_tuned = head(sel_tuned.to(head.weight.dtype))               # [B,k,V]
+
+    with torch.no_grad():
+        with model.disable_adapter():
+            # no labels => the regression branch is skipped and .logits are real LM logits
+            base_out = model(input_ids=inputs["input_ids"], attention_mask=attention_mask,
+                             do_intervention=False)
+        logits_base = base_out.logits[bidx, idx]
+
+    lp_tuned = torch.log_softmax(logits_tuned.float(), dim=-1)
+    lp_base = torch.log_softmax(logits_base.float(), dim=-1)
+    kl = (lp_base.exp() * (lp_base - lp_tuned)).sum(-1)                # [B,k]
+    return (kl * ok.float()).sum() / ok.float().sum().clamp(min=1.0)
+
+
 class UngatedCollator(LoRAGatingCollator):
     """LoRAGatingCollator minus the gate, selected when training_config.
     disable_adapter_in_input is False (matching train_introspector.py, where that
@@ -141,21 +221,54 @@ class UngatedCollator(LoRAGatingCollator):
 
     def __call__(self, features):
         batch = super().__call__(features)
-        batch.pop("lora_token_mask", None)
+        # keep the mask under a different key: gating must be OFF (the model's patched
+        # forward only reads `lora_token_mask`), but the KL anchor still needs to know
+        # which positions are input TEXT (0) versus introspection prompt (1)
+        mask = batch.pop("lora_token_mask", None)
+        if mask is not None:
+            batch["anchor_region_mask"] = mask
         return batch
 
 
 class JointInterventionTrainer(InterventionTrainer):
     """Two-forward joint loss: w*endogenous + (1-w)*interventional (both var-normed)."""
 
-    def __init__(self, *args, joint_loss_weight=0.5, **kwargs):
+    def __init__(self, *args, joint_loss_weight=0.5, kl_anchor_target=None,
+                 kl_anchor_weight=0.0, kl_anchor_positions=4, kl_anchor_coef_init=1.0,
+                 kl_anchor_coef_range=(0.01, 1000.0), **kwargs):
         super().__init__(*args, **kwargs)
         self.joint_loss_weight = joint_loss_weight
+        # anchor: adaptive to a KL budget if a target is set, else a fixed weight
+        self.kl_anchor_target = kl_anchor_target
+        self.kl_anchor_positions = kl_anchor_positions
+        self.kl_anchor_range = kl_anchor_coef_range
+        self.kl_anchor_coef = (kl_anchor_coef_init if kl_anchor_target is not None
+                               else kl_anchor_weight)
+        self.kl_anchor_on = self.kl_anchor_coef > 0 or kl_anchor_target is not None
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        inputs = inputs.copy()
+        inputs.pop("anchor_region_mask", None)   # loss bookkeeping, not a model input
+        return super().prediction_step(model, inputs, prediction_loss_only,
+                                       ignore_keys=ignore_keys)
+
+    def _update_kl_coef(self, kl_value):
+        """PPO-style multiplicative controller: hold measured KL near the budget.
+        Bands at 1.5x avoid oscillating on ordinary step-to-step noise."""
+        if self.kl_anchor_target is None:
+            return
+        lo, hi = self.kl_anchor_range
+        if kl_value > 1.5 * self.kl_anchor_target:
+            self.kl_anchor_coef = min(self.kl_anchor_coef * 1.5, hi)
+        elif kl_value < self.kl_anchor_target / 1.5:
+            self.kl_anchor_coef = max(self.kl_anchor_coef / 1.5, lo)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         inputs = inputs.copy()
+        # not a model input: the patched forward only understands `lora_token_mask`
+        region_mask = inputs.pop("anchor_region_mask", None)
         w = self.joint_loss_weight
-        endo_out = interv_out = L_endo = L_interv = None
+        endo_out = interv_out = L_endo = L_interv = L_kl = None
 
         # A forward whose weight is 0 is skipped entirely. At w=1 (pure endogenous)
         # or w=0 (pure interventional) the zero-weighted term adds no gradient, but
@@ -183,9 +296,30 @@ class JointInterventionTrainer(InterventionTrainer):
             loss = loss + w * L_endo
         if L_interv is not None:
             loss = loss + (1.0 - w) * L_interv
+
+        # KL anchor: keep next-token behaviour on the INPUT TEXT close to the base
+        # model's. Nothing else in this objective preserves language modelling -- with
+        # the adapter live over the text, an unanchored run reaches ~3 nats/token and
+        # 24% top-1 agreement, i.e. it stops being a language model.
+        if self.kl_anchor_on and region_mask is not None:
+            anchor_out = endo_out
+            if anchor_out is None:      # w == 0: no clean forward exists yet
+                clean = inputs.copy()
+                clean["do_intervention"] = False
+                clean.pop("labels", None)
+                anchor_out = model(**clean)
+            L_kl = kl_anchor_loss(model, inputs, anchor_out.hidden_states[-1],
+                                  region_mask, self.kl_anchor_positions)
+            if L_kl is not None:
+                loss = loss + self.kl_anchor_coef * L_kl
+                self._update_kl_coef(float(L_kl.detach()))
+
         if self.state.global_step % max(1, self.args.logging_steps) == 0:
-            self.log({k: float(v.detach()) for k, v in
-                      (("L_endo", L_endo), ("L_interv", L_interv)) if v is not None})
+            log = {k: float(v.detach()) for k, v in
+                   (("L_endo", L_endo), ("L_interv", L_interv), ("L_kl", L_kl)) if v is not None}
+            if self.kl_anchor_on:
+                log["kl_coef"] = float(self.kl_anchor_coef)
+            self.log(log)
         out = interv_out if interv_out is not None else endo_out
         return (loss, out) if return_outputs else loss
 
@@ -786,7 +920,11 @@ def main():
         # reports the endogenous objective; the interventional TEST still runs
         # afterwards, where it measures context bypass rather than training progress
         do_intervention=(args.joint_loss_weight < 1.0),
-        callbacks=callbacks, joint_loss_weight=args.joint_loss_weight)
+        callbacks=callbacks, joint_loss_weight=args.joint_loss_weight,
+        kl_anchor_target=args.kl_anchor_target, kl_anchor_weight=args.kl_anchor_weight,
+        kl_anchor_positions=args.kl_anchor_positions,
+        kl_anchor_coef_init=args.kl_anchor_coef_init,
+        kl_anchor_coef_range=tuple(float(x) for x in args.kl_anchor_coef_range.split(",")))
     print(f"[joint] joint_loss_weight (endo)={args.joint_loss_weight}  "
           f"interv_distribution={config.training_config.intervention_signal_distribution} "
           f"scale={model.intervention_scale}")
