@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1-64
+#$ -t 44-47
 
 # ============================================================================
 # ENDOGENOUS-ONLY (no interventional loss) regressor sweep over

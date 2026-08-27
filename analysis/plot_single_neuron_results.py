@@ -414,6 +414,13 @@ def plot_endogenous_lines(df: pd.DataFrame, out_dir: str, hue: str = "layer"):
 
 
 if __name__ == "__main__":
+    # ---- older sweeps ---------------------------------------------------
+    # plot_token_overlap_vs_test_metrics("single_mlp_l10_n24_train")
+    # plot_sweep_eval_metrics("single_mlp_sweep")
+    # correlate_sweep_metrics_with_data_stats("single_mlp_sweep")
+    # plot_sweep_eval_metrics_intervention_train("intervention_train_regressor_sweep_layer_token_old_fixed_scale10")
+
+
     # ---- endogenous (W=1.0) layer x token sweep -------------------------
     EXP_GROUP = "mlp_endo_sweep_layer_token"
     OUT_DIR = f"{ROOT}/outputs/plots/{EXP_GROUP}"
@@ -425,10 +432,4 @@ if __name__ == "__main__":
     plot_endogenous_heatmaps(endo_df, OUT_DIR)
     plot_endogenous_lines(endo_df, OUT_DIR, hue="layer")
     plot_endogenous_lines(endo_df, OUT_DIR, hue="neuron")
-
-    # ---- older sweeps ---------------------------------------------------
-    # plot_token_overlap_vs_test_metrics("single_mlp_l10_n24_train")
-    # plot_sweep_eval_metrics("single_mlp_sweep")
-    # correlate_sweep_metrics_with_data_stats("single_mlp_sweep")
-    # plot_sweep_eval_metrics_intervention_train("intervention_train_regressor_sweep_layer_token_old_fixed_scale10")
 

@@ -9,11 +9,11 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1-6
+#$ -t 1
 
 # ============================================================================
 # LR sweep for joint (endogenous + interventional) training on ONE mlp neuron,
-# introspecting a RANDOM token position in [-31, -1].
+# introspecting a FIXED token position in [-31, -1].
 #
 # Migrated from scripts_old_with_off_by_one_bug/. What changed, and why:
 #
@@ -75,17 +75,18 @@ set -e
 ## Batch job variables
 index=$(($SGE_TASK_ID-1))
 
-GATE=off                 # off = adapter active over input text (working setup) | on = gated control
+GATE=on                 # off = adapter active over input text (working setup) | on = gated control (adaptor is disabled in input text so behavior is exactly the same as frozen)
 W=0.01                   # weight on the ENDOGENOUS term; interventional gets (1-W)
 SCALE=10                 # injected-value spread (extreme distribution)
 SIG=10.24                # layer.neuron
-TOKEN_POS='-1:-31'
-LORA_R=128
+TOKEN_POS=-1     #'-1:-31'
+LORA_R=16
 LORA_ALPHA=$((LORA_R * 2))
 LORA_DO=0.0
-BS=128
-LRS=(1e-5 2e-5 3e-5 5e-5 1e-4 2e-4)
-LR=${LRS[$index]}
+BS=32
+#LRS=(1e-5 2e-5 3e-5 5e-5 1e-4 2e-4)
+#LR=${LRS[$index]}
+LR=5e-5
 
 # set to --overwrite-cache to force config/dataset/run regeneration
 OVERWRITE=""
@@ -93,7 +94,7 @@ OVERWRITE=""
 if [ "$GATE" = "on" ]; then GATE_FLAG="--disable-adapter-in-input"; else GATE_FLAG=""; fi
 
 EXP_GROUP=mlp_joint_prev_token_hyper
-EXP_NAME="joint_N${SIG}_POS${TOKEN_POS}_gate${GATE}_scale${SCALE}_r${LORA_R}_do${LORA_DO}_lr${LR}_w${W}_1M"
+EXP_NAME="joint_N${SIG}_POS${TOKEN_POS}_gate${GATE}_scale${SCALE}_w${W}_lrcos"
 CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
 echo "$EXP_NAME"
 
@@ -103,7 +104,7 @@ python generate_experiment_config.py \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 \
     --train-dataset-split "train" \
-    --train-max-samples 1000000 \
+    --train-max-samples 300000 \
     --dev-max-samples 200 \
     --dev-offset-from-train 1000000 \
     --test-dataset allenai/c4 \
@@ -125,7 +126,6 @@ python generate_experiment_config.py \
     $GATE_FLAG \
     --bf16 \
     --learning-rate $LR \
-    --save-steps 0.2 \
     --use-regressor \
     --intervention-signal-distribution extreme \
     --intervention-extreme-scale $SCALE \
@@ -133,6 +133,7 @@ python generate_experiment_config.py \
     --output-dir outputs/runs/$EXP_GROUP \
     --output "$CONFIG" \
     $OVERWRITE
+
 
 ### cache activations and generate dataset
 # no-op once any arm of the sweep has built it (the six LRs resolve to one
@@ -149,11 +150,11 @@ python train_introspector_joint.py \
     $OVERWRITE
 
 # post training analysis of each checkpoint (same config => same gating as training)
-for CK in outputs/runs/$EXP_GROUP/$EXP_NAME/checkpoint-*; do
-  python train_introspector_joint.py \
-     --config "$CONFIG" \
-     --joint-loss-weight $W \
-     --force-drift-eval \
-     --diag-only \
-     --checkpoint "$CK"
-done
+#for CK in outputs/runs/$EXP_GROUP/$EXP_NAME/checkpoint-*; do
+#  python train_introspector_joint.py \
+#     --config "$CONFIG" \
+#     --joint-loss-weight $W \
+#     --force-drift-eval \
+#     --diag-only \
+#     --checkpoint "$CK"
+#done
