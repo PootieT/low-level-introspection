@@ -53,7 +53,7 @@ DEFAULT_TASK_NAMES = [
     "arc:easy",     # reasoning, well above chance at 1B
     "winogrande",   # commonsense
     "hellaswag",    # commonsense
-    "piqa",         # commonsense / physical
+    # "piqa",         # commonsense / physical  (dataset loader bug)
     "lambada",      # next-token: the closest benchmark analogue to LM damage
 ]
 # deterministic tie-break when a task appears under several suites
