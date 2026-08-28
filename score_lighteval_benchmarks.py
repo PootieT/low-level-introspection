@@ -60,6 +60,26 @@ DEFAULT_TASK_NAMES = [
 SUITE_PRIORITY = ["leaderboard", "lighteval", "harness", "helm", "original", "bigbench"]
 
 
+def _import_lighteval():
+    """Centralized so an API change breaks in ONE place with an actionable message."""
+    try:
+        from lighteval.logging.evaluation_tracker import EvaluationTracker
+        from lighteval.models.transformers.transformers_model import (
+            TransformersModel, TransformersModelConfig,
+        )
+        from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters
+    except ImportError as e:
+        raise SystemExit(
+            f"lighteval import failed ({e}).\n"
+            f"  pip install lighteval\n"
+            f"If it IS installed, the API moved: this script needs EvaluationTracker, "
+            f"TransformersModel(.from_model)/TransformersModelConfig, and "
+            f"Pipeline/PipelineParameters/ParallelismManager. Check `lighteval --version` and "
+            f"adjust _import_lighteval + run_condition, which are the only lighteval-aware parts.")
+    return (EvaluationTracker, TransformersModel, TransformersModelConfig,
+            ParallelismManager, Pipeline, PipelineParameters)
+
+
 def _registry():
     """Instantiate a task Registry across lighteval versions with different signatures."""
     from lighteval.tasks.registry import Registry
