@@ -97,7 +97,7 @@ def parse_args():
                         "fp32 KL over every position is ~GBs; a random subset is unbiased and "
                         "cheap. Raise for a lower-variance estimate.")
     p.add_argument("--kl-anchor-coef-init", type=float, default=1.0)
-    p.add_argument("--kl-anchor-coef-range", type=str, default="0.01,1000",
+    p.add_argument("--kl-anchor-coef-range", type=str, default="0.0001,1000",
                    help="Clamp for the adaptive coefficient (min,max).")
     p.add_argument("--skip-drift-eval", action="store_true",
                    help="Skip the activation-drift measurement (see measure_activation_drift). It runs "
