@@ -182,6 +182,30 @@ def resolve_tasks(names: list[str], few_shot: int) -> str:
     return joined
 
 
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", type=Path, required=False,
+                   help="Experiment config (not needed with --list-tasks).")
+    p.add_argument("--checkpoint", type=Path, default=None,
+                   help="Adapter checkpoint (default: latest under the run's output dir).")
+    p.add_argument("--tasks", type=str, default=None,
+                   help="Comma-separated. Bare names (winogrande, arc:easy) are resolved against "
+                        "the installed lighteval registry; anything containing '|' is passed "
+                        "through verbatim. Default: " + ",".join(DEFAULT_TASK_NAMES))
+    p.add_argument("--few-shot", type=int, default=0)
+    p.add_argument("--list-tasks", action="store_true",
+                   help="Print every task the installed lighteval knows about, and exit.")
+    p.add_argument("--max-samples", type=int, default=200,
+                   help="Examples per task. Small values iterate fast but the noise floor is "
+                        "several points -- fine for 'nothing broke', useless for '2 points worse'.")
+    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--conditions", type=str, default="adapter,base",
+                   help="Which passes to run; 'base' is the same checkpoint with adapters disabled.")
+    p.add_argument("--force", action="store_true", help="Run even on a gated checkpoint.")
+    p.add_argument("--output-dir", type=Path, default=None)
+    return p.parse_args()
+
+
 def run_condition(peft_model, config, args, condition: str, out_dir: Path) -> dict:
     """One full pass over the task list. condition='base' runs the identical harness
     with the adapter disabled, so few-shot examples and ordering are shared and the
