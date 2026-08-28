@@ -35,6 +35,8 @@ from __future__ import annotations
 import os
 import sys
 import glob
+import shutil
+from datetime import datetime
 import json
 import argparse
 from pathlib import Path
@@ -256,33 +258,48 @@ def parse_args():
                    help="Which passes to run; 'base' is the same checkpoint with adapters disabled.")
     p.add_argument("--force", action="store_true", help="Run even on a gated checkpoint.")
     p.add_argument("--output-dir", type=Path, default=None)
+    p.add_argument("--cache-dir", type=Path, default=None,
+                   help="Response-cache root. Default: a fresh per-invocation directory under "
+                        "the run's lighteval/_cache, which prevents both cross-condition replay "
+                        "and stale reuse after retraining. Set this only to deliberately reuse.")
+    p.add_argument("--keep-cache", action="store_true",
+                   help="Keep the response cache after the run (default: delete it).")
     return p.parse_args()
 
 
-def run_condition(peft_model, config, args, condition: str, out_dir: Path) -> dict:
+def run_condition(peft_model, config, args, condition: str, out_dir: Path,
+                  cache_root: Path) -> dict:
     """One full pass over the task list. condition='base' runs the identical harness
     with the adapter disabled, so few-shot examples and ordering are shared and the
     two conditions differ only by the adapter."""
     (EvaluationTracker, TransformersModel, TransformersModelConfig,
      ParallelismManager, Pipeline, PipelineParameters) = _import_lighteval()
 
+    # ISOLATE the response cache PER CONDITION AND PER INVOCATION.
+    #
+    # lighteval caches responses under {cache_dir}/{model_name}/{hash(model_config)}.
+    # Both conditions share the model id and, with an identical config, the hash too --
+    # so the second condition silently REPLAYS the first's responses. Not theoretical:
+    # it produced byte-identical arc/winogrande logprobs across adapter and base (the
+    # "base" numbers were really the adapter's, which is why they looked like chance)
+    # while lambada, on an uncached path, differed by 9.8 nats.
+    #
+    # Setting _cache = None does NOT work: Pipeline.__init__ calls
+    # self.model._cache._init_registry(...) unconditionally. Instead give each
+    # condition its own directory -- which also perturbs the hash, since cache_dir is
+    # part of the hashed config. The per-invocation stamp additionally prevents a stale
+    # cache from replaying a PREVIOUS checkpoint's answers: the hash covers the config,
+    # not the adapter weights, so same-path reruns after retraining would otherwise hit.
+    cache_dir = Path(cache_root) / condition
+    cache_dir.mkdir(parents=True, exist_ok=True)
     model_config = TransformersModelConfig(
         model_name=config.model_name,
         batch_size=args.batch_size,
         dtype="bfloat16" if config.training_config.bf16 else "float32",
+        cache_dir=str(cache_dir),
     )
     lm = TransformersModel.from_model(model=peft_model, config=model_config)
-    # DISABLE lighteval's response cache. It keys on {model_name}/{hash(model_config)},
-    # and our two conditions share both -- same base id, identical config -- so the
-    # second condition silently REPLAYS the first's responses. That is not theoretical:
-    # it produced byte-identical arc/winogrande logprobs across adapter and base (the
-    # "base" scores were the adapter's, which is why they looked like chance) while
-    # lambada, on an uncached path, differed by 9.8 nats. lighteval 0.13's @cached
-    # decorator skips caching when _cache is None.
-    if hasattr(lm, "_cache"):
-        lm._cache = None
-        print(f"[lighteval] response cache disabled for condition '{condition}' "
-              f"(both conditions share a cache key)")
+    print(f"[lighteval] response cache isolated at {cache_dir}")
     tracker = EvaluationTracker(output_dir=str(out_dir / condition), save_details=True)
     params = PipelineParameters(
         launcher_type=ParallelismManager.NONE,
@@ -375,14 +392,17 @@ def main():
     # base tokenizer matches the model and no phantom token can be generated.
     model, _ = load_adapter_model(config, ckpt, trim_vocab=True)
 
+    # fresh cache root per invocation; conditions get subdirectories of it
+    cache_root = Path(args.cache_dir) if args.cache_dir else (
+        out_dir / "_cache" / datetime.now().strftime("%Y%m%dT%H%M%S"))
     rows, raw = [], {}
     for condition in [c.strip() for c in args.conditions.split(",")]:
         print(f"\n[lighteval] ===== condition: {condition} =====")
         if condition == "base":
             with model.disable_adapter():
-                results = run_condition(model, config, args, condition, out_dir)
+                results = run_condition(model, config, args, condition, out_dir, cache_root)
         else:
-            results = run_condition(model, config, args, condition, out_dir)
+            results = run_condition(model, config, args, condition, out_dir, cache_root)
         raw[condition] = results
         rows.extend(flatten_results(results, condition))
 
@@ -433,6 +453,8 @@ def main():
         json.dump({"checkpoint": str(ckpt), "tasks": args.tasks,
                    "max_samples": args.max_samples, "results": raw}, f, indent=2, default=str)
     print(f"[lighteval] wrote {out_dir}/benchmarks_{{long,comparison}}.csv + benchmarks_raw.json")
+    if not args.keep_cache and args.cache_dir is None and cache_root.exists():
+        shutil.rmtree(cache_root, ignore_errors=True)
 
 
 if __name__ == "__main__":
