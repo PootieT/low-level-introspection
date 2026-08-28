@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1
+#$ -t 1-7
 
 # ============================================================================
 # LR sweep for joint (endogenous + interventional) training on ONE mlp neuron,
@@ -75,7 +75,7 @@ set -e
 ## Batch job variables
 index=$(($SGE_TASK_ID-1))
 
-GATE=on                 # off = adapter active over input text (working setup) | on = gated control (adaptor is disabled in input text so behavior is exactly the same as frozen)
+GATE=off                 # off = adapter active over input text (working setup) | on = gated control (adaptor is disabled in input text so behavior is exactly the same as frozen)
 W=0.01                   # weight on the ENDOGENOUS term; interventional gets (1-W)
 SCALE=10                 # injected-value spread (extreme distribution)
 SIG=10.24                # layer.neuron
@@ -87,6 +87,8 @@ BS=32
 #LRS=(1e-5 2e-5 3e-5 5e-5 1e-4 2e-4)
 #LR=${LRS[$index]}
 LR=5e-5
+KLS=(0.001 0.003 0.01 0.03 0.1 0.3 1.0)
+KL=${KLS[$index]}
 
 # set to --overwrite-cache to force config/dataset/run regeneration
 OVERWRITE=""
@@ -94,7 +96,8 @@ OVERWRITE=""
 if [ "$GATE" = "on" ]; then GATE_FLAG="--disable-adapter-in-input"; else GATE_FLAG=""; fi
 
 EXP_GROUP=mlp_joint_prev_token_hyper
-EXP_NAME="joint_N${SIG}_POS${TOKEN_POS}_gate${GATE}_scale${SCALE}_w${W}_lrcos"
+#EXP_NAME="joint_N${SIG}_POS${TOKEN_POS}_gate${GATE}_scale${SCALE}_kl${KL}_w${W}"
+EXP_NAME="joint_N${SIG}_POS${TOKEN_POS}_gate${GATE}_scale${SCALE}_w${W}"
 CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
 echo "$EXP_NAME"
 
@@ -148,6 +151,7 @@ python train_introspector_joint.py \
     --joint-loss-weight $W \
     --force-drift-eval \
     $OVERWRITE
+#    --kl-anchor-target $KL \
 
 # post training analysis of each checkpoint (same config => same gating as training)
 #for CK in outputs/runs/$EXP_GROUP/$EXP_NAME/checkpoint-*; do
@@ -158,3 +162,10 @@ python train_introspector_joint.py \
 #     --diag-only \
 #     --checkpoint "$CK"
 #done
+
+# evaluate how far model+LoRA has drifted from original model (LM Loss)
+#python score_lm_degradation.py --config "$CONFIG"
+
+# evaluate how far model+LoRA has drifted from original model (small benchmark)
+#python score_lighteval_benchmarks.py --list-tasks | grep -i arc:easy
+python score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200

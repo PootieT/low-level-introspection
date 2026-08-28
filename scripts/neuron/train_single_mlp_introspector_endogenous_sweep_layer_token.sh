@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 44-47
+#$ -t 4
 
 # ============================================================================
 # ENDOGENOUS-ONLY (no interventional loss) regressor sweep over
@@ -64,7 +64,9 @@ export WANDB_RUN_GROUP=mlp_endo_sweep_layer_token
 set -e
 
 ## ---- decode (layer, position) from the flat array index ----
-index=$(($SGE_TASK_ID-1))
+#index=$(($SGE_TASK_ID-1))
+index=63
+
 LAYERS=(0 2 4 6 8 10 12 14)
 POSS=(-1 -4 -8 -12 -16 -20 -24 -28)
 LAYER=${LAYERS[$((index / 8))]}
@@ -123,7 +125,7 @@ echo "cell $CELL neurons: $NEURON_LIST"
 
 for SAMPLE in $(seq 0 $((N_NEURONS - 1))); do
   SIG=${NEURONS[$SAMPLE]}
-  EXP_NAME="endo_${SIG}_POS${TOKEN_POS}_gate${GATE}_r${LORA_R}_lr${LR}_w${W}_300K"
+  EXP_NAME="endo_${SIG}_POS${TOKEN_POS}_gate${GATE}_w${W}_300K"
   CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
   echo "=== [$CELL sample $SAMPLE] $EXP_NAME ==="
 
