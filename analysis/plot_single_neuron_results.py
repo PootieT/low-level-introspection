@@ -248,9 +248,14 @@ def plot_sweep_eval_metrics_intervention_train(exp_name: str, output_dir:str="si
 #                    prediction from context.
 # ============================================================
 
+# Independent searches rather than one whole-name pattern, so both naming variants
+# parse: the full form endo_N14.1668_POS-28_gateon_r16_lr5e-5_w1.0_300K and the
+# shortened endo_N12.7950_POS-1_gateon_w1.0_300K (r/lr dropped). Fields absent from a
+# name come back None instead of failing the match.
 NEURON_RE = re.compile(r"N(?P<layer>\d+)\.(?P<index>\d+)")
 POS_RE = re.compile(r"POS(?P<pos>-?\d+)")
 GATE_RE = re.compile(r"gate(?P<gate>on|off)")
+R_RE = re.compile(r"_r(?P<r>\d+)_")
 LR_RE = re.compile(r"_lr(?P<lr>[0-9.e+-]+?)_")
 W_RE = re.compile(r"_w(?P<w>[0-9.]+)")
 
@@ -265,27 +270,45 @@ ENDO_METRICS = ("corr", "l2_dist")
 RANGE01 = {"corr"}
 
 
-def load_endogenous_sweep(exp_group: str, metrics=ENDO_METRICS) -> pd.DataFrame:
-    """Long-form table: one row per (run, eval, metric). Runs missing a metrics
-    file are skipped and counted -- unfinished or crashed cells show up as gaps in
-    the coverage report rather than silently shifting a cell's mean."""
+def load_endogenous_sweep(exp_group: str, metrics=ENDO_METRICS, gate="on",
+                          lora_r=None, lr=None, w=None) -> pd.DataFrame:
+    """
+    Long-form table: one row per (run, eval, metric).
+
+    `gate` selects one arm -- the group dir also holds gateoff experiments, and
+    averaging the two arms into a cell would silently mix two different models.
+    Pass gate=None to keep both (and then facet on the column).
+
+    `lora_r` / `lr` / `w` are optional filters for when a group dir holds several
+    configurations of the same cell. Runs missing a metrics file are skipped and
+    counted, so unfinished cells appear in the coverage report rather than quietly
+    shifting a mean.
+    """
     run_dirs = sorted(Path(f"{ROOT}/outputs/runs/{exp_group}").glob("endo_*"))
-    rows, skipped = [], []
+    rows, skipped, excluded = [], [], 0
     for d in tqdm(run_dirs, desc=exp_group):
         n, p = NEURON_RE.search(d.name), POS_RE.search(d.name)
         if n is None or p is None:
             skipped.append((d.name, "unparsable name"))
             continue
-        g, lr, w = GATE_RE.search(d.name), LR_RE.search(d.name), W_RE.search(d.name)
+        g, m_lr, m_w = GATE_RE.search(d.name), LR_RE.search(d.name), W_RE.search(d.name)
+        m_r = R_RE.search(d.name)
         base = {
             "run": d.name,
             "neuron": f"N{n['layer']}.{n['index']}",
             "layer": int(n["layer"]), "index": int(n["index"]),
             "position": int(p["pos"]),
             "gate": g["gate"] if g else None,
-            "lr": lr["lr"] if lr else None,
-            "w": float(w["w"]) if w else None,
+            "lora_r": int(m_r["r"]) if m_r else None,
+            "lr": m_lr["lr"] if m_lr else None,
+            "w": float(m_w["w"]) if m_w else None,
         }
+        if ((gate is not None and base["gate"] != gate)
+                or (lora_r is not None and base["lora_r"] != lora_r)
+                or (lr is not None and base["lr"] != lr)
+                or (w is not None and base["w"] != w)):
+            excluded += 1
+            continue
         for fname, key, eval_name in ENDO_EVALS:
             fpath = d / fname
             if not fpath.exists():
@@ -300,11 +323,36 @@ def load_endogenous_sweep(exp_group: str, metrics=ENDO_METRICS) -> pd.DataFrame:
                     # all-False for anyone filtering the exported CSV interactively
                     rows.append({**base, "eval_type": eval_name, "metric": metric,
                                  "value": float(payload[metric])})
+    if excluded:
+        print(f"[endo] excluded {excluded} run(s) not matching the requested "
+              f"gate={gate} lora_r={lora_r} lr={lr} w={w}")
     if skipped:
         print(f"[endo] skipped {len(skipped)} run/file(s); first few: {skipped[:5]}")
     df = pd.DataFrame(rows)
     if df.empty:
-        raise SystemExit(f"No metrics parsed under {ROOT}/outputs/runs/{exp_group}")
+        raise SystemExit(f"No metrics parsed under {ROOT}/outputs/runs/{exp_group} "
+                         f"(gate={gate} lora_r={lora_r} lr={lr} w={w})")
+
+    # What configurations actually survived? A cell built from two different configs
+    # is not a cell, and with two naming schemes in one directory that is easy to do
+    # by accident.
+    inventory = (df.groupby(["gate", "lora_r", "lr", "w"], dropna=False)["run"]
+                 .nunique().reset_index(name="n_runs"))
+    print("[endo] configurations kept:")
+    print(inventory.to_string(index=False))
+    if len(inventory) > 1:
+        print("[endo] WARNING: more than one configuration is present. If these are not meant "
+              "to be pooled, pass lora_r=/lr=/w= to pick one.")
+
+    # Same neuron+position twice means one cell is averaging two runs -- typically the
+    # short-named and fully-specified copies of the same experiment.
+    keys = ["neuron", "position", "eval_type", "metric"]
+    dup = df[df.duplicated(keys, keep=False)]
+    if len(dup):
+        pairs = (dup.groupby(keys)["run"].apply(lambda r: sorted(set(r))).reset_index(name="runs"))
+        print(f"[endo] WARNING: {len(pairs)} duplicated (neuron, position, metric) cell(s); "
+              f"keeping the first run name alphabetically. Example: {pairs['runs'].iloc[0]}")
+        df = df.sort_values("run").drop_duplicates(keys, keep="first").reset_index(drop=True)
     df["panel"] = df["eval_type"] + " " + df["metric"]
     n_nan = int(df["value"].isna().sum())
     if n_nan:
@@ -426,7 +474,8 @@ if __name__ == "__main__":
     OUT_DIR = f"{ROOT}/outputs/plots/{EXP_GROUP}"
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    endo_df = load_endogenous_sweep(EXP_GROUP)
+    # gate="on" is the sweep proper; the group dir also holds gateoff trials
+    endo_df = load_endogenous_sweep(EXP_GROUP, gate="on")
     report_endogenous_coverage(endo_df, expected_neurons=10)
     endo_df.to_csv(f"{OUT_DIR}/sweep_runs.csv", index=False)   # per-run long table
     plot_endogenous_heatmaps(endo_df, OUT_DIR)
