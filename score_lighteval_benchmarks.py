@@ -33,6 +33,7 @@ python score_lighteval_benchmarks.py --config experiment_configs/<group>/<run>.j
 from __future__ import annotations
 
 import os
+import sys
 import glob
 import json
 import argparse
@@ -92,16 +93,42 @@ def _registry():
                      "and pass fully-qualified ids via --tasks instead.")
 
 
-def available_tasks() -> list[str]:
-    """Every task key the installed lighteval knows about. Key SHAPE varies by
+def _task_table() -> dict:
+    """{key: LightevalTaskConfig} from the installed lighteval. Key SHAPE varies by
     version: some releases use 'suite|task', others bare 'task'."""
     reg = _registry()
     for attr in ("_task_registry", "task_registry", "TASK_REGISTRY"):
         table = getattr(reg, attr, None)
         if isinstance(table, dict) and table:
-            return sorted(table.keys())
+            return table
     raise SystemExit("Could not read the task table from lighteval's Registry; run "
                      "`lighteval tasks list` and pass fully-qualified ids via --tasks.")
+
+
+def available_tasks() -> list[str]:
+    return sorted(_task_table().keys())
+
+
+def task_metrics(key: str) -> list[str]:
+    """Metric names a task will be scored with. Worth printing BEFORE a run: the same
+    dataset exists under several suites with very different configs, and a generative
+    metric (em/exact_match) on a multiple-choice benchmark scores 0 for every model --
+    which looks like 'no difference between conditions' rather than like a broken
+    setup."""
+    cfg = _task_table().get(key)
+    for attr in ("metrics", "metric"):
+        metrics = getattr(cfg, attr, None)
+        if metrics:
+            out = []
+            for m in (metrics if isinstance(metrics, (list, tuple, set)) else [metrics]):
+                name = getattr(m, "metric_name", None) or getattr(m, "name", None) or str(m)
+                out.extend(name if isinstance(name, (list, tuple)) else [str(name)])
+            return out
+    return []
+
+
+# metrics that cannot score a multiple-choice task sensibly
+GENERATIVE_METRICS = {"em", "exact_match", "quasi_exact_match", "f1", "rouge"}
 
 
 def _index_tasks(keys: list[str]) -> dict[str, list[str | None]]:
@@ -188,8 +215,14 @@ def resolve_tasks(names: list[str], few_shot: int) -> str:
         if fmt is None:
             fmt = _probe_format(suite, matched, few_shot)
         resolved.append(dict(_candidate_strings(suite, matched, few_shot))[fmt])
-        print(f"[lighteval] {name:12s} -> {resolved[-1]}"
+        key = f"{suite}|{matched}" if suite else matched
+        mets = task_metrics(key)
+        print(f"[lighteval] {name:12s} -> {resolved[-1]}   metrics={mets or 'unknown'}"
               + (f"   (suites: {sorted(str(x) for x in suites)})" if len(suites) > 1 else ""))
+        if mets and set(m.lower() for m in mets) <= GENERATIVE_METRICS:
+            print(f"[lighteval]   WARNING: {name} resolves to a variant scored ONLY by "
+                  f"{mets} -- a generative metric, which scores ~0 for every model on a "
+                  f"multiple-choice task. Pick another variant (see --list-tasks).")
 
     joined = ",".join(resolved)
     # a task can exist yet fail to expand (missing dataset, gated repo); finding that
@@ -239,6 +272,17 @@ def run_condition(peft_model, config, args, condition: str, out_dir: Path) -> di
         dtype="bfloat16" if config.training_config.bf16 else "float32",
     )
     lm = TransformersModel.from_model(model=peft_model, config=model_config)
+    # DISABLE lighteval's response cache. It keys on {model_name}/{hash(model_config)},
+    # and our two conditions share both -- same base id, identical config -- so the
+    # second condition silently REPLAYS the first's responses. That is not theoretical:
+    # it produced byte-identical arc/winogrande logprobs across adapter and base (the
+    # "base" scores were the adapter's, which is why they looked like chance) while
+    # lambada, on an uncached path, differed by 9.8 nats. lighteval 0.13's @cached
+    # decorator skips caching when _cache is None.
+    if hasattr(lm, "_cache"):
+        lm._cache = None
+        print(f"[lighteval] response cache disabled for condition '{condition}' "
+              f"(both conditions share a cache key)")
     tracker = EvaluationTracker(output_dir=str(out_dir / condition), save_details=True)
     params = PipelineParameters(
         launcher_type=ParallelismManager.NONE,
@@ -262,6 +306,37 @@ def flatten_results(results: dict, condition: str) -> list[dict]:
                 rows.append({"condition": condition, "task": task, "metric": metric,
                              "value": float(value)})
     return rows
+
+
+def verify_conditions_differ(out_dir: Path):
+    """Acceptance test for the run: per-example scores MUST differ between conditions.
+    Identical scores mean one condition replayed the other (see the cache note in
+    run_condition), and every delta in the table is then meaningless."""
+    try:
+        sys.path.insert(0, str(Path(__file__).parent / "analysis"))
+        from compare_lighteval_details import compare_task, _detail_files
+    except Exception as e:                      # analysis module absent / pyarrow missing
+        print(f"[lighteval] (skipping per-example verification: {e})")
+        return
+    run_dir = out_dir.parent if out_dir.name == "lighteval" else out_dir
+    base, adapter = _detail_files(run_dir, "base"), _detail_files(run_dir, "adapter")
+    shared = sorted(set(base) & set(adapter))
+    if not shared:
+        return
+    bad = []
+    for task in shared:
+        r = compare_task(base[task], adapter[task], task)
+        frac = r.get("identical_scores_frac", r.get("identical_text_frac"))
+        if frac is not None and frac > 0.99:
+            bad.append((task, frac))
+    if bad:
+        print("\n[lighteval] *** CONDITIONS ARE NOT DISTINCT ***")
+        for task, frac in bad:
+            print(f"    {task}: {frac:.1%} of examples scored IDENTICALLY in both conditions")
+        print("    One condition replayed the other's responses. Treat every delta above as "
+              "invalid, and check that the response cache is disabled.")
+    else:
+        print("\n[lighteval] verified: per-example scores differ between conditions")
 
 
 def main():
@@ -322,7 +397,30 @@ def main():
     wide.to_csv(out_dir / "benchmarks_comparison.csv", index=False)
     print("\n[lighteval] adapter vs base (same tasks, same few-shot seed):")
     print(wide.to_string(index=False))
+    returned = {t for t in df["task"].unique() if t != "all"}
+    requested = {t.split("|")[0] if "|" in t else t for t in args.tasks.split(",")}
+    missing = {r for r in requested if not any(r.split("|")[0] in t for t in returned)}
+    if missing:
+        print(f"\n[lighteval] WARNING: requested but ABSENT from results: {sorted(missing)}. "
+              f"lighteval dropped them silently (dataset download failed, or gated repo). "
+              f"Inspect with `lighteval tasks inspect <task>`.")
+
     if "delta" in wide:
+        # A metric identical across conditions while another moves by orders of
+        # magnitude is not evidence of preserved behaviour -- it means that metric is
+        # not sensitive to the model here. Compare the base column against published
+        # numbers for this model before trusting any of it.
+        flat = wide[wide["delta"].abs() < 1e-12]
+        moved = wide[wide["delta"].abs() > 1e-6]
+        if len(flat) and len(moved):
+            print(f"\n[lighteval] WARNING: {len(flat)} metric(s) are EXACTLY identical across "
+                  f"conditions while {len(moved)} moved. Identical scores usually mean the metric "
+                  f"is not model-sensitive in this configuration (wrong task variant, degenerate "
+                  f"scoring), not that behaviour is preserved:\n"
+                  f"{flat[['task', 'metric', 'base']].to_string(index=False)}")
+            print("[lighteval] Sanity-check the BASE column against published numbers for this "
+                  "model. A base score at chance means the harness, not the adapter, is broken.")
+
         worst = wide.loc[wide["delta"].idxmin()]
         print(f"\n[lighteval] largest drop: {worst['task']} / {worst['metric']} "
               f"{worst['base']:.4f} -> {worst['adapter']:.4f} ({worst['delta']:+.4f})")
@@ -330,6 +428,7 @@ def main():
               "Per-sample outputs for both conditions are under "
               f"{out_dir}/<condition>/details -- compare them pairwise before concluding "
               "the behaviour is unchanged.")
+    verify_conditions_differ(out_dir)
     with open(out_dir / "benchmarks_raw.json", "w") as f:
         json.dump({"checkpoint": str(ckpt), "tasks": args.tasks,
                    "max_samples": args.max_samples, "results": raw}, f, indent=2, default=str)
