@@ -56,7 +56,7 @@ DEFAULT_TASK_NAMES = [
     "piqa",         # commonsense / physical
     "lambada",      # next-token: the closest benchmark analogue to LM damage
 ]
-# deterministic tie-break when several suites carry the same task
+# deterministic tie-break when a task appears under several suites
 SUITE_PRIORITY = ["leaderboard", "lighteval", "harness", "helm", "original", "bigbench"]
 
 
@@ -73,7 +73,8 @@ def _registry():
 
 
 def available_tasks() -> list[str]:
-    """All 'suite|task' names the installed lighteval knows about."""
+    """Every task key the installed lighteval knows about. Key SHAPE varies by
+    version: some releases use 'suite|task', others bare 'task'."""
     reg = _registry()
     for attr in ("_task_registry", "task_registry", "TASK_REGISTRY"):
         table = getattr(reg, attr, None)
@@ -81,6 +82,30 @@ def available_tasks() -> list[str]:
             return sorted(table.keys())
     raise SystemExit("Could not read the task table from lighteval's Registry; run "
                      "`lighteval tasks list` and pass fully-qualified ids via --tasks.")
+
+
+def _index_tasks(keys: list[str]) -> dict[str, list[str | None]]:
+    """{task_name: [suite or None, ...]} -- tolerant of both key shapes, since
+    assuming 'suite|task' silently indexes everything under the empty string when the
+    keys are bare names (which is how 'arc:easy' came back as 'similar: none' while
+    sitting in plain sight in --list-tasks)."""
+    by_task: dict[str, list[str | None]] = {}
+    for key in keys:
+        if "|" in key:
+            suite, _, task = key.partition("|")
+        else:
+            suite, task = None, key
+        by_task.setdefault(task, []).append(suite)
+    return by_task
+
+
+def _candidate_strings(suite: str | None, task: str, few_shot: int):
+    """Task-string layouts to try, most specific first. Which one a release accepts
+    varies, and the trailing few-shot fields can end up part of the lookup key."""
+    base = f"{suite}|{task}" if suite else task
+    return [("base|few_shot|truncate", f"{base}|{few_shot}|0"),
+            ("base|few_shot", f"{base}|{few_shot}"),
+            ("base", base)]
 
 
 def _registry_accepts(task_string: str) -> bool:
@@ -95,129 +120,66 @@ def _registry_accepts(task_string: str) -> bool:
         return False
 
 
-def _task_string_format(suite: str, task: str, few_shot: int) -> str:
-    """
-    Find the task-string layout THIS lighteval accepts.
-
-    The `suite|task|few_shot|truncate` form is only one of several across releases:
-    some versions look the whole string up against `suite|task` keys, so the trailing
-    `|0|0` becomes part of the key and nothing matches -- which is exactly how
-    `leaderboard|winogrande|0|0` failed while `winogrande` was plainly in the task
-    list. Probing beats guessing, and the answer is the same for every task, so this
-    runs once.
-    """
-    for fmt, template in (("suite|task|few_shot|truncate", f"{suite}|{task}|{few_shot}|0"),
-                          ("suite|task|few_shot", f"{suite}|{task}|{few_shot}"),
-                          ("suite|task", f"{suite}|{task}")):
-        if _registry_accepts(template):
+def _probe_format(suite, task, few_shot) -> str:
+    """Probe once for the layout THIS install accepts; the answer is the same for
+    every task."""
+    for fmt, candidate in _candidate_strings(suite, task, few_shot):
+        if _registry_accepts(candidate):
             print(f"[lighteval] task string format for this install: {fmt}")
-            if fmt == "suite|task" and few_shot:
-                print(f"[lighteval] WARNING: this format carries no few-shot field, so "
-                      f"--few-shot {few_shot} is NOT being applied. Set few-shot through the "
-                      f"task config or accept 0-shot.")
+            if fmt == "base" and few_shot:
+                print(f"[lighteval] WARNING: this format has no few-shot field, so --few-shot "
+                      f"{few_shot} is NOT applied. Set it in the task config or accept 0-shot.")
             return fmt
     raise SystemExit(
-        f"No task-string format was accepted for {suite}|{task}. Run "
+        f"No task-string layout was accepted for {task!r}. Tried: "
+        f"{[c for _, c in _candidate_strings(suite, task, few_shot)]}. Run "
         f"`lighteval tasks list` and pass a working id verbatim via --tasks.")
-
-
-def _apply_format(fmt: str, suite: str, task: str, few_shot: int) -> str:
-    return {"suite|task|few_shot|truncate": f"{suite}|{task}|{few_shot}|0",
-            "suite|task|few_shot": f"{suite}|{task}|{few_shot}",
-            "suite|task": f"{suite}|{task}"}[fmt]
 
 
 def resolve_tasks(names: list[str], few_shot: int) -> str:
     """
-    Bare names -> 'suite|task|few_shot|0', resolved against the installed registry.
+    Bare names -> task strings the installed lighteval accepts.
 
-    Exact task match first, then prefix (so 'lambada' finds 'lambada:openai'), with
-    SUITE_PRIORITY breaking ties deterministically. Raises with candidates listed
-    rather than letting the Pipeline fail deep inside task expansion.
+    Exact match first, then prefix (so 'lambada' finds 'lambada:openai'), with
+    SUITE_PRIORITY breaking ties when a task lives under several suites. The string
+    layout is probed rather than assumed, and the whole set is validated before any
+    model runs.
     """
-    table = available_tasks()
-    by_task: dict[str, list[str]] = {}
-    for full in table:
-        suite, _, task = full.partition("|")
-        by_task.setdefault(task, []).append(suite)
+    keys = available_tasks()
+    by_task = _index_tasks(keys)
 
     resolved, fmt = [], None
     for name in names:
-        suites = by_task.get(name)
-        matched = name
+        matched, suites = name, by_task.get(name)
         if not suites:                       # prefix match: 'lambada' -> 'lambada:openai'
-            cands = sorted(t for t in by_task if t == name or t.startswith(f"{name}:"))
+            cands = sorted(t for t in by_task if t.startswith(f"{name}:"))
             if cands:
-                matched = cands[0]
-                suites = by_task[matched]
+                matched, suites = cands[0], by_task[cands[0]]
         if not suites:
-            near = [t for t in by_task if name.split(":")[0] in t][:10]
+            stem = name.split(":")[0]
+            near = sorted(t for t in by_task if stem in t)[:10]
             raise SystemExit(
                 f"Task {name!r} not found in this lighteval install.\n"
                 f"  similar: {near or 'none'}\n"
+                f"  example keys: {keys[:5]}\n"
                 f"  list them all: python {Path(__file__).name} --list-tasks")
         suite = min(suites, key=lambda s: (SUITE_PRIORITY.index(s) if s in SUITE_PRIORITY
-                                           else len(SUITE_PRIORITY), s))
+                                           else len(SUITE_PRIORITY), s or ""))
         if fmt is None:
-            fmt = _task_string_format(suite, matched, few_shot)
-        resolved.append(_apply_format(fmt, suite, matched, few_shot))
+            fmt = _probe_format(suite, matched, few_shot)
+        resolved.append(dict(_candidate_strings(suite, matched, few_shot))[fmt])
         print(f"[lighteval] {name:12s} -> {resolved[-1]}"
-              + (f"   (suites: {sorted(suites)})" if len(suites) > 1 else ""))
+              + (f"   (suites: {sorted(str(x) for x in suites)})" if len(suites) > 1 else ""))
 
     joined = ",".join(resolved)
-    # one last check on the full set: a task can exist yet fail to expand (missing
-    # dataset, gated repo), and finding that out here beats finding it out after the
-    # base-model pass has already run
+    # a task can exist yet fail to expand (missing dataset, gated repo); finding that
+    # out here beats finding it out after the base-model pass has already run
     if not _registry_accepts(joined):
         bad = [t for t in resolved if not _registry_accepts(t)]
         raise SystemExit(f"lighteval rejected these resolved tasks: {bad or joined}\n"
                          f"Inspect with `lighteval tasks inspect <task>`, or pass working ids "
                          f"verbatim via --tasks.")
     return joined
-
-
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--config", type=Path, required=False,
-                   help="Experiment config (not needed with --list-tasks).")
-    p.add_argument("--checkpoint", type=Path, default=None,
-                   help="Adapter checkpoint (default: latest under the run's output dir).")
-    p.add_argument("--tasks", type=str, default=None,
-                   help="Comma-separated. Bare names (winogrande, arc:easy) are resolved against "
-                        "the installed lighteval registry; anything containing '|' is passed "
-                        "through verbatim. Default: " + ",".join(DEFAULT_TASK_NAMES))
-    p.add_argument("--few-shot", type=int, default=0)
-    p.add_argument("--list-tasks", action="store_true",
-                   help="Print every task the installed lighteval knows about, and exit.")
-    p.add_argument("--max-samples", type=int, default=200,
-                   help="Examples per task. Small values iterate fast but the noise floor is "
-                        "several points -- fine for 'nothing broke', useless for '2 points worse'.")
-    p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--conditions", type=str, default="adapter,base",
-                   help="Which passes to run; 'base' is the same checkpoint with adapters disabled.")
-    p.add_argument("--force", action="store_true", help="Run even on a gated checkpoint.")
-    p.add_argument("--output-dir", type=Path, default=None)
-    return p.parse_args()
-
-
-def _import_lighteval():
-    """Centralized so an API change breaks in ONE place with an actionable message."""
-    try:
-        from lighteval.logging.evaluation_tracker import EvaluationTracker
-        from lighteval.models.transformers.transformers_model import (
-            TransformersModel, TransformersModelConfig,
-        )
-        from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters
-    except ImportError as e:
-        raise SystemExit(
-            f"lighteval import failed ({e}).\n"
-            f"  pip install lighteval\n"
-            f"If it IS installed, the API moved: this script needs EvaluationTracker, "
-            f"TransformersModel(.from_model)/TransformersModelConfig, and "
-            f"Pipeline/PipelineParameters/ParallelismManager. Check `lighteval --version` and "
-            f"adjust _import_lighteval + run_condition, which are the only lighteval-aware parts.")
-    return (EvaluationTracker, TransformersModel, TransformersModelConfig,
-            ParallelismManager, Pipeline, PipelineParameters)
 
 
 def run_condition(peft_model, config, args, condition: str, out_dir: Path) -> dict:
