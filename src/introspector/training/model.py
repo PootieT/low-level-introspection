@@ -478,6 +478,118 @@ class InterventionAnnealCallback(TrainerCallback):
             print(f"[anneal] step {state.global_step}/{state.max_steps} intervention_scale={scale:.4g}")
 
 
+ADDED_TOKEN_EMBEDDINGS_FILENAME = "added_token_embeddings.pt"
+EMBED_TENSOR_SUFFIXES = ("embed_tokens.weight", "lm_head.weight")
+
+
+def strip_adapter_embeddings(ckpt_dir, n_added_tokens: int, verbose: bool = True):
+    """
+    Rewrite a saved adapter without the frozen embedding matrices.
+
+    PEFT's save_pretrained(save_embedding_layers="auto") stores the WHOLE resized
+    embed_tokens and lm_head whenever the vocab grew -- and every run here grows it by
+    one for the introspection separator. At 128257 x 2048 in bf16 that is ~1.0 GB per
+    checkpoint against ~21 MB of LoRA weights: 98% of the file is a frozen copy of the
+    base model.
+
+    Only the last `n_added_tokens` rows are genuinely not in the base model. They were
+    random at resize time and frozen through training, but the model trained WITH those
+    vectors and a fresh resize initializes them differently -- so they are preserved
+    (a few KB) and restored by load_added_token_embeddings.
+
+    n_added_tokens is passed explicitly rather than inferred from a vocab constant, so
+    this works for any base model (Llama 128256, Gemma 256000, ...).
+    """
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    path = os.path.join(str(ckpt_dir), "adapter_model.safetensors")
+    if not os.path.exists(path):
+        return False
+    before = os.path.getsize(path)
+    keep, rows, had_embed = {}, {}, False
+    with safe_open(path, framework="pt") as f:
+        meta = f.metadata()
+        for key in f.keys():
+            tensor = f.get_tensor(key)
+            if any(key.endswith(sfx) for sfx in EMBED_TENSOR_SUFFIXES):
+                had_embed = True
+                if n_added_tokens > 0 and tensor.shape[0] > n_added_tokens:
+                    rows[key] = tensor[-n_added_tokens:].clone()
+            else:
+                keep[key] = tensor
+    if not had_embed:
+        return False              # already stripped, or never carried embeddings
+    save_file(keep, path, metadata=meta)
+    if rows:
+        torch.save(rows, os.path.join(str(ckpt_dir), ADDED_TOKEN_EMBEDDINGS_FILENAME))
+    if verbose:
+        after = os.path.getsize(path)
+        print(f"[strip_adapter_embeddings] {path}: {before/2**20:.1f}MB -> "
+              f"{after/2**20:.1f}MB (kept {len(rows)} added-token row set(s))")
+    return True
+
+
+class StripEmbeddingSaveCallback(TrainerCallback):
+    """
+    Drop the frozen embedding matrices from each checkpoint as it is written.
+
+    Cheaper and safer than cleaning up afterwards: the 1 GB per checkpoint is never
+    on disk in the first place, so a sweep cannot fill the filesystem mid-run. Pass
+    the number of tokens added to the tokenizer (tokenizer.add_special_tokens returns
+    it); 0 disables the strip.
+    """
+
+    def __init__(self, n_added_tokens: int):
+        self.n_added_tokens = n_added_tokens
+
+    def on_save(self, args, state, control, **kwargs):
+        if self.n_added_tokens is None:
+            return
+        ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        try:
+            strip_adapter_embeddings(ckpt_dir, self.n_added_tokens)
+        except Exception as e:      # never let disk hygiene kill a training run
+            print(f"[StripEmbeddingSaveCallback] skipped ({type(e).__name__}: {e})")
+
+
+def load_added_token_embeddings(model, ckpt_dir):
+    """
+    Restore the rows beyond the base vocabulary (the introspection separator) after a
+    checkpoint has had its frozen embedding matrices stripped by
+    utils/delete_checkpoints_batch.strip_embedding_tensors.
+
+    PEFT saves the WHOLE resized embed_tokens/lm_head (~1.0 GB) because the vocab grew
+    by one, even though they are frozen. Stripping them saves 97.9% of the checkpoint,
+    but the separator's row is genuinely not in the base model: it was random at resize
+    time, frozen through training, and a fresh resize initializes it differently. This
+    puts the trained-time row back.
+
+    No-op when the file is absent (checkpoint still carries its full embeddings).
+    Returns True if rows were restored.
+    """
+    path = os.path.join(ckpt_dir, ADDED_TOKEN_EMBEDDINGS_FILENAME)
+    if not os.path.exists(path):
+        return False
+    rows = torch.load(path, map_location="cpu")
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    restored = []
+    for key, tensor in rows.items():
+        module = base.get_input_embeddings() if "embed_tokens" in key else base.get_output_embeddings()
+        if module is None:
+            continue
+        w = module.weight
+        n = tensor.shape[0]
+        if w.shape[0] < n:
+            raise ValueError(f"{key}: model vocab {w.shape[0]} is smaller than the {n} "
+                             f"saved extra row(s); resize the base model before loading.")
+        with torch.no_grad():
+            w[-n:] = tensor.to(device=w.device, dtype=w.dtype)
+        restored.append(key)
+    print(f"[load_added_token_embeddings] restored {restored} from {path}")
+    return bool(restored)
+
+
 def load_regression_head(model, ckpt_dir):
     """
     Restore a regression head previously saved by RegressionHeadSaveCallback.

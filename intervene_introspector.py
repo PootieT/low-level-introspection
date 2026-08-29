@@ -30,7 +30,10 @@ from src.introspector.prompts import PROMPT_REGISTRY
 from src.introspector.signals.resolution import resolve_signal_source
 from src.introspector.training.collator import LoRAGatingCollator
 from src.introspector.training.metrics import compute_metrics_from_numericals
-from src.introspector.training.model import replace_model_with_gated_version, replace_lora_with_gated_version
+from src.introspector.training.model import (
+    replace_model_with_gated_version, replace_lora_with_gated_version,
+    load_added_token_embeddings,
+)
 from src.introspector.utils import rsetattr
 from train_introspector import preprocess_example, INTROSPECTION_SEPARATOR
 
@@ -80,6 +83,8 @@ def main():
     checkpoint_paths = glob.glob(str(Path(config.output_dir) / config.experiment_name / "checkpoint-*"))
     latest_checkpoint_path = max(checkpoint_paths, key=os.path.getctime)
     model = PeftModel.from_pretrained(model, latest_checkpoint_path, autocast_adapter_dtype=False)
+    # no-op unless the checkpoint's frozen embeddings were stripped to save disk
+    load_added_token_embeddings(model, latest_checkpoint_path)
 
     # monkey patch to get the introspection token masking
     replace_model_with_gated_version(model)

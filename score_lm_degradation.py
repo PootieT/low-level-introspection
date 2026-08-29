@@ -49,6 +49,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.introspector.config import ExperimentConfig
 from train_introspector import INTROSPECTION_SEPARATOR
+from src.introspector.training.model import load_added_token_embeddings
 
 # KL below this (nats/token) and top-1 agreement above the second value => the
 # adapter left ordinary language modelling essentially untouched. Calibration, not law.
@@ -84,6 +85,10 @@ def load_adapter_model(config: ExperimentConfig, ckpt, trim_vocab: bool = True):
     if added:
         base.resize_token_embeddings(len(tokenizer))
     model = PeftModel.from_pretrained(base, str(ckpt), autocast_adapter_dtype=False)
+    # restores the separator row if the checkpoint's frozen embeddings were
+    # stripped. Irrelevant once trim_vocab drops that row, but keeps this loader
+    # correct for callers that do not trim.
+    load_added_token_embeddings(model, str(ckpt))
     if added and trim_vocab:
         model.get_base_model().resize_token_embeddings(orig_vocab)
         print(f"[load] trimmed vocab {len(tokenizer)} -> {orig_vocab} "
@@ -111,6 +116,9 @@ def parse_args():
                    help="Keep the extra (untrained) separator row instead of trimming back to the "
                         "base vocabulary. Shared by both conditions either way, so KL/top-1 are "
                         "unaffected; only absolute NLL/perplexity shift.")
+    p.add_argument("--overwrite", action="store_true",
+                   help="Re-run even if lm_degradation.json already exists (default: skip, "
+                        "matching cache_signals.py / train_introspector_joint.py).")
     p.add_argument("--force", action="store_true",
                    help="Run even on a gated checkpoint (the numbers will not describe the "
                         "trained model -- see the module docstring).")
@@ -217,6 +225,10 @@ def main():
     run_dir = Path(config.output_dir) / config.experiment_name
     out_dir = args.output_dir or run_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if (out_dir / "lm_degradation.json").exists() and not args.overwrite:
+        print(f"[lm] already scored: {out_dir}/lm_degradation.json (--overwrite to redo)")
+        return
 
     if config.training_config.disable_adapter_in_input and not args.force:
         raise SystemExit(

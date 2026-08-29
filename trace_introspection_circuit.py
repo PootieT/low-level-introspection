@@ -56,6 +56,7 @@ from src.introspector.training.collator import LoRAGatingCollator
 from src.introspector.training.model import (
     IntrospectionRegressionModel,
     load_regression_head,
+    load_added_token_embeddings,
     replace_model_with_gated_version,
     replace_lora_with_gated_version,
 )
@@ -136,6 +137,8 @@ def load_model_and_data(config: ExperimentConfig, checkpoint: Path):
         intervention_extreme_scale=config.training_config.intervention_extreme_scale,
     )
     load_regression_head(model, str(checkpoint))
+    # no-op unless the checkpoint's frozen embeddings were stripped to save disk
+    load_added_token_embeddings(model, str(checkpoint))
     replace_model_with_gated_version(model)
     replace_lora_with_gated_version(model)
     model.eval()

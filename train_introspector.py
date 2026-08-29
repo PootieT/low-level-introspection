@@ -48,7 +48,10 @@ import seaborn as sns
 
 from src.introspector.config import ExperimentConfig
 from src.introspector.training.collator import LoRAGatingCollator
-from src.introspector.training.model import replace_model_with_gated_version, replace_lora_with_gated_version
+from src.introspector.training.model import (
+    replace_model_with_gated_version, replace_lora_with_gated_version,
+    StripEmbeddingSaveCallback, load_added_token_embeddings,
+)
 from src.introspector.training.metrics import compute_metrics, get_numericals, compute_metrics_from_numericals
 from src.introspector.prompts import PROMPT_REGISTRY
 
@@ -320,13 +323,18 @@ def main():
         eval_dataset=dev_dataset,
         data_collator=collator,
         compute_metrics=partial(compute_metrics, tokenizer=tokenizer),
-        preprocess_logits_for_metrics=get_argmax_from_logits  # otherwise during test prediction it's too much mem
+        preprocess_logits_for_metrics=get_argmax_from_logits,  # otherwise during test prediction it's too much mem
+        # PEFT saves the whole resized embed_tokens/lm_head (~1.0 GB, 98% of the
+        # checkpoint) because the vocab grew by one; drop them at save time and keep
+        # only the added rows, which load_added_token_embeddings restores.
+        callbacks=[StripEmbeddingSaveCallback(num_added)],
     )
     ckpt_dirs = glob.glob(f"{output_dir}/checkpoint-*")
     if ckpt_dirs and not args.overwrite_cache:
         print(f"Found Trained model, skipping training and loading directly ..")
         latest_checkpoint_path = max(ckpt_dirs, key=os.path.getctime)
         train_results = trainer.train(resume_from_checkpoint=latest_checkpoint_path)
+        load_added_token_embeddings(model, latest_checkpoint_path)
     else:
         train_results = trainer.train()
     trainer.save_metrics("train", train_results.metrics)

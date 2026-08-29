@@ -71,6 +71,8 @@ from src.introspector.training.model import (
     RegressionHeadSaveCallback,
     InterventionAnnealCallback,
     load_regression_head,
+    load_added_token_embeddings,
+    StripEmbeddingSaveCallback,
 )
 from train_introspector import (
     preprocess_example,
@@ -489,7 +491,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     special_tokens = {"additional_special_tokens": [INTROSPECTION_SEPARATOR]}
-    tokenizer.add_special_tokens(special_tokens)
+    n_added_tokens = tokenizer.add_special_tokens(special_tokens)
 
     # ========================================================
     # Load datasets
@@ -617,10 +619,13 @@ def main():
         report_to="wandb",
     )
 
-    callbacks = None
+    # drop the frozen resized embed_tokens/lm_head from each checkpoint as it is
+    # written (~1.0 GB, 98% of the file); the added rows are kept so the checkpoint
+    # stays reloadable. Applies whether or not the regressor head is in use.
+    callbacks = [StripEmbeddingSaveCallback(n_added_tokens)]
     if config.use_regressor:
         # persist the custom regression head next to every checkpoint (PEFT won't)
-        callbacks = [RegressionHeadSaveCallback(model)]
+        callbacks.append(RegressionHeadSaveCallback(model))
         if config.training_config.intervention_anneal:
             callbacks.append(InterventionAnnealCallback(
                 model,
@@ -656,6 +661,7 @@ def main():
         train_results = trainer.train(resume_from_checkpoint=latest_checkpoint_path)
         if config.use_regressor:
             load_regression_head(model, latest_checkpoint_path)
+            load_added_token_embeddings(model, latest_checkpoint_path)
     else:
         train_results = trainer.train()
         trainer.save_metrics( "train", train_results.metrics)

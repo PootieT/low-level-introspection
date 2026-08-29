@@ -137,6 +137,59 @@ def delete_files_matching_pattern(exp_pattern: str, keep_per_cell: int = 0,
             shutil.rmtree(f)
 
 
+# ---------------------------------------------------------------------------
+# Frozen embedding tensors
+# ---------------------------------------------------------------------------
+# PEFT's save_pretrained(save_embedding_layers="auto") stores embed_tokens and lm_head
+# whenever the vocab was resized -- and every run here resizes by one for the
+# introspection separator. At vocab 128257 x 2048 in bf16 that is ~1.0 GB per
+# checkpoint against ~21 MB of actual LoRA weights: 97.9% of the file is a frozen copy
+# of the base model.
+#
+# The single row that is NOT in the base model is the separator's embedding. It was
+# random-initialized at resize time and frozen, so it never changed -- but the model
+# trained WITH that specific vector, and a reload re-initializes it differently
+# (transformers mean-resizing). Stripping the matrices while preserving that one row
+# (4 KB) keeps checkpoints reloadable; stripping it outright does not.
+EMBED_KEYS = ("embed_tokens.weight", "lm_head.weight")
+ADDED_ROWS_FILE = "added_token_embeddings.safetensors"
+
+
+def strip_embedding_tensors(exp_pattern: str, n_added_tokens: int = 1,
+                            dry_run: bool = True, assume_yes: bool = False):
+    """Post-hoc version of what StripEmbeddingSaveCallback now does at save time, for
+    checkpoints written before that existed. Delegates to the same implementation.
+
+    n_added_tokens is how many tokens the run added to the tokenizer (1 for the
+    introspection separator); those rows are preserved so the checkpoint stays
+    reloadable, and load_added_token_embeddings puts them back.
+    """
+    import sys
+    sys.path.insert(0, os.getcwd())
+    from src.introspector.training.model import strip_adapter_embeddings
+
+    files = sorted(glob.glob(exp_pattern))
+    print(f"\n{exp_pattern}\nFound {len(files)} adapter file(s)")
+    if not files:
+        return
+    before = sum(_size(f) for f in files)
+    print(f"  {_human(before)} total; keeping the last {n_added_tokens} row(s) per file")
+    if dry_run:
+        print(f"  DRY RUN -- nothing rewritten (expect ~{_human(before * 0.02)} to remain)")
+        return
+    if not assume_yes:
+        res = input(f"Rewrite {len(files)} adapter file(s)? (Y/N)")
+        if not res.lower().startswith("y"):
+            print("  aborted")
+            return
+    n = 0
+    for f in tqdm(files):
+        n += bool(strip_adapter_embeddings(os.path.dirname(f), n_added_tokens, verbose=False))
+    after = sum(_size(f) for f in files)
+    print(f"  rewrote {n} file(s): {_human(before)} -> {_human(after)} "
+          f"(freed {_human(before - after)})")
+
+
 if __name__ == "__main__":
     GROUP = "outputs/runs/mlp_endo_sweep_layer_token"
     # Adapter weights: keep ONE neuron per (layer, position, gate) cell so the
@@ -147,6 +200,11 @@ if __name__ == "__main__":
     # Optimizer state and the tokenizer copy are never needed again -> delete all.
     delete_files_matching_pattern(f"{GROUP}/*/checkpoint-*/optimizer.pt", dry_run=DRY_RUN)
     delete_files_matching_pattern(f"{GROUP}/*/checkpoint-*/tokenizer.json", dry_run=DRY_RUN)
+
+    # Frozen embeddings: ~1.0 GB of each checkpoint, 97.9% of the file. Keeps the
+    # separator's row so the checkpoint stays reloadable for introspection evals.
+    # strip_embedding_tensors(f"{GROUP}/*/checkpoint-*/adapter_model.safetensors",
+    #                         keep_added_rows=True, dry_run=DRY_RUN)
 
     # other sweeps:
     # delete_files_matching_pattern("outputs/runs/mlp_joint_weight_sweep/*/checkpoint-*/optimizer.pt", dry_run=DRY_RUN)

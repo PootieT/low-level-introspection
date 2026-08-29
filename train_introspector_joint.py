@@ -64,6 +64,8 @@ from src.introspector.training.model import (
     IntrospectionRegressionModel,
     RegressionHeadSaveCallback,
     InterventionAnnealCallback,
+    StripEmbeddingSaveCallback,
+    load_added_token_embeddings,
     load_regression_head,
     replace_model_with_gated_version,
     replace_lora_with_gated_version,
@@ -426,6 +428,19 @@ class ActivationCaptureHook:
         return None
 
 
+# The Llama MLP is  down_proj( act_fn(gate_proj(x)) * up_proj(x) ), so for the target
+# neuron n these three tensors play different roles, and the weight analysis
+# (analysis/compare_lora_weight_patterns.py) found the adapter targets only two:
+#   gate_proj row n  -> the neuron's OWN value (what we intervene on).  NOT targeted.
+#   up_proj   row n  -> the multiplicative gate on its contribution.    rank 1 of 8192.
+#   down_proj col n  -> the residual direction it writes.               rank 1 of 8192.
+# up_proj's update came back ~14 sigma ANTI-aligned with the base row, which would
+# flatten the gate's input-dependence -- i.e. make transmission less context-dependent,
+# as a reliable relay would. TRANSMISSION_SITES measures that directly: a std ratio
+# well below 1 for up_proj is the signature.
+TRANSMISSION_SITES = ("up_proj", "gate_proj")
+
+
 def _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offsets):
     """One forward over `batch`, capturing the target neuron at every offset AND the
     regression head's prediction from the same pass (the head reads the last-token
@@ -436,15 +451,24 @@ def _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offs
     layer, so a multi-neuron / multi-layer batch still needs only one forward."""
     bs = abs_pos.shape[0]
     out = {off: torch.full((bs,), float("nan")) for off in offsets}
-    hooks, handles = [], []
+    trans = {site: torch.full((bs,), float("nan")) for site in TRANSMISSION_SITES}
+    hooks, handles, trans_hooks = [], [], []
     try:
         for layer in torch.unique(signal_layer).tolist():
             m = signal_layer == layer
             rows = torch.nonzero(m, as_tuple=True)[0]
             hook = ActivationCaptureHook(rows, abs_pos[m], signal_index[m], offsets)
-            module = operator.attrgetter(resolve_mlp_signal_path(model, layer, path_to_output=False))(model)
+            act_path = resolve_mlp_signal_path(model, layer, path_to_output=False)
+            module = operator.attrgetter(act_path)(model)
             handles.append(module.register_forward_hook(hook))
             hooks.append((rows, hook))
+            # same positions, same neuron index, on the transmission tensors
+            for site in TRANSMISSION_SITES:
+                site_hook = ActivationCaptureHook(rows, abs_pos[m], signal_index[m], (0,))
+                site_module = operator.attrgetter(
+                    act_path.rsplit(".", 1)[0] + "." + site)(model)
+                handles.append(site_module.register_forward_hook(site_hook))
+                trans_hooks.append((rows, site, site_hook))
         outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
                         lora_token_mask=batch.get("lora_token_mask"), do_intervention=False)
     finally:
@@ -453,6 +477,9 @@ def _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offs
     for rows, hook in hooks:
         for off in offsets:
             out[off][rows.cpu()] = hook.captured[off]
+    for rows, site, hook in trans_hooks:
+        trans[site][rows.cpu()] = hook.captured[0]
+    out["_transmission"] = trans
     head = model.regression_head
     h = outputs.hidden_states[-1][:, -1, :]
     preds = head(h.to(device=head.weight.device, dtype=head.weight.dtype)).squeeze(-1).float().cpu()
@@ -498,6 +525,8 @@ def measure_activation_drift(model, dataset, collator, config, output_dir, suffi
     cached_all, pos_all, pred_all = [], [], []
     tuned_all = {off: [] for off in offsets}
     base_all = {off: [] for off in offsets}
+    trans_all = {"tuned": {s: [] for s in TRANSMISSION_SITES},
+                 "base": {s: [] for s in TRANSMISSION_SITES}}
 
     for batch in dl:
         batch = batch.to(model.device)
@@ -515,6 +544,9 @@ def measure_activation_drift(model, dataset, collator, config, output_dir, suffi
         cached_all.append(batch["activation"].float().cpu())
         pred_all.append(preds)
         pos_all.append(token_position.cpu())
+        for site in TRANSMISSION_SITES:
+            trans_all["tuned"][site].append(tuned["_transmission"][site])
+            trans_all["base"][site].append(base["_transmission"][site])
         for off in offsets:
             tuned_all[off].append(tuned[off])
             base_all[off].append(base[off])
@@ -524,6 +556,13 @@ def measure_activation_drift(model, dataset, collator, config, output_dir, suffi
     pos = torch.cat(pos_all).numpy()
     tuned = {off: torch.cat(v).numpy() for off, v in tuned_all.items()}
     base = {off: torch.cat(v).numpy() for off, v in base_all.items()}
+    transmission = {}
+    for site in TRANSMISSION_SITES:
+        t, b = (torch.cat(trans_all["tuned"][site]).numpy(),
+                torch.cat(trans_all["base"][site]).numpy())
+        stats = _drift_stats(t, b)
+        stats["std_tuned"], stats["std_base"] = float(np.std(t)), float(np.std(b))
+        transmission[site] = stats
 
     # ---- alignment: which offset reproduces the cache? ----
     alignment = [dict(offset=off, **_drift_stats(base[off], cached)) for off in offsets]
@@ -575,6 +614,7 @@ def measure_activation_drift(model, dataset, collator, config, output_dir, suffi
         "drift_tuned_vs_base": drift_vs_base,
         "drift_tuned_vs_cached": drift_vs_cached,
         "readout_tracking": readout,
+        "transmission_path": transmission,
         "drift_by_position": rows,
     }
     out = Path(output_dir)
@@ -639,6 +679,25 @@ def measure_activation_drift(model, dataset, collator, config, output_dir, suffi
         print("[drift] => the adapter MOVED the neuron. A high endogenous corr against the CACHED "
               "target now needs the recompute explanation ruled out: check whether corr(tuned,cached) "
               "exceeds corr(tuned,base) -- reading the live neuron cannot beat the live neuron itself.")
+    print("[transmission] target neuron's MLP path, tuned vs base at the same site:")
+    for site, st in transmission.items():
+        print(f"    {site:10s} corr={st['corr']:.4f}  std_ratio={st['std_ratio']:.3f} "
+              f"(std {st['std_base']:.4f} -> {st['std_tuned']:.4f})  "
+              f"mean_shift={st['mean_shift']:+.4f}")
+    up = transmission.get("up_proj", {})
+    gate = transmission.get("gate_proj", {})
+    if up and gate:
+        if up.get("std_ratio", 1) < 0.8:
+            print("[transmission] => the multiplicative gate was FLATTENED: the neuron's "
+                  "contribution is now less input-dependent, which is what a reliable relay "
+                  "needs. Combined with an untouched gate_proj, the adapter rewired the "
+                  "neuron's OUTPUT PATH without changing the value it reports.")
+        elif gate.get("std_ratio", 1) < 0.8:
+            print("[transmission] => gate_proj moved: the adapter changed the SIGNAL itself, "
+                  "not just its transmission. Endogenous targets are then measuring a neuron "
+                  "the model rewrote.")
+        else:
+            print("[transmission] => neither path was reshaped much at this operating point.")
     print("[drift] by position:")
     print(by_pos.to_string(index=False))
     return metrics
@@ -809,7 +868,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.add_special_tokens({"additional_special_tokens": [INTROSPECTION_SEPARATOR]})
+    n_added_tokens = tokenizer.add_special_tokens(
+        {"additional_special_tokens": [INTROSPECTION_SEPARATOR]})
 
     # ---- data ----
     train_raw = load_from_disk(str(cache_dir / "train"))
@@ -871,6 +931,8 @@ def main():
         intervention_extreme_scale=config.training_config.intervention_extreme_scale)
     if args.diag_only:
         load_regression_head(model, str(diag_ckpt))
+        # no-op unless the checkpoint's frozen embeddings were stripped to save disk
+        load_added_token_embeddings(model, str(diag_ckpt))
     replace_model_with_gated_version(model)
     replace_lora_with_gated_version(model)
 
@@ -899,7 +961,11 @@ def main():
         bf16=config.training_config.bf16,
         remove_unused_columns=False, report_to="wandb", **save_kwargs)
 
-    callbacks = [RegressionHeadSaveCallback(model)]
+    # PEFT stores the whole resized embed_tokens/lm_head (~1.0 GB, 98% of the file)
+    # because the vocab grew by one; drop them as each checkpoint is written, keeping
+    # the added rows so the checkpoint stays reloadable.
+    callbacks = [RegressionHeadSaveCallback(model),
+                 StripEmbeddingSaveCallback(n_added_tokens)]
     if config.training_config.intervention_anneal:
         # NOTE: this anneals the injection SCALE (magnitude), NOT the mix weight.
         callbacks.append(InterventionAnnealCallback(
@@ -941,6 +1007,7 @@ def main():
         print(f"Found checkpoint, resuming/loading from {latest}")
         train_results = trainer.train(resume_from_checkpoint=latest)
         load_regression_head(model, latest)
+        load_added_token_embeddings(model, latest)
     else:
         train_results = trainer.train()
         trainer.save_metrics("train", train_results.metrics)

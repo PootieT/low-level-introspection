@@ -44,6 +44,7 @@ from src.introspector.models.signal_paths import resolve_sae_hook_path
 from src.introspector.signals.sae import load_sae_for_spec
 from src.introspector.training.collator import LoRAGatingCollator
 from src.introspector.training.model import (
+    StripEmbeddingSaveCallback,
     replace_model_with_gated_version, replace_lora_with_gated_version, SAEInterventionHook,
 )
 from src.introspector.prompts import PROMPT_REGISTRY
@@ -255,7 +256,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.add_special_tokens({"additional_special_tokens": [INTROSPECTION_SEPARATOR]})
+    n_added_tokens = tokenizer.add_special_tokens(
+        {"additional_special_tokens": [INTROSPECTION_SEPARATOR]})
 
     train_raw = load_from_disk(str(cache_dir / "train"))
     dev_raw = load_from_disk(str(cache_dir / "dev"))
@@ -313,6 +315,8 @@ def main():
         compute_metrics=partial(compute_detection_metrics, active_id=active_id, inactive_id=inactive_id),
         preprocess_logits_for_metrics=partial(
             preprocess_logits_for_detection, active_id=active_id, inactive_id=inactive_id),
+        # drop the frozen resized embeddings from each checkpoint (~1.0 GB, 98% of it)
+        callbacks=[StripEmbeddingSaveCallback(n_added_tokens)],
     )
     ckpts = glob.glob(f"{out_dir}/checkpoint-*")
     if ckpts and not args.overwrite_cache:

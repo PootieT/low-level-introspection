@@ -38,4 +38,6 @@ reuse — migrate a script into this directory rather than running it in place.
 
 | `neuron/train_single_mlp_introspector_endogenous_sweep_layer_token.sh` | 8 layers x 8 positions x 10 neurons, endogenous only (`W=1.0`); one array task per (layer, position) cell, 10 neurons inside it sharing one cached dataset |
 
+| `neuron/train_single_mlp_introspector_joint_weight_sweep.sh` | joint-loss weight `W` at 3 (layer, position, KL-budget) cells x 5 neurons = 90 runs; fixes `W` for the main grid and gives the endogenous-vs-interventional pareto with error bars |
+
 Others are migrated as the experiment list for the paper firms up.

@@ -256,6 +256,10 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--conditions", type=str, default="adapter,base",
                    help="Which passes to run; 'base' is the same checkpoint with adapters disabled.")
+    p.add_argument("--overwrite", action="store_true",
+                   help="Re-run even if benchmarks_raw.json already exists. Worth having: a "
+                        "benchmark pass is far more expensive than the KL scorer, and sweep "
+                        "scripts re-invoke it on every resubmission.")
     p.add_argument("--force", action="store_true", help="Run even on a gated checkpoint.")
     p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--cache-dir", type=Path, default=None,
@@ -367,6 +371,10 @@ def main():
     run_dir = Path(config.output_dir) / config.experiment_name
     out_dir = args.output_dir or (run_dir / "lighteval")
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if (out_dir / "benchmarks_raw.json").exists() and not args.overwrite:
+        print(f"[lighteval] already evaluated: {out_dir}/benchmarks_raw.json (--overwrite to redo)")
+        return
 
     if config.training_config.disable_adapter_in_input and not args.force:
         raise SystemExit(
