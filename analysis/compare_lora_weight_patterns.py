@@ -133,9 +133,14 @@ def profile_frame(ckpt: Path, signal_layer: int, label: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def plot_profiles(df, out_dir, x="rel_depth"):
-    """One panel per module; a line per condition. x='rel_depth' aligns conditions on
-    their own signal layer, x='layer' keeps absolute depth."""
+def plot_profiles(df, out_dir, x="rel_depth", value="frob_norm"):
+    """One panel per module; a line per condition.
+
+    x='rel_depth' aligns conditions on their own signal layer, x='layer' keeps absolute
+    depth. value='frob_norm' normalizes each condition by ITS OWN max, so shapes are
+    comparable but LEVELS ARE NOT -- conditions trained at different KL budgets have
+    very different absolute update sizes. Use value='frob' (log scale) for any claim
+    of the form "condition A moved more weight than condition B"."""
     modules = [m for m in MODULE_ORDER if m in set(df["module"])]
     ncol = 4
     nrow = int(np.ceil(len(modules) / ncol))
@@ -146,20 +151,27 @@ def plot_profiles(df, out_dir, x="rel_depth"):
         sub = df[df["module"] == module]
         for cond, s in sub.groupby("condition"):
             s = s.sort_values(x)
-            ax.plot(s[x], s["frob_norm"], marker="o", ms=4, label=cond, color=palette[cond])
+            ax.plot(s[x], s[value], marker="o", ms=4, label=cond, color=palette[cond])
         ax.axvline(0, color="k", ls="--", lw=1, alpha=0.6)
         ax.set_title(module)
         ax.set_xlabel("layer - signal layer" if x == "rel_depth" else "layer")
-        ax.set_ylabel("||dW||_F (normalized)")
-        ax.set_ylim(0, 1.05); ax.grid(alpha=0.25)
+        if value == "frob_norm":
+            ax.set_ylabel("||dW||_F (normalized)")
+            ax.set_ylim(0, 1.05)
+        else:
+            ax.set_ylabel("||dW||_F (absolute)")
+            ax.set_yscale("log")
+        ax.grid(alpha=0.25)
     for ax in axes.flat[len(modules):]:
         ax.set_visible(False)
     axes.flat[0].legend(fontsize=8)
-    fig.suptitle("LoRA update magnitude by module"
+    scale = "per-condition normalized" if value == "frob_norm" else "ABSOLUTE (log)"
+    fig.suptitle(f"LoRA update magnitude by module [{scale}]"
                  + (", aligned on the signal layer (0 = where the signal is read)"
                     if x == "rel_depth" else ", absolute layer"), y=1.01)
     fig.tight_layout()
-    path = Path(out_dir) / f"lora_profile_by_{x}.png"
+    suffix = "" if value == "frob_norm" else "_abs"
+    path = Path(out_dir) / f"lora_profile{suffix}_by_{x}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"[lora] wrote {path}")
 
@@ -192,6 +204,15 @@ def main(conditions, out_dir, per_checkpoint=True, use_base_model=True,
     df.to_csv(out_dir / "lora_profiles.csv", index=False)
     plot_profiles(df, out_dir, x="rel_depth")
     plot_profiles(df, out_dir, x="layer")
+    # absolute versions: required for any "A moved more weight than B" statement,
+    # since the normalized panels hide that different KL budgets rescale everything
+    plot_profiles(df, out_dir, x="rel_depth", value="frob")
+    plot_profiles(df, out_dir, x="layer", value="frob")
+
+    tot = (df.groupby("condition")["frob"].sum().sort_values(ascending=False)
+             .rename("total_||dW||_F").reset_index())
+    print("\n[lora] TOTAL update magnitude per condition (absolute, not normalized):")
+    print(tot.to_string(index=False, float_format=lambda v: f"{v:.2f}"))
 
     if targeted:
         t = pd.DataFrame(targeted)
