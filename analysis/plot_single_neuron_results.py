@@ -461,6 +461,77 @@ def plot_endogenous_lines(df: pd.DataFrame, out_dir: str, hue: str = "layer"):
         raise ValueError(f"hue must be 'layer' or 'neuron', got {hue!r}")
 
 
+def plot_gate_comparison(df_by_gate: dict, out_dir: str, expected_neurons: int = 10):
+    """Gate ON vs OFF side by side, same axes, one line per layer.
+
+    This is the panel the gate claim rests on: with the gate ON no trainable parameter
+    touches the computation at the introspected token, so the model cannot read the
+    neuron and interventional corr sits at 0 however good the endogenous score looks --
+    the bypass signature. With it OFF the same objective produces causal reading.
+    Shared axes make that a visual comparison rather than a cross-table one."""
+    gates = [g for g in ("on", "off") if g in df_by_gate]
+    if len(gates) < 2:
+        print(f"[endo] only gate={gates} present; skipping the side-by-side comparison")
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    panels = sorted(set().union(*(set(df_by_gate[g]["panel"]) for g in gates)))
+    for panel in panels:
+        fig, axes = plt.subplots(1, len(gates), figsize=(7 * len(gates), 5.2),
+                                 squeeze=False, sharey=True)
+        layers = sorted(set().union(*(set(df_by_gate[g]["layer"]) for g in gates)))
+        palette = dict(zip(layers, sns.color_palette("viridis", len(layers))))
+        for ax, gate in zip(axes.flat, gates):
+            sub = df_by_gate[gate]
+            sub = sub[sub["panel"] == panel]
+            if sub.empty:
+                ax.set_visible(False)
+                continue
+            sns.lineplot(data=sub, x="position", y="value", hue="layer", palette=palette,
+                         marker="o", errorbar="se", ax=ax, legend=(ax is axes.flat[-1]))
+            ax.set_title(f"gate {gate}")
+            ax.set_xlabel("token position")
+            ax.set_ylabel(panel)
+            if "corr" in panel:
+                ax.set_ylim(-0.1, 1.05)
+                ax.axhline(0, color="grey", ls="--", lw=1)
+            ax.grid(alpha=0.25)
+        fig.suptitle(f"{panel}: gate on vs off (mean ± SE over {expected_neurons} neurons)",
+                     y=1.02)
+        fig.tight_layout()
+        path = Path(out_dir) / f"gate_comparison_{panel.replace(' ', '_')}.png"
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[endo] wrote {path}")
+
+
+def run_endogenous_sweep_plots(exp_group: str, out_root: str, gates=("on", "off"),
+                               expected_neurons: int = 10):
+    """Plot each gate arm into its OWN subdirectory (gate_on/, gate_off/), then the
+    side-by-side comparison at the root. A missing arm is reported and skipped rather
+    than aborting the other one."""
+    loaded = {}
+    for gate in gates:
+        out_dir = f"{out_root}/gate_{gate}"
+        print(f"\n[endo] ===== gate={gate} -> {out_dir} =====")
+        try:
+            df = load_endogenous_sweep(exp_group, gate=gate)
+        except SystemExit as e:
+            print(f"[endo] skipping gate={gate}: {e}")
+            continue
+        os.makedirs(out_dir, exist_ok=True)
+        report_endogenous_coverage(df, expected_neurons=expected_neurons)
+        df.to_csv(f"{out_dir}/sweep_runs.csv", index=False)      # per-run long table
+        plot_endogenous_heatmaps(df, out_dir)
+        plot_endogenous_lines(df, out_dir, hue="layer")
+        plot_endogenous_lines(df, out_dir, hue="neuron")
+        loaded[gate] = df
+    if loaded:
+        pd.concat([d.assign(gate_arm=g) for g, d in loaded.items()], ignore_index=True) \
+          .to_csv(f"{out_root}/sweep_runs_both_gates.csv", index=False)
+    plot_gate_comparison(loaded, out_root, expected_neurons=expected_neurons)
+    return loaded
+
+
 if __name__ == "__main__":
     # ---- older sweeps ---------------------------------------------------
     # plot_token_overlap_vs_test_metrics("single_mlp_l10_n24_train")
@@ -474,11 +545,6 @@ if __name__ == "__main__":
     OUT_DIR = f"{ROOT}/outputs/plots/{EXP_GROUP}"
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    # gate="on" is the sweep proper; the group dir also holds gateoff trials
-    endo_df = load_endogenous_sweep(EXP_GROUP, gate="on")
-    report_endogenous_coverage(endo_df, expected_neurons=10)
-    endo_df.to_csv(f"{OUT_DIR}/sweep_runs.csv", index=False)   # per-run long table
-    plot_endogenous_heatmaps(endo_df, OUT_DIR)
-    plot_endogenous_lines(endo_df, OUT_DIR, hue="layer")
-    plot_endogenous_lines(endo_df, OUT_DIR, hue="neuron")
+    # both arms: each into its own subdir, plus the gate on/off comparison at the root
+    run_endogenous_sweep_plots(EXP_GROUP, OUT_DIR, gates=("on", "off"))
 
