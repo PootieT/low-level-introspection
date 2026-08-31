@@ -101,6 +101,15 @@ def parse_args():
     p.add_argument("--kl-anchor-coef-init", type=float, default=1.0)
     p.add_argument("--kl-anchor-coef-range", type=str, default="0.0001,1000",
                    help="Clamp for the adaptive coefficient (min,max).")
+    p.add_argument("--ood-eval", action="store_true",
+                   help="After the in-domain evals, score the readout on out-of-distribution "
+                        "corpora (see score_ood_generalization.py). Endogenous corr is the "
+                        "discriminating metric: a context-predicting readout collapses under "
+                        "shift, a causal one does not.")
+    p.add_argument("--ood-corpora", type=str, default=None,
+                   help="Comma-separated corpus names (default: shuffled,wikipedia,c4_zh,math). "
+                        "'shuffled' is the run's own test text with word order destroyed -- the "
+                        "cleanest control, and it needs no download.")
     p.add_argument("--skip-drift-eval", action="store_true",
                    help="Skip the activation-drift measurement (see measure_activation_drift). It runs "
                         "automatically whenever the adapter is active over the input text, because that "
@@ -441,6 +450,23 @@ class ActivationCaptureHook:
 TRANSMISSION_SITES = ("up_proj", "gate_proj")
 
 
+class VectorCaptureHook:
+    """Like ActivationCaptureHook but keeps the WHOLE vector at the position, not one
+    neuron. Used for the MLP's output: the target neuron's share of its layer's write
+    is only meaningful against the size of that write."""
+
+    def __init__(self, row_indices, token_positions):
+        self.row_indices = row_indices
+        self.token_positions = token_positions
+        self.captured = None
+
+    def __call__(self, module, inputs, outputs):
+        out = outputs[0] if isinstance(outputs, tuple) else outputs
+        pos = self.token_positions.clamp(0, out.shape[1] - 1)
+        self.captured = out[self.row_indices, pos].detach().float().cpu()
+        return None
+
+
 def _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offsets):
     """One forward over `batch`, capturing the target neuron at every offset AND the
     regression head's prediction from the same pass (the head reads the last-token
@@ -452,7 +478,8 @@ def _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offs
     bs = abs_pos.shape[0]
     out = {off: torch.full((bs,), float("nan")) for off in offsets}
     trans = {site: torch.full((bs,), float("nan")) for site in TRANSMISSION_SITES}
-    hooks, handles, trans_hooks = [], [], []
+    mlp_norm = torch.full((bs,), float("nan"))
+    hooks, handles, trans_hooks, mlp_hooks = [], [], [], []
     try:
         for layer in torch.unique(signal_layer).tolist():
             m = signal_layer == layer
@@ -469,6 +496,11 @@ def _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offs
                     act_path.rsplit(".", 1)[0] + "." + site)(model)
                 handles.append(site_module.register_forward_hook(site_hook))
                 trans_hooks.append((rows, site, site_hook))
+            # the whole MLP write at this token, for the neuron's share of it
+            mlp_hook = VectorCaptureHook(rows, abs_pos[m])
+            mlp_module = operator.attrgetter(act_path.rsplit(".", 1)[0])(model)
+            handles.append(mlp_module.register_forward_hook(mlp_hook))
+            mlp_hooks.append((rows, mlp_hook))
         outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
                         lora_token_mask=batch.get("lora_token_mask"), do_intervention=False)
     finally:
@@ -479,7 +511,11 @@ def _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offs
             out[off][rows.cpu()] = hook.captured[off]
     for rows, site, hook in trans_hooks:
         trans[site][rows.cpu()] = hook.captured[0]
+    for rows, hook in mlp_hooks:
+        if hook.captured is not None:
+            mlp_norm[rows.cpu()] = hook.captured.norm(dim=-1)
     out["_transmission"] = trans
+    out["_mlp_norm"] = mlp_norm
     head = model.regression_head
     h = outputs.hidden_states[-1][:, -1, :]
     preds = head(h.to(device=head.weight.device, dtype=head.weight.dtype)).squeeze(-1).float().cpu()
@@ -494,7 +530,13 @@ def _drift_stats(x, ref):
     return {
         "corr": _corr_or_nan(x, ref),
         "std_ratio": float(np.std(x) / ref_std) if ref_std > 1e-12 else float("nan"),
+        # raw means as well as the shift: "is the tuned value dominated by a constant?"
+        # needs mean and std on the same footing, not a difference
+        "mean_tuned": float(np.mean(x)),
+        "mean_base": float(np.mean(ref)),
         "mean_shift": float(np.mean(x) - np.mean(ref)),
+        "std_tuned": float(np.std(x)),
+        "std_base": ref_std,
         "rel_rmse": float(np.sqrt(np.mean((x - ref) ** 2)) / ref_std) if ref_std > 1e-12 else float("nan"),
     }
 
@@ -527,6 +569,7 @@ def measure_activation_drift(model, dataset, collator, config, output_dir, suffi
     base_all = {off: [] for off in offsets}
     trans_all = {"tuned": {s: [] for s in TRANSMISSION_SITES},
                  "base": {s: [] for s in TRANSMISSION_SITES}}
+    mlp_all = {"tuned": [], "base": []}
 
     for batch in dl:
         batch = batch.to(model.device)
@@ -547,6 +590,8 @@ def measure_activation_drift(model, dataset, collator, config, output_dir, suffi
         for site in TRANSMISSION_SITES:
             trans_all["tuned"][site].append(tuned["_transmission"][site])
             trans_all["base"][site].append(base["_transmission"][site])
+        mlp_all["tuned"].append(tuned["_mlp_norm"])
+        mlp_all["base"].append(base["_mlp_norm"])
         for off in offsets:
             tuned_all[off].append(tuned[off])
             base_all[off].append(base[off])
@@ -556,13 +601,32 @@ def measure_activation_drift(model, dataset, collator, config, output_dir, suffi
     pos = torch.cat(pos_all).numpy()
     tuned = {off: torch.cat(v).numpy() for off, v in tuned_all.items()}
     base = {off: torch.cat(v).numpy() for off, v in base_all.items()}
-    transmission = {}
+    transmission, site_vals = {}, {}
     for site in TRANSMISSION_SITES:
         t, b = (torch.cat(trans_all["tuned"][site]).numpy(),
                 torch.cat(trans_all["base"][site]).numpy())
-        stats = _drift_stats(t, b)
-        stats["std_tuned"], stats["std_base"] = float(np.std(t)), float(np.std(b))
-        transmission[site] = stats
+        site_vals[site] = (t, b)
+        transmission[site] = _drift_stats(t, b)
+
+    # What actually reaches the residual stream is the PRODUCT a[n]*u[n], scaled by the
+    # (fixed) down_proj column. Measuring the factors separately understates the
+    # channel: a 30% smaller signal times a 20x larger gate is still a large boost.
+    prod_t = tuned[TRAIN_OFFSET] * site_vals["up_proj"][0]
+    prod_b = base[TRAIN_OFFSET] * site_vals["up_proj"][1]
+    transmission["product_act_x_up"] = _drift_stats(prod_t, prod_b)
+    denom = float(np.mean(np.abs(prod_b)))
+    transmission["product_act_x_up"]["abs_mean_ratio"] = (
+        float(np.mean(np.abs(prod_t)) / denom) if denom > 1e-12 else float("nan"))
+
+    # ... and against the size of the whole MLP write at that token: if the layer's
+    # output grew by the same factor, nothing was singled out.
+    mlp_t, mlp_b = (torch.cat(mlp_all["tuned"]).numpy(), torch.cat(mlp_all["base"]).numpy())
+    mlp_ok = np.isfinite(mlp_t) & np.isfinite(mlp_b) & (mlp_b > 1e-12)
+    transmission["mlp_output_norm"] = {
+        "mean_tuned": float(np.mean(mlp_t[mlp_ok])) if mlp_ok.any() else float("nan"),
+        "mean_base": float(np.mean(mlp_b[mlp_ok])) if mlp_ok.any() else float("nan"),
+        "norm_ratio": float(np.mean(mlp_t[mlp_ok] / mlp_b[mlp_ok])) if mlp_ok.any() else float("nan"),
+    }
 
     # ---- alignment: which offset reproduces the cache? ----
     alignment = [dict(offset=off, **_drift_stats(base[off], cached)) for off in offsets]
@@ -680,10 +744,25 @@ def measure_activation_drift(model, dataset, collator, config, output_dir, suffi
               "target now needs the recompute explanation ruled out: check whether corr(tuned,cached) "
               "exceeds corr(tuned,base) -- reading the live neuron cannot beat the live neuron itself.")
     print("[transmission] target neuron's MLP path, tuned vs base at the same site:")
-    for site, st in transmission.items():
-        print(f"    {site:10s} corr={st['corr']:.4f}  std_ratio={st['std_ratio']:.3f} "
-              f"(std {st['std_base']:.4f} -> {st['std_tuned']:.4f})  "
-              f"mean_shift={st['mean_shift']:+.4f}")
+    for site in list(TRANSMISSION_SITES) + ["product_act_x_up"]:
+        st = transmission[site]
+        # CV = std/|mean|: small => the value is dominated by a constant, which is how
+        # a bias-free projection turns a context-dependent gate into a fixed gain
+        cv = abs(st["std_tuned"] / st["mean_tuned"]) if abs(st["mean_tuned"]) > 1e-12 else float("nan")
+        print(f"    {site:18s} corr={st['corr']:+.4f}  std_ratio={st['std_ratio']:.3f}  "
+              f"mean {st['mean_base']:+.4f} -> {st['mean_tuned']:+.4f}  "
+              f"std {st['std_base']:.4f} -> {st['std_tuned']:.4f}  CV_tuned={cv:.3f}")
+    prod = transmission["product_act_x_up"]
+    mlp = transmission["mlp_output_norm"]
+    print(f"    {'mlp_output_norm':18s} mean {mlp['mean_base']:.4f} -> {mlp['mean_tuned']:.4f}  "
+          f"ratio={mlp['norm_ratio']:.3f}")
+    if np.isfinite(prod.get("abs_mean_ratio", float("nan"))) and np.isfinite(mlp["norm_ratio"]):
+        print(f"[transmission] the neuron's scalar into the residual changed "
+              f"{prod['abs_mean_ratio']:.2f}x while the whole MLP write changed "
+              f"{mlp['norm_ratio']:.2f}x"
+              + (" => this ONE neuron was singled out"
+                 if prod["abs_mean_ratio"] > 2 * mlp["norm_ratio"] else
+                 " => no more than the layer as a whole"))
     up = transmission.get("up_proj", {})
     gate = transmission.get("gate_proj", {})
     if up and gate:
@@ -1034,6 +1113,14 @@ def main():
     scales = [float(x) for x in args.scale_sweep.split(",")]
     interventional_scale_sweep(model, test_dataset_pred, pred_collator, config, eval_out_dir,
                                scales=scales, n_pca=args.routing_probe_pca)
+
+    if args.ood_eval:
+        # lazy import: score_ood_generalization imports this module's eval helpers
+        from score_ood_generalization import evaluate_ood, DEFAULT_CORPORA
+        corpora = ([c.strip() for c in args.ood_corpora.split(",")]
+                   if args.ood_corpora else DEFAULT_CORPORA)
+        evaluate_ood(model, config, tokenizer, pred_collator,
+                     preprocess_fn=preprocess, output_dir=eval_out_dir, corpora=corpora)
 
     # fp32 overlay: if natural-scale corr lifts toward the large-scale plateau when
     # cast to fp32, the natural-scale failure was a bf16 numerical floor.

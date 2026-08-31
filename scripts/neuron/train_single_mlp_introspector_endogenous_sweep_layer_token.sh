@@ -85,6 +85,10 @@ LORA_ALPHA=$((LORA_R * 2))
 LORA_DO=0.0
 BS=32
 SCALE=10                 # only affects the post-training interventional diagnostics
+# OOD generalization eval on EVERY run: 3K examples per corpus, a couple of
+# minutes each, and the per-(cell, corpus) activation cache is built once and
+# shared by the cell's 5 neurons (and by both regimes).
+OOD_FLAG="--ood-eval"
 OVERWRITE=""             # set to --overwrite-cache to force regeneration
 
 if [ "$GATE" = "on" ]; then GATE_FLAG="--disable-adapter-in-input"; else GATE_FLAG=""; fi
@@ -181,5 +185,6 @@ for SAMPLE in $(seq 0 $((N_NEURONS - 1))); do
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $DRIFT \
+      $OOD_FLAG \
       $OVERWRITE
 done
