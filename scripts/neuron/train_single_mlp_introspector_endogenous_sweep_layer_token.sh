@@ -64,22 +64,35 @@ export WANDB_RUN_GROUP=mlp_endo_sweep_layer_token
 set -e
 
 ## ---- decode (layer, position) from the flat array index ----
+# GATE is the OUTER dimension (tasks 1-64 = gate on, 65-128 = gate off): both arms of a
+# cell share its cached dataset, so keeping them 64 tasks apart stops concurrent slots
+# racing to build the same directory. Set "#$ -t 1-128" for the full sweep.
 index=$(($SGE_TASK_ID-1))
 LAYERS=(0 2 4 6 8 10 12 14)
 POSS=(-1 -4 -8 -12 -16 -20 -24 -28)
-LAYER=${LAYERS[$((index / 8))]}
-TOKEN_POS=${POSS[$((index % 8))]}
+GATES=(on off)
+GATE=${GATES[$((index / 64))]}
+cell_idx=$((index % 64))
+LAYER=${LAYERS[$((cell_idx / 8))]}
+TOKEN_POS=${POSS[$((cell_idx % 8))]}
 #     eval_type  layer  position  n_neurons   jobid
 #    endogenous      4       -24          7   63
 #    endogenous     10        -8          1   43
 #    endogenous     14       -24         10   23
-GATE=off                  # on = gated (matches the old sweep; the model cannot move
-                         # the neuron it reports, so endogenous corr means "read or
-                         # predict the TRUE activation"). off = second arm, where the
-                         # recompute shortcut is available and the drift eval fires.
+# GATE now comes from the array index -- both arms in one submission:
+#   on  = gated. No trainable parameter touches the introspected token, so the model
+#         cannot read the neuron: interventional corr pins at 0, and whatever endogenous
+#         score it gets is context bypass.
+#   off = the adapter reaches the site, and the same objective produces causal reading.
 W=1.0                    # weight on the ENDOGENOUS term; 1.0 => no interventional loss
 SEED=21                  # neuron-selection seed (now actually used)
-N_NEURONS=10
+# The DATASET carries N_NEURONS_CACHE signals; we TRAIN on the first
+# N_NEURONS_TRAIN of them. Keeping the cached list at 10 means the canonical dataset
+# key matches the caches already built for the 10-neuron sweep, so a 5-neuron run
+# reuses them instead of triggering 64 fresh caching passes over 300K examples.
+# (--signal-filter is not part of the cache identity, so all neurons share one dataset.)
+N_NEURONS_CACHE=10
+N_NEURONS_TRAIN=5
 LR=5e-5
 LORA_R=16
 LORA_ALPHA=$((LORA_R * 2))
@@ -96,7 +109,7 @@ if [ "$GATE" = "on" ]; then GATE_FLAG="--disable-adapter-in-input"; else GATE_FL
 
 EXP_GROUP=mlp_endo_sweep_layer_token
 CELL="l${LAYER}_pos${TOKEN_POS}"
-SAMPLER="{\"type\":\"uniform_layer_sampler\",\"signal_type\":\"mlp\",\"layers\":[${LAYER}],\"signals_per_layer\":${N_NEURONS},\"seed\":${SEED}}"
+SAMPLER="{\"type\":\"uniform_layer_sampler\",\"signal_type\":\"mlp\",\"layers\":[${LAYER}],\"signals_per_layer\":${N_NEURONS_CACHE},\"seed\":${SEED}}"
 
 ## ---- resolve this layer's neuron set ONCE (identical at every position) ----
 # generated, not run: it exists so resolution.py stays the single source of truth for
@@ -128,7 +141,7 @@ print(' '.join(f\"N{s['layer']}.{s['index']}\" for s in cfg['train_signals']))
 NEURON_LIST=$(IFS=,; echo "${NEURONS[*]}")
 echo "cell $CELL neurons: $NEURON_LIST"
 
-for SAMPLE in $(seq 0 $((N_NEURONS - 1))); do
+for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
   SIG=${NEURONS[$SAMPLE]}
   EXP_NAME="endo_${SIG}_POS${TOKEN_POS}_gate${GATE}_w${W}_300K"
   CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json

@@ -35,7 +35,7 @@ reuse — migrate a script into this directory rather than running it in place.
 | script | what it sweeps                                                                                                                                                                                                                  |
 |---|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `neuron/train_single_mlp_introspector_regressor_joint_loss_prev_token_hyper.sh` | learning rate (6 arms) for joint training on one neuron at random positions in [-31,-1]; `GATE` switches the gated control arm; this is mostly a playground script to test out new features, and manual hyper-parameter tunning |
-| `neuron/train_single_mlp_introspector_endogenous_sweep_layer_token.sh` | 8 layers x 8 positions x 10 neurons, endogenous only (`W=1.0`); one array task per (layer, position) cell, 10 neurons inside it sharing one cached dataset |
+| `neuron/train_single_mlp_introspector_endogenous_sweep_layer_token.sh` | endogenous only (`W=1.0`): 8 layers x 8 positions x 5 neurons x {gate on, gate off}; the SFT baseline the joint grid is compared against |
 | `neuron/train_single_mlp_introspector_joint_weight_sweep.sh` | joint-loss weight `W` at 3 (layer, position, KL-budget) cells x 5 neurons = 90 runs; fixes `W` for the main grid and gives the endogenous-vs-interventional pareto with error bars |
 | `neuron/train_single_mlp_introspector_joint_sweep_layer_token.sh` | MAIN GRID: 8 layers x 8 positions x 5 neurons in two cost regimes (KL budget 0.1, and unanchored for the ceiling + measured cost) = 640 runs |
 

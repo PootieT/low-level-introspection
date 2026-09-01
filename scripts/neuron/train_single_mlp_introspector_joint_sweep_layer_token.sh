@@ -88,7 +88,13 @@ fi
 GATE=off
 W=0.01
 SEED=21
-N_NEURONS=5
+# The DATASET carries N_NEURONS_CACHE signals; we TRAIN on the first
+# N_NEURONS_TRAIN of them. Keeping the cached list at 10 means the canonical dataset
+# key matches the caches already built for the 10-neuron sweep, so a 5-neuron run
+# reuses them instead of triggering 64 fresh caching passes over 300K examples.
+# (--signal-filter is not part of the cache identity, so all neurons share one dataset.)
+N_NEURONS_CACHE=10
+N_NEURONS_TRAIN=5
 SCALE=10
 LR=5e-5
 LORA_R=16
@@ -108,7 +114,7 @@ if [ "$GATE" = "on" ]; then GATE_FLAG="--disable-adapter-in-input"; else GATE_FL
 
 EXP_GROUP=mlp_joint_grid_layer_token
 CELL_TAG="l${LAYER}_pos${TOKEN_POS}"
-SAMPLER="{\"type\":\"uniform_layer_sampler\",\"signal_type\":\"mlp\",\"layers\":[${LAYER}],\"signals_per_layer\":${N_NEURONS},\"seed\":${SEED}}"
+SAMPLER="{\"type\":\"uniform_layer_sampler\",\"signal_type\":\"mlp\",\"layers\":[${LAYER}],\"signals_per_layer\":${N_NEURONS_CACHE},\"seed\":${SEED}}"
 echo "cell=$CELL_TAG regime=$REGIME"
 
 ## ---- resolve this layer's neuron set ONCE (identical at every position/regime) ----
@@ -139,7 +145,7 @@ print(' '.join(f\"N{s['layer']}.{s['index']}\" for s in cfg['train_signals']))
 NEURON_LIST=$(IFS=,; echo "${NEURONS[*]}")
 echo "cell $CELL_TAG neurons: $NEURON_LIST"
 
-for SAMPLE in $(seq 0 $((N_NEURONS - 1))); do
+for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
   SIG=${NEURONS[$SAMPLE]}
   EXP_NAME="joint_${SIG}_POS${TOKEN_POS}_gate${GATE}_scale${SCALE}_${KL_TAG}_w${W}_300K"
   CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
