@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1-18
+#$ -t 14,15
 
 # ============================================================================
 # Joint-loss WEIGHT sweep: fixes W for the main layer x token grid, and produces the
@@ -55,7 +55,7 @@ export WANDB_RUN_GROUP=mlp_joint_weight_sweep
 set -e
 
 ## ---- decode (cell, weight) from the flat array index ----
-index=$(($SGE_TASK_ID-1))
+index=$(($SGE_TASK_ID-1))  # missing job id: 7, 14, 15
 # cell := layer:position:kl_budget
 CELLS=("2:-1:0.1" "10:-1:0.1" "10:-28:3.0")
 WS=(0.0 0.01 0.03 0.1 0.3 1.0)

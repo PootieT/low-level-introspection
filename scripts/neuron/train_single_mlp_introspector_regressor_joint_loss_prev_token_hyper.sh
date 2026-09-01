@@ -5,11 +5,11 @@
 #$ -l gpus=1
 #$ -l gpu_c=8.5
 #$ -l gpu_memory=47G
-#$ -l h_rt=6:00:00
+#$ -l h_rt=3:00:00
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1-7
+#$ -t 1-8
 
 # ============================================================================
 # LR sweep for joint (endogenous + interventional) training on ONE mlp neuron,
@@ -79,7 +79,7 @@ GATE=off                 # off = adapter active over input text (working setup) 
 W=0.01                   # weight on the ENDOGENOUS term; interventional gets (1-W)
 SCALE=10                 # injected-value spread (extreme distribution)
 SIG=10.24                # layer.neuron
-TOKEN_POS=-1     #'-1:-31'
+TOKEN_POS=-28     #'-1:-31'
 LORA_R=16
 LORA_ALPHA=$((LORA_R * 2))
 LORA_DO=0.0
@@ -87,8 +87,10 @@ BS=32
 #LRS=(1e-5 2e-5 3e-5 5e-5 1e-4 2e-4)
 #LR=${LRS[$index]}
 LR=5e-5
-KLS=(0.001 0.003 0.01 0.03 0.1 0.3 1.0)
+KLS=(0.001 0.003 0.01 0.03 0.1 0.3 1.0 3.0)
 KL=${KLS[$index]}
+KL=3.0
+
 
 # set to --overwrite-cache to force config/dataset/run regeneration
 OVERWRITE=""
@@ -96,8 +98,8 @@ OVERWRITE=""
 if [ "$GATE" = "on" ]; then GATE_FLAG="--disable-adapter-in-input"; else GATE_FLAG=""; fi
 
 EXP_GROUP=mlp_joint_prev_token_hyper
-#EXP_NAME="joint_N${SIG}_POS${TOKEN_POS}_gate${GATE}_scale${SCALE}_kl${KL}_w${W}"
-EXP_NAME="joint_N${SIG}_POS${TOKEN_POS}_gate${GATE}_scale${SCALE}_w${W}"
+EXP_NAME="joint_N${SIG}_POS${TOKEN_POS}_gate${GATE}_scale${SCALE}_kl${KL}_w${W}"
+#EXP_NAME="joint_N${SIG}_POS${TOKEN_POS}_gate${GATE}_scale${SCALE}_w${W}"
 CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
 echo "$EXP_NAME"
 
@@ -150,8 +152,9 @@ python train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     --force-drift-eval \
+    --kl-anchor-target $KL \
+    --diag-only \
     $OVERWRITE
-#    --kl-anchor-target $KL \
 
 # post training analysis of each checkpoint (same config => same gating as training)
 #for CK in outputs/runs/$EXP_GROUP/$EXP_NAME/checkpoint-*; do
@@ -167,5 +170,4 @@ python train_introspector_joint.py \
 #python score_lm_degradation.py --config "$CONFIG"
 
 # evaluate how far model+LoRA has drifted from original model (small benchmark)
-#python score_lighteval_benchmarks.py --list-tasks | grep -i arc:easy
-python score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200
+#python score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200

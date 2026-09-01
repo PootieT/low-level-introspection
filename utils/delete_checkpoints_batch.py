@@ -191,12 +191,11 @@ def strip_embedding_tensors(exp_pattern: str, n_added_tokens: int = 1,
 
 
 if __name__ == "__main__":
-    GROUP = "outputs/runs/mlp_endo_sweep_layer_token"
+    GROUP = "outputs/runs/mlp_joint_weight_sweep"
     # Adapter weights: keep ONE neuron per (layer, position, gate) cell so the
     # weight-pattern analysis still has something to read. Set DRY_RUN=False to act.
-    DRY_RUN = True
-    delete_files_matching_pattern(f"{GROUP}/*/checkpoint-*/adapter_model.safetensors",
-                                  keep_per_cell=1, dry_run=DRY_RUN)
+    DRY_RUN = False
+    delete_files_matching_pattern(f"{GROUP}/*/checkpoint-*/adapter_model.safetensors", keep_per_cell=1, dry_run=DRY_RUN)
     # Optimizer state and the tokenizer copy are never needed again -> delete all.
     delete_files_matching_pattern(f"{GROUP}/*/checkpoint-*/optimizer.pt", dry_run=DRY_RUN)
     delete_files_matching_pattern(f"{GROUP}/*/checkpoint-*/tokenizer.json", dry_run=DRY_RUN)

@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 4
+#$ -t 58,61
 
 # ============================================================================
 # ENDOGENOUS-ONLY (no interventional loss) regressor sweep over
@@ -64,15 +64,16 @@ export WANDB_RUN_GROUP=mlp_endo_sweep_layer_token
 set -e
 
 ## ---- decode (layer, position) from the flat array index ----
-#index=$(($SGE_TASK_ID-1))
-index=63
-
+index=$(($SGE_TASK_ID-1))
 LAYERS=(0 2 4 6 8 10 12 14)
 POSS=(-1 -4 -8 -12 -16 -20 -24 -28)
 LAYER=${LAYERS[$((index / 8))]}
 TOKEN_POS=${POSS[$((index % 8))]}
-
-GATE=on                  # on = gated (matches the old sweep; the model cannot move
+#     eval_type  layer  position  n_neurons   jobid
+#    endogenous      4       -24          7   63
+#    endogenous     10        -8          1   43
+#    endogenous     14       -24         10   23
+GATE=off                  # on = gated (matches the old sweep; the model cannot move
                          # the neuron it reports, so endogenous corr means "read or
                          # predict the TRUE activation"). off = second arm, where the
                          # recompute shortcut is available and the drift eval fires.
