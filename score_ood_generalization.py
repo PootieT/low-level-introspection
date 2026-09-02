@@ -153,29 +153,28 @@ def ensure_cache(config_path: Path):
     return proc
 
 
-def evaluate_ood(model, base_config: ExperimentConfig, tokenizer, collator, preprocess_fn,
-                 output_dir, corpora=DEFAULT_CORPORA, n_test=DEFAULT_N_TEST, seed=0):
+def prepare_ood_caches(base_config: ExperimentConfig, corpora=DEFAULT_CORPORA,
+                       n_test=DEFAULT_N_TEST, seed=0):
     """
-    Evaluate an already-built model on each OOD corpus. Takes the live model so this can
-    run at the end of training with no reload; --diag-only gives the same path for an
-    existing checkpoint.
+    Build the OOD activation caches. CALL THIS BEFORE THE CALLER LOADS ITS MODEL.
 
-    Returns a DataFrame and writes ood_generalization.{csv,json} into output_dir.
+    cache_signals runs as a subprocess and needs the GPU to extract activations. If the
+    parent already holds the device, that second CUDA context fails with "CUDA-capable
+    device(s) is/are busy or unavailable" -- which is what happens if caching is
+    deferred until evaluation time.
+
+    Returns {corpus: config_path or None}; failures are recorded, not raised, so one
+    unavailable dataset does not cost the others.
     """
-    # imported here: the training script imports THIS module, so a module-level import
-    # of its eval helpers would be circular
-    from train_introspector_joint import eval_endogenous_test
-    from train_introspector_with_intervention import evaluate_interventional_test
-
-    output_dir = Path(output_dir)
     config_dir = Path("experiment_configs") / "_ood"
-    rows = []
+    prepared, errors = {}, {}
     for corpus in corpora:
         spec = OOD_CORPORA.get(corpus)
         if spec is None:
-            print(f"[ood] unknown corpus {corpus!r}; known: {sorted(OOD_CORPORA)}")
+            errors[corpus] = f"unknown corpus (known: {sorted(OOD_CORPORA)})"
+            prepared[corpus] = None
             continue
-        print(f"\n[ood] ===== {corpus} =====")
+        print(f"[ood] preparing cache: {corpus}")
         try:
             spec = spec.copy()
             if spec.pop("shuffled", False):
@@ -184,7 +183,47 @@ def evaluate_ood(model, base_config: ExperimentConfig, tokenizer, collator, prep
                 spec["hf_data_kwargs"] = {"data_files": str(jsonl), "streaming": True}
             cfg_path = derive_config(base_config, corpus, spec, config_dir, n_test)
             ensure_cache(cfg_path)
-            cfg = ExperimentConfig.model_validate_json(cfg_path.read_text())
+            prepared[corpus] = cfg_path
+        except Exception as e:
+            print(f"[ood] {corpus} cache FAILED ({type(e).__name__}: {e})")
+            errors[corpus] = f"{type(e).__name__}: {e}"
+            prepared[corpus] = None
+    prepare_ood_caches.errors = errors
+    return prepared
+
+
+def evaluate_ood(model, base_config: ExperimentConfig, tokenizer, collator, preprocess_fn,
+                 output_dir, corpora=DEFAULT_CORPORA, n_test=DEFAULT_N_TEST, seed=0,
+                 prepared=None):
+    """
+    Evaluate an already-built model on each OOD corpus.
+
+    `prepared` comes from prepare_ood_caches, which must have run BEFORE the model was
+    loaded (see its docstring). Passing None falls back to preparing here, which works
+    only if nothing else holds the GPU.
+    """
+    # imported here: the training script imports THIS module, so a module-level import
+    # of its eval helpers would be circular
+    from train_introspector_joint import eval_endogenous_test
+    from train_introspector_with_intervention import evaluate_interventional_test
+
+    output_dir = Path(output_dir)
+    if prepared is None:
+        print("[ood] WARNING: caches not prepared before the model was loaded; building "
+              "them now. If the GPU is already held this fails with "
+              "'CUDA-capable device(s) is/are busy or unavailable'.")
+        prepared = prepare_ood_caches(base_config, corpora, n_test, seed)
+    errors = getattr(prepare_ood_caches, "errors", {})
+
+    rows = []
+    for corpus in corpora:
+        cfg_path = prepared.get(corpus)
+        if cfg_path is None:
+            rows.append({"corpus": corpus, "error": errors.get(corpus, "cache not prepared")})
+            continue
+        print(f"\n[ood] ===== {corpus} =====")
+        try:
+            cfg = ExperimentConfig.model_validate_json(Path(cfg_path).read_text())
             raw = load_from_disk(str(cfg.dataset_cache_dir / "test"))
             raw = apply_signal_filter(raw, base_config.signal_filter, f"ood/{corpus}")
             acts = np.asarray(raw["activation"], dtype=float)
@@ -207,18 +246,17 @@ def evaluate_ood(model, base_config: ExperimentConfig, tokenizer, collator, prep
                 "activation_frac_zero": float(np.mean(np.abs(acts) < 1e-6)),
             })
         except Exception as e:
-            print(f"[ood] {corpus} FAILED ({type(e).__name__}: {e}); continuing")
+            print(f"[ood] {corpus} eval FAILED ({type(e).__name__}: {e}); continuing")
             rows.append({"corpus": corpus, "error": f"{type(e).__name__}: {e}"})
 
     df = pd.DataFrame(rows)
     df.to_csv(output_dir / "ood_generalization.csv", index=False)
     with open(output_dir / "ood_generalization.json", "w") as f:
-        json.dump({"signal_filter": base_config.signal_filter,
-                   "rows": rows}, f, indent=2, default=str)
+        json.dump({"signal_filter": base_config.signal_filter, "rows": rows}, f,
+                  indent=2, default=str)
     print("\n[ood] generalization summary:")
     print(df.to_string(index=False))
-    ok = df[df.get("activation_std", pd.Series(dtype=float)).fillna(0) > 1e-6] if "activation_std" in df else df
-    if "activation_std" in df and len(ok) < len(df.dropna(subset=["corpus"])):
+    if "activation_std" in df and (df["activation_std"].fillna(1) <= 1e-6).any():
         print("[ood] NOTE: some corpora have near-zero activation variance for this "
               "neuron; their correlations are not interpretable.")
     return df

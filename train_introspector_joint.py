@@ -989,6 +989,17 @@ def main():
     dev_dataset = dev_raw.map(preprocess, remove_columns=dev_raw.column_names)
     test_dataset_pred = test_raw.map(preprocess, remove_columns=test_raw.column_names)
 
+    # ---- OOD caches BEFORE the model loads ----
+    # cache_signals runs as a subprocess and needs the GPU itself; once this process has
+    # a model on the device, that second CUDA context fails with "CUDA-capable device(s)
+    # is/are busy or unavailable". Preparing here keeps the device free for it.
+    ood_prepared, ood_corpora = None, None
+    if args.ood_eval or args.ood_only:
+        from score_ood_generalization import prepare_ood_caches, DEFAULT_CORPORA
+        ood_corpora = ([c.strip() for c in args.ood_corpora.split(",")]
+                       if args.ood_corpora else list(DEFAULT_CORPORA))
+        ood_prepared = prepare_ood_caches(config, corpora=ood_corpora)
+
     # ---- model (regressor + gated LoRA) ----
     base = AutoModelForCausalLM.from_pretrained(
         config.model_name, device_map="auto",
@@ -1037,12 +1048,11 @@ def main():
         # everything needed for the OOD pass exists by now (checkpoint loaded, collator
         # built); skip the Trainer entirely and write into the RUN dir so the results
         # replace the failed ones and the aggregator finds them
-        from score_ood_generalization import evaluate_ood, DEFAULT_CORPORA
-        corpora = ([c.strip() for c in args.ood_corpora.split(",")]
-                   if args.ood_corpora else DEFAULT_CORPORA)
-        print(f"[joint] --ood-only: {diag_ckpt} -> {output_dir} | corpora={list(corpora)}")
+        from score_ood_generalization import evaluate_ood
+        print(f"[joint] --ood-only: {diag_ckpt} -> {output_dir} | corpora={ood_corpora}")
         evaluate_ood(model, config, tokenizer, pred_collator,
-                     preprocess_fn=preprocess, output_dir=output_dir, corpora=corpora)
+                     preprocess_fn=preprocess, output_dir=output_dir,
+                     corpora=ood_corpora, prepared=ood_prepared)
         return
 
     # checkpoint frequency: 0 => per epoch; >0 => every save_steps (float <1 = ratio of total steps)
@@ -1137,11 +1147,10 @@ def main():
 
     if args.ood_eval:
         # lazy import: score_ood_generalization imports this module's eval helpers
-        from score_ood_generalization import evaluate_ood, DEFAULT_CORPORA
-        corpora = ([c.strip() for c in args.ood_corpora.split(",")]
-                   if args.ood_corpora else DEFAULT_CORPORA)
+        from score_ood_generalization import evaluate_ood
         evaluate_ood(model, config, tokenizer, pred_collator,
-                     preprocess_fn=preprocess, output_dir=eval_out_dir, corpora=corpora)
+                     preprocess_fn=preprocess, output_dir=eval_out_dir,
+                     corpora=ood_corpora, prepared=ood_prepared)
 
     # fp32 overlay: if natural-scale corr lifts toward the large-scale plateau when
     # cast to fp32, the natural-scale failure was a bf16 numerical floor.
