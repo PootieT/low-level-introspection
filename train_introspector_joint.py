@@ -106,6 +106,12 @@ def parse_args():
                         "corpora (see score_ood_generalization.py). Endogenous corr is the "
                         "discriminating metric: a context-predicting readout collapses under "
                         "shift, a causal one does not.")
+    p.add_argument("--ood-only", action="store_true",
+                   help="Load the checkpoint and run ONLY the OOD eval -- no training, and "
+                        "none of the other diagnostics. Results are written into the RUN dir "
+                        "(not a diag_* subdir) so they overwrite a previous ood_generalization.* "
+                        "and stay where the aggregator looks. Use this to redo an OOD pass that "
+                        "failed without retraining.")
     p.add_argument("--ood-corpora", type=str, default=None,
                    help="Comma-separated corpus names (default: shuffled,wikipedia,c4_zh,math). "
                         "'shuffled' is the run's own test text with word order destroyed -- the "
@@ -939,7 +945,8 @@ def main():
     cache_dir = config.dataset_cache_dir
     output_dir = Path(config.output_dir) / config.experiment_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    if (output_dir / "routing_probe_by_position.csv").exists() and not args.overwrite_cache and not args.diag_only:
+    if ((output_dir / "routing_probe_by_position.csv").exists()
+            and not args.overwrite_cache and not args.diag_only and not args.ood_only):
         print(f"Experiments ran already, skipping.. {output_dir}")
         return
 
@@ -988,14 +995,16 @@ def main():
         torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32)
     base.resize_token_embeddings(len(tokenizer))
     diag_ckpt = None
-    if args.diag_only:
+    load_from_ckpt = args.diag_only or args.ood_only
+    if load_from_ckpt:
         # load a specific (possibly mid-run) checkpoint's adapter for eval WITHOUT training
         from peft import PeftModel
         ckpts = glob.glob(f"{output_dir}/checkpoint-*")
         diag_ckpt = Path(args.checkpoint) if args.checkpoint else (
             Path(max(ckpts, key=os.path.getctime)) if ckpts else None)
         if diag_ckpt is None:
-            raise SystemExit("--diag-only needs a checkpoint (none found; pass --checkpoint).")
+            raise SystemExit("--diag-only/--ood-only need a checkpoint "
+                             "(none found; pass --checkpoint).")
         model = PeftModel.from_pretrained(base, str(diag_ckpt), autocast_adapter_dtype=False)
     else:
         peft_config = LoraConfig(
@@ -1008,7 +1017,7 @@ def main():
         model, signal_ranges=signal_ranges,
         intervention_distribution=config.training_config.intervention_signal_distribution,
         intervention_extreme_scale=config.training_config.intervention_extreme_scale)
-    if args.diag_only:
+    if load_from_ckpt:
         load_regression_head(model, str(diag_ckpt))
         # no-op unless the checkpoint's frozen embeddings were stripped to save disk
         load_added_token_embeddings(model, str(diag_ckpt))
@@ -1023,6 +1032,18 @@ def main():
           f"{config.training_config.lora_dropout}")
     pred_collator = collator_cls(tokenizer=tokenizer, model=model, padding=True,
                                  label_pad_token_id=-100, return_tensors="pt", for_prediction=True)
+
+    if args.ood_only:
+        # everything needed for the OOD pass exists by now (checkpoint loaded, collator
+        # built); skip the Trainer entirely and write into the RUN dir so the results
+        # replace the failed ones and the aggregator finds them
+        from score_ood_generalization import evaluate_ood, DEFAULT_CORPORA
+        corpora = ([c.strip() for c in args.ood_corpora.split(",")]
+                   if args.ood_corpora else DEFAULT_CORPORA)
+        print(f"[joint] --ood-only: {diag_ckpt} -> {output_dir} | corpora={list(corpora)}")
+        evaluate_ood(model, config, tokenizer, pred_collator,
+                     preprocess_fn=preprocess, output_dir=output_dir, corpora=corpora)
+        return
 
     # checkpoint frequency: 0 => per epoch; >0 => every save_steps (float <1 = ratio of total steps)
     save_kwargs = ({"save_strategy": "epoch"} if config.training_config.save_steps <= 0
