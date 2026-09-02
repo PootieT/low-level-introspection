@@ -391,22 +391,24 @@ def main():
 
     set_seed(config.seed)
 
-    # load datasets from hf
-    if "config" in config.train_dataset.hf_data_kwargs:
-        rest_kwargs = {k:v for k,v in config.train_dataset.hf_data_kwargs.items() if k != "config"}
-        hf_dataset_train = load_dataset(config.train_dataset.name, config.train_dataset.hf_data_kwargs["config"],
-                                        split=config.train_dataset.split, **rest_kwargs)
-        hf_dataset_dev = load_dataset(config.train_dataset.name, config.train_dataset.hf_data_kwargs["config"],
-                                        split=config.dev_dataset.split, **rest_kwargs)
-        hf_dataset_test = load_dataset(config.test_dataset.name, config.test_dataset.hf_data_kwargs["config"],
-                                       split=config.test_dataset.split, **rest_kwargs)
-    else:
-        hf_dataset_train = load_dataset(config.train_dataset.name, split=config.train_dataset.split,
-                                        **config.train_dataset.hf_data_kwargs)
-        hf_dataset_dev = load_dataset(config.train_dataset.name, split=config.dev_dataset.split,
-                                        **config.train_dataset.hf_data_kwargs)
-        hf_dataset_test = load_dataset(config.test_dataset.name, split=config.test_dataset.split,
-                                       **config.test_dataset.hf_data_kwargs)
+    # load datasets from hf. Each split is loaded from ITS OWN DatasetConfig: the
+    # previous version branched on whether the TRAIN kwargs carried "config" and then
+    # indexed config.test_dataset.hf_data_kwargs["config"] unconditionally, so a test
+    # corpus without a config key raised KeyError, and the test split silently inherited
+    # the train split's remaining kwargs (dropping e.g. data_files). That only ever
+    # showed up once train and test came from different corpora -- as in the OOD eval.
+    # dev keeps using the TRAIN corpus with the dev split, which is the original behaviour.
+    def _load_split(ds_cfg, split=None):
+        kwargs = dict(ds_cfg.hf_data_kwargs)
+        name_config = kwargs.pop("config", None)
+        split = split or ds_cfg.split
+        if name_config is not None:
+            return load_dataset(ds_cfg.name, name_config, split=split, **kwargs)
+        return load_dataset(ds_cfg.name, split=split, **kwargs)
+
+    hf_dataset_train = _load_split(config.train_dataset)
+    hf_dataset_dev = _load_split(config.train_dataset, split=config.dev_dataset.split)
+    hf_dataset_test = _load_split(config.test_dataset)
 
     # assume dataset is large and is not truncated so using streaming mode
     if isinstance(hf_dataset_train, IterableDataset):
