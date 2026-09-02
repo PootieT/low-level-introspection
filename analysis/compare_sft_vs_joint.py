@@ -288,37 +288,51 @@ def plot_delta_heatmap(merged, metric, label_a, label_b, out_dir):
     print(f"[cmp] wrote {path}")
 
 
-def main(arms: dict, baseline: str, out_dir):
-    """arms: {label: {"group": ..., "filters": {...}}}. Each non-baseline arm is paired
-    against the baseline separately (a 3-way join would drop any cell missing from any
-    one arm, which is exactly the cell you want reported instead)."""
+def main(arms: dict, out_dir, pairs=None):
+    """
+    arms:  {label: {"group": ..., "filters": {...}}}
+    pairs: [(a, b), ...] to compare as a-minus-b. Default: every joint arm against
+           every sft arm.
+
+    Pairwise rather than one joint table: a join across all arms would drop any cell
+    missing from any one of them, which is exactly the cell the missing-run report
+    exists to surface.
+    """
     os.makedirs(out_dir, exist_ok=True)
     expected = expected_grid()
     frames, missing = {}, {}
     for label, spec in arms.items():
         print(f"\n[cmp] ===== {label} =====")
-        frames[label] = load_group(spec["group"], **spec.get("filters", {}))
+        try:
+            frames[label] = load_group(spec["group"], **spec.get("filters", {}))
+        except SystemExit as e:
+            print(f"[cmp] {label}: no runs ({e}); skipping this arm")
+            continue
         missing[label] = report_missing(frames[label], label, expected)
     with open(Path(out_dir) / "missing_runs.json", "w") as f:
         json.dump({k: [list(m) for m in v] for k, v in missing.items()}, f, indent=2)
 
+    if pairs is None:
+        pairs = [(a, b) for a in frames if a.startswith("joint")
+                 for b in frames if b.startswith("sft")]
     tables = []
-    for label in arms:
-        if label == baseline:
+    for label_a, label_b in pairs:
+        if label_a not in frames or label_b not in frames:
+            print(f"[cmp] skipping {label_a} vs {label_b}: an arm is missing")
             continue
-        merged = pair(frames[label], frames[baseline], label, baseline)
-        merged.to_csv(Path(out_dir) / f"paired_runs_{label}_vs_{baseline}.csv", index=False)
+        print(f"\n[cmp] ---------- {label_a} vs {label_b} ----------")
+        merged = pair(frames[label_a], frames[label_b], label_a, label_b)
+        merged.to_csv(Path(out_dir) / f"paired_runs_{label_a}_vs_{label_b}.csv", index=False)
         metrics = ["interventional_corr", "endogenous_corr"]
         metrics += sorted({c.rsplit("_", 1)[0] for c in merged.columns
-                           if c.startswith("ood_") and c.endswith(f"_{label}")
+                           if c.startswith("ood_") and c.endswith(f"_{label_a}")
                            and "activation_std" not in c})
-        stats = [st for st in (paired_stats(merged, m, label, baseline) for m in metrics) if st]
-        table = pd.DataFrame(stats).assign(arm=label, baseline=baseline)
+        stats = [st for st in (paired_stats(merged, m, label_a, label_b) for m in metrics) if st]
+        table = pd.DataFrame(stats).assign(arm=label_a, baseline=label_b)
         tables.append(table)
-        print(f"\n[cmp] paired summary ({label} vs {baseline}):")
         print(table.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
         for m in ("interventional_corr", "endogenous_corr"):
-            plot_delta_heatmap(merged, m, label, baseline, out_dir)
+            plot_delta_heatmap(merged, m, label_a, label_b, out_dir)
 
     if tables:
         pd.concat(tables, ignore_index=True).to_csv(Path(out_dir) / "paired_summary.csv",
@@ -329,14 +343,21 @@ def main(arms: dict, baseline: str, out_dir):
 
 
 if __name__ == "__main__":
-    # joint training at the usable operating point AND unconstrained, against SFT.
-    # Unanchored runs are tagged klnone by the grid script.
+    # SFT appears TWICE, once per gate arm. gate ON is the purest bypass baseline: the
+    # adapter cannot touch the introspected token, so interventional corr is 0 by
+    # construction and whatever endogenous score it has is context prediction. That
+    # makes it the arm whose endogenous score SHOULD collapse hardest off-distribution,
+    # and therefore the sharpest test of the OOD logic itself. gate OFF isolates the
+    # objective (joint vs endogenous-only) with access held constant.
     ARMS = {
-        "sft":         dict(group="mlp_endo_sweep_layer_token",
+        "sft_gateon":  dict(group="mlp_endo_sweep_layer_token",
+                            filters=dict(gate="on", w=1.0)),
+        "sft_gateoff": dict(group="mlp_endo_sweep_layer_token",
                             filters=dict(gate="off", w=1.0)),
         "joint_kl0.1": dict(group="mlp_joint_grid_layer_token",
                             filters=dict(gate="off", w=0.01, kl="0.1")),
         "joint_free":  dict(group="mlp_joint_grid_layer_token",
                             filters=dict(gate="off", w=0.01, kl="none")),
     }
-    main(ARMS, baseline="sft", out_dir=f"{ROOT}/outputs/plots/sft_vs_joint")
+    # default pairs = every joint arm against every sft arm (4 comparisons)
+    main(ARMS, out_dir=f"{ROOT}/outputs/plots/sft_vs_joint")
