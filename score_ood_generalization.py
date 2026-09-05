@@ -262,7 +262,82 @@ def evaluate_ood(model, base_config: ExperimentConfig, tokenizer, collator, prep
     return df
 
 
+def evaluate_ood_detection(model, base_config: ExperimentConfig, tokenizer, collator,
+                           preprocess_fn, spec, on_value, output_dir,
+                           corpora=DEFAULT_CORPORA, n_test=DEFAULT_N_TEST, seed=0,
+                           prepared=None, batch_size=128):
+    """
+    DETECTION counterpart of evaluate_ood, for SAE-feature runs.
+
+    Same corpus ladder and same logic -- an endogenous score that comes from context
+    should fall off-distribution while a causal read should not -- but scored with the
+    detection metrics (AP is the imbalance-honest headline, AUROC secondary) instead of
+    correlation, and with the paired steering test carried along so the causal channel
+    can be tracked corpus by corpus.
+
+    WATCH FOR (the detection analogue of the near-silent-neuron caveat): a feature that
+    never fires on a corpus gives a single-class eval set, where AP/AUROC are undefined
+    rather than bad. base_rate_positive is reported per corpus for exactly that filter.
+    """
+    from train_sae_detector import auroc_eval, interventional_detection_eval
+
+    output_dir = Path(output_dir)
+    if prepared is None:
+        print("[ood] WARNING: caches not prepared before the model was loaded; building "
+              "them now (fails if the GPU is already held).")
+        prepared = prepare_ood_caches(base_config, corpora, n_test, seed)
+    errors = getattr(prepare_ood_caches, "errors", {})
+    tc = base_config.training_config
+
+    rows = []
+    for corpus in corpora:
+        cfg_path = prepared.get(corpus)
+        if cfg_path is None:
+            rows.append({"corpus": corpus, "error": errors.get(corpus, "cache not prepared")})
+            continue
+        print(f"\n[ood-detect] ===== {corpus} =====")
+        try:
+            cfg = ExperimentConfig.model_validate_json(Path(cfg_path).read_text())
+            raw = load_from_disk(str(cfg.dataset_cache_dir / "test"))
+            raw = apply_signal_filter(raw, base_config.signal_filter, f"ood/{corpus}")
+            acts = np.asarray(raw["activation"], dtype=float)
+            ds = raw.map(preprocess_fn, remove_columns=raw.column_names)
+
+            endo, _, _ = auroc_eval(model, ds, raw["activation"], collator, tokenizer,
+                                    tc, batch_size)
+            interv, _, _ = interventional_detection_eval(
+                model, spec, raw, ds, collator, tokenizer, tc, on_value, batch_size)
+            rows.append({
+                "corpus": corpus, "n": len(ds),
+                "endogenous_ap": endo.get("ap"),
+                "endogenous_auroc": endo.get("auroc"),
+                "endogenous_f1_at_0": endo.get("f1_at_0"),
+                "interventional_auroc": interv.get("auroc"),
+                "paired_directional_acc": interv.get("paired_directional_acc"),
+                # single-class corpora make AP/AUROC undefined, not bad -- filter on this
+                "base_rate_positive": endo.get("base_rate_positive"),
+                "activation_std": float(np.std(acts)),
+                "activation_frac_zero": float(np.mean(np.abs(acts) < 1e-6)),
+            })
+        except Exception as e:
+            print(f"[ood-detect] {corpus} eval FAILED ({type(e).__name__}: {e}); continuing")
+            rows.append({"corpus": corpus, "error": f"{type(e).__name__}: {e}"})
+
+    df = pd.DataFrame(rows)
+    df.to_csv(output_dir / "ood_generalization_detection.csv", index=False)
+    with open(output_dir / "ood_generalization_detection.json", "w") as f:
+        json.dump({"signal_filter": base_config.signal_filter, "rows": rows}, f,
+                  indent=2, default=str)
+    print("\n[ood-detect] generalization summary:")
+    print(df.to_string(index=False))
+    if "base_rate_positive" in df and (df["base_rate_positive"].fillna(1) <= 0).any():
+        print("[ood-detect] NOTE: some corpora never fire this feature; their AP/AUROC "
+              "are undefined, not zero.")
+    return df
+
+
 if __name__ == "__main__":
     print(__doc__)
     print("Run through train_introspector_joint.py --ood-eval (optionally with "
-          "--diag-only --checkpoint <ckpt> for an existing run).")
+          "--diag-only --checkpoint <ckpt> for an existing run), or "
+          "train_sae_detector.py --ood-eval for SAE detection runs.")

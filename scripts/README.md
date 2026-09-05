@@ -38,5 +38,30 @@ reuse — migrate a script into this directory rather than running it in place.
 | `neuron/train_single_mlp_introspector_endogenous_sweep_layer_token.sh` | endogenous only (`W=1.0`): 8 layers x 8 positions x 5 neurons x {gate on, gate off}; the SFT baseline the joint grid is compared against |
 | `neuron/train_single_mlp_introspector_joint_weight_sweep.sh` | joint-loss weight `W` at 3 (layer, position, KL-budget) cells x 5 neurons = 90 runs; fixes `W` for the main grid and gives the endogenous-vs-interventional pareto with error bars |
 | `neuron/train_single_mlp_introspector_joint_sweep_layer_token.sh` | MAIN GRID: 8 layers x 8 positions x 5 neurons in two cost regimes (KL budget 0.1, and unanchored for the ceiling + measured cost) = 640 runs |
+| `sae/precompute_sae_feature_stats.sh` | per-layer SAE feature density stats (one task per layer, skips existing); the sweep's feature picker needs these to avoid dead/punctuation features |
+| `sae/train_single_sae_introspector_sweep_layer_position.sh` | SAE DETECTION grid: 8 layers x 8 positions x 5 features x {gate on, gate off} = 128 cells; the SAE analogue of the endogenous neuron sweep |
+| `sae/train_sae_intervention_pilot.sh` | interventional SAE detection training on 3 features x 3 positions: does steering on/off during training break the bypass before the full grid is worth running |
 
 Others are migrated as the experiment list for the paper firms up.
+
+## SAE-specific notes
+
+SAE features are sparse (~1% density), so the readout is BINARY detection
+("active"/"inactive" in the model's own tokens), not magnitude regression: at a fixed
+position a magnitude target is ~all zeros and a regressor wins by predicting 0. Score
+with **AP** (imbalance-honest) and AUROC; pooled accuracy is meaningless at a 1% base
+rate. The same conventions above apply, plus:
+
+- **`--signal-filter S<layer>.<index>`** (note the `S`) selects one feature out of a
+  cell's shared cache. The SAE trainers resolve the steering target THROUGH this
+  filter, so training one feature while steering another cannot happen silently.
+- **`--force-drift-eval`** runs `measure_sae_alignment`: recomputes the feature at the
+  cached position with adapters off and reports corr per offset. Want best offset
+  `+0`, corr ~1.0, `alignment OK`. `train_sae_detector_intervention.py` runs it BEFORE
+  training and aborts on failure, because steering a misaligned position invalidates
+  the whole run rather than just its diagnostics.
+- **`--ood-eval`** uses the detection branch (`evaluate_ood_detection`), reporting AP /
+  paired_directional_acc per corpus. A corpus where the feature never fires gives an
+  undefined AP, not a bad one — filter on `base_rate_positive`.
+- **`score_lm_degradation.py` / `score_lighteval_benchmarks.py`** are signal-agnostic
+  and apply unchanged, but only to **gate-off** checkpoints.
