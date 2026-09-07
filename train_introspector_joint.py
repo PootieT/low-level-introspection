@@ -141,6 +141,12 @@ def parse_args():
     p.add_argument("--neuron-gen-only", action="store_true",
                    help="Load the checkpoint and run ONLY the neuron-generalization eval. "
                         "Writes into the RUN dir so results land where the aggregator looks.")
+    p.add_argument("--neuron-gen-pool-config", type=str, default=None,
+                   help="Config whose cached TEST split holds the full neuron pool "
+                        "(trained + held-out). A run's own cache only has the neurons it "
+                        "trained on -- sizing it to hold the whole pool would multiply its "
+                        "train split by the pool size. Point this at the sweep's shared cell "
+                        "config; without it there is no unseen arm.")
     p.add_argument("--max-unseen-neurons", type=int, default=None,
                    help="Cap the held-out neurons evaluated (default: every neuron in the "
                         "cache that the run did not train on).")
@@ -1199,7 +1205,8 @@ def main():
         print(f"[joint] --neuron-gen-only: {diag_ckpt} -> {output_dir}")
         evaluate_neuron_generalization(model, config, tokenizer, pred_collator,
                                        preprocess_fn=preprocess, output_dir=output_dir,
-                                       max_unseen=args.max_unseen_neurons)
+                                       max_unseen=args.max_unseen_neurons,
+                                       pool_config=args.neuron_gen_pool_config)
         return
 
     if args.length_only:
@@ -1319,7 +1326,8 @@ def main():
         from score_neuron_generalization import evaluate_neuron_generalization
         evaluate_neuron_generalization(model, config, tokenizer, pred_collator,
                                        preprocess_fn=preprocess, output_dir=eval_out_dir,
-                                       max_unseen=args.max_unseen_neurons)
+                                       max_unseen=args.max_unseen_neurons,
+                                       pool_config=args.neuron_gen_pool_config)
 
     if args.length_eval:
         from score_length_generalization import evaluate_length_grid

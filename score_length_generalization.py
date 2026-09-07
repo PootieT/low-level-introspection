@@ -58,7 +58,11 @@ from src.introspector.dataset_utils import apply_signal_filter, canonical_datase
 # with, or the documents will not actually reach the nominal length and the distance
 # axis collapses toward the short end (see DatasetConfig.min_seq_length).
 DEFAULT_EVAL_LENGTHS = (16, 64, 128)
-DEFAULT_N_TEST = 3000
+# None => inherit the run's own test split size. Hardcoding a number here silently
+# overrode --test-max-samples, so raising the run's test split had no effect on this
+# eval at all. Bin population is what limits the near-distance bins, so that knob has
+# to reach here.
+DEFAULT_N_TEST = None
 
 # Log-spaced, because what matters is the ORDER of magnitude of the reach, and because
 # uniform position sampling puts most mass at large distances. Upper edges, inclusive.
@@ -92,7 +96,7 @@ def training_window(config: ExperimentConfig) -> int | None:
 
 
 def derive_config(base_config: ExperimentConfig, eval_len: int, config_dir: Path,
-                  n_test: int = DEFAULT_N_TEST) -> Path:
+                  n_test: int | None = DEFAULT_N_TEST) -> Path:
     """A config identical to the run's except for the TEST split's length and positions.
 
     The test selector spans the WHOLE eval length rather than the training window: the
@@ -106,7 +110,7 @@ def derive_config(base_config: ExperimentConfig, eval_len: int, config_dir: Path
     """
     cfg = base_config.model_copy(deep=True)
     cfg.test_dataset = cfg.test_dataset.model_copy(update={
-        "max_samples": n_test,
+        "max_samples": n_test if n_test is not None else base_config.test_dataset.max_samples,
         "max_seq_length": eval_len,
     })
     # Sample positions across the entire document, expressed from the end so it is the
@@ -160,7 +164,7 @@ def ensure_cache(config_path: Path):
 
 def prepare_length_caches(base_config: ExperimentConfig,
                           eval_lengths=DEFAULT_EVAL_LENGTHS,
-                          n_test: int = DEFAULT_N_TEST):
+                          n_test: int | None = DEFAULT_N_TEST):
     """
     Build the eval caches. CALL THIS BEFORE THE CALLER LOADS ITS MODEL.
 
@@ -241,7 +245,7 @@ def _bin_by_distance(df: pd.DataFrame, value_col: str, target_col: str,
 
 def evaluate_length_grid(model, base_config: ExperimentConfig, tokenizer, collator,
                          output_dir, eval_lengths=DEFAULT_EVAL_LENGTHS,
-                         n_test: int = DEFAULT_N_TEST, prepared=None):
+                         n_test: int | None = DEFAULT_N_TEST, prepared=None):
     """
     Evaluate an already-built model across eval lengths, binned by distance-to-readout.
 
