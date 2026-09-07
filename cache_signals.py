@@ -316,7 +316,38 @@ def _git_sha():
         return None
 
 
-def write_dataset_metadata(config: ExperimentConfig, output_dir: Path, model, row_counts: dict):
+def _realized_stats(dataset) -> dict:
+    """Observed sequence-length and introspected-position distribution of a built split.
+
+    `distance_from_end` is the gap between the introspected token and the end of the
+    text, i.e. how far back the readout has to reach -- the axis a length-generalization
+    run is actually varying, and the one that quietly collapses when documents are
+    shorter than max_seq_length.
+    """
+    import numpy as np
+    if len(dataset) == 0:
+        return {}
+    if "text_input_ids" in dataset.column_names:
+        seq_len = np.array([len(x) for x in dataset["text_input_ids"]])
+    else:
+        return {}
+    pos = np.array(dataset["token_position"])
+    dist = seq_len - 1 - pos
+    pct = [5, 25, 50, 75, 95]
+    return {
+        "seq_len": {"min": int(seq_len.min()), "max": int(seq_len.max()),
+                    "mean": round(float(seq_len.mean()), 1),
+                    "pct": {p: int(np.percentile(seq_len, p)) for p in pct}},
+        "token_position": {"min": int(pos.min()), "max": int(pos.max()),
+                           "pct": {p: int(np.percentile(pos, p)) for p in pct}},
+        "distance_from_end": {"min": int(dist.min()), "max": int(dist.max()),
+                              "mean": round(float(dist.mean()), 1),
+                              "pct": {p: int(np.percentile(dist, p)) for p in pct}},
+    }
+
+
+def write_dataset_metadata(config: ExperimentConfig, output_dir: Path, model,
+                           row_counts: dict, realized: dict | None = None):
     """
     Make the cache self-describing, so "can these two runs share this dataset?" and
     "what tokenization produced these activations?" are answerable from disk instead
@@ -352,6 +383,13 @@ def write_dataset_metadata(config: ExperimentConfig, output_dir: Path, model, ro
         },
         "capture": {"model_dtype": dtype, "signal_site": "mlp.act_fn output (post-activation neuron)"},
         "row_counts": row_counts,
+        # What the cache ACTUALLY contains, not what was requested. A length sweep is
+        # only meaningful if the documents really reach the nominal length: max_seq_length
+        # truncates but does not guarantee, and sample_token_position clamps a range into
+        # whatever each document has. Comparing realized[] against the configured
+        # max_seq_length / token_selector is how a silently collapsed length or distance
+        # axis becomes visible on disk instead of showing up as a flat result.
+        "realized": realized,
         "columns_include_text_input_ids": True,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "created_by_experiment": config.experiment_name,
@@ -409,6 +447,33 @@ def main():
     hf_dataset_train = _load_split(config.train_dataset)
     hf_dataset_dev = _load_split(config.train_dataset, split=config.dev_dataset.split)
     hf_dataset_test = _load_split(config.test_dataset)
+
+    # Length floor, applied BEFORE skip/take. Order matters twice over:
+    #   - take() before filter() would keep only the long documents *within* the first
+    #     max_samples, silently returning far fewer rows than asked for (at a 512-token
+    #     floor on C4, ~25% of them).
+    #   - dev's skip() counts documents, so it has to count in the SAME (filtered) space
+    #     as train's take(), or train and dev stop being disjoint.
+    # Costs a longer stream, not more compute: a 512-token floor on C4 reads ~4x the
+    # documents to yield the same number of rows.
+    min_len_cfgs = {config.train_dataset.min_seq_length, config.dev_dataset.min_seq_length,
+                    config.test_dataset.min_seq_length}
+    if len({m for m in min_len_cfgs if m} ) > 1:
+        # A per-split floor would make train and test draw from different document
+        # populations -- a content shift masquerading as a generalization result.
+        raise ValueError(f"min_seq_length must match across splits, got {min_len_cfgs}")
+
+    def _apply_min_len(ds, ds_cfg, tokenizer):
+        if not ds_cfg.min_seq_length:
+            return ds
+        field, floor = ds_cfg.text_field, ds_cfg.min_seq_length
+        return ds.filter(
+            lambda ex: len(tokenizer(ex[field], add_special_tokens=True)["input_ids"]) >= floor)
+
+    length_tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    hf_dataset_train = _apply_min_len(hf_dataset_train, config.train_dataset, length_tokenizer)
+    hf_dataset_dev = _apply_min_len(hf_dataset_dev, config.train_dataset, length_tokenizer)
+    hf_dataset_test = _apply_min_len(hf_dataset_test, config.test_dataset, length_tokenizer)
 
     # assume dataset is large and is not truncated so using streaming mode
     if isinstance(hf_dataset_train, IterableDataset):
@@ -484,7 +549,10 @@ def main():
     print(f"Saved test dataset to: {test_path}")
 
     write_dataset_metadata(config, output_dir, model,
-                           {"train": len(train_dataset), "dev": len(dev_dataset), "test": len(test_dataset)})
+                           {"train": len(train_dataset), "dev": len(dev_dataset), "test": len(test_dataset)},
+                           realized={"train": _realized_stats(train_dataset),
+                                     "dev": _realized_stats(dev_dataset),
+                                     "test": _realized_stats(test_dataset)})
 
 
 if __name__ == "__main__":

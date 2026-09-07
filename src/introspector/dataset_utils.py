@@ -93,6 +93,11 @@ def _split_identity(ds_cfg) -> dict[str, Any]:
         "text_field": ds_cfg.text_field,
         "max_samples": ds_cfg.max_samples,
         "max_seq_length": ds_cfg.max_seq_length,
+        # Part of the IDENTITY, not just a build option: a floor changes which documents
+        # are in the cache, so a filtered and an unfiltered build at the same
+        # max_seq_length are different datasets. Without this they hash alike and the
+        # second run silently reuses the first one's cache.
+        "min_seq_length": ds_cfg.min_seq_length,
         "offset": ds_cfg.offset,
         "hf_data_kwargs": ds_cfg.hf_data_kwargs,
     }

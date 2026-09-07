@@ -2,20 +2,41 @@ import random
 from typing import Literal
 
 
+# The index the PROMPT shows is not the raw cached `token_position`.
+# cache_signals.py tokenizes with add_special_tokens=True, so position 0 is BOS and
+# the first *visible* text token sits at position 1. Displaying the raw position
+# would ask the model to count a token it cannot see. Subtracting the BOS makes the
+# displayed number 0-based over exactly the text the model reads.
+# Only the DISPLAYED number shifts -- `token_position` itself still indexes the
+# BOS-prefixed sequence and is what the intervention hook injects at. Do not
+# "fix" one without the other.
+BOS_OFFSET = 1
+
+
+def _display_token_index(token_index: int) -> int:
+    return max(0, int(token_index) - BOS_OFFSET)
+
+
 def mlp_prompt_with_token_index(
     layer: int,
     signal_index: int,
     token: str,
     token_index: int,
 ) -> str:
+    # These MUST be mlp_prompt()'s templates with only the ` (token #N)` clause
+    # added. They previously also dropped the quotes around {TOKEN} and the word
+    # "token" before it, so switching arms changed the tokenization of the prompt
+    # and not just the presence of the index -- any index-vs-no-index gap would
+    # have been confounded by that.
     templates = [
-        "At token {TOKEN} (token #{TOKEN_IDX}), the MLP activation for neuron {SIGNAL_IDX} at layer {LAYER} is",
-        "The MLP activation for neuron {SIGNAL_IDX} at layer {LAYER} for {TOKEN} (token #{TOKEN_IDX}) is",
-        "Neuron {SIGNAL_IDX} at layer {LAYER} and {TOKEN} (token #{TOKEN_IDX}) has activation level of",
-        "Neuron {LAYER}.{SIGNAL_IDX} at {TOKEN} (token #{TOKEN_IDX}) has activation of",
+        'At token "{TOKEN}" (token #{TOKEN_IDX}), the MLP activation for neuron {SIGNAL_IDX} at layer {LAYER} is',
+        'The MLP activation for neuron {SIGNAL_IDX} at layer {LAYER} for token "{TOKEN}" (token #{TOKEN_IDX}) is',
+        'Neuron {SIGNAL_IDX} at layer {LAYER} and token "{TOKEN}" (token #{TOKEN_IDX}) has activation level of',
+        'Neuron {LAYER}.{SIGNAL_IDX} at token "{TOKEN}" (token #{TOKEN_IDX}) has activation of',
     ]
     prompt = random.choice(templates).format(
-        TOKEN=token, SIGNAL_IDX=signal_index, LAYER=layer, TOKEN_IDX=token_index,
+        TOKEN=token, SIGNAL_IDX=signal_index, LAYER=layer,
+        TOKEN_IDX=_display_token_index(token_index),
     )
     return prompt
 

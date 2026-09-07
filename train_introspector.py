@@ -64,6 +64,7 @@ def preprocess_example(
     prompt_fn,
     max_length,
     return_frozen_input_len=False,
+    return_position_valid=False,
     for_prediction=False,
     detection=False,
     detection_active_word="active",
@@ -76,6 +77,9 @@ def preprocess_example(
     :param prompt_fn: function to piece together the prompt
     :param max_length:
     :param return_frozen_input_len: used for lora token masking
+    :param return_position_valid: emit a per-row flag for whether max_length kept the
+        introspected token. Opt-in: it is an extra column, and callers that map with
+        remove_columns=<original> would otherwise hand it to the collator as a model kwarg.
     :param for_prediction: if True, do not suffix the target activation, and left-pad the batches
     :return:
     """
@@ -151,7 +155,34 @@ def preprocess_example(
     if return_frozen_input_len:
         out["frozen_input_len"] = len(input_tokens["input_ids"])
 
+    # Truncation guard. `token_position` indexes the FULL cached sequence; here the
+    # text is re-tokenized under `max_length`, which can cut the introspected token
+    # off entirely. Nothing downstream would notice: InterventionHook and the capture
+    # hooks .clamp() the position into range, so a truncated target silently becomes
+    # "inject at the last surviving token" -- a wrong-position run that still looks
+    # healthy. Harmless while every run used pos=-1 on short texts; a real hazard for
+    # long-context runs, where max_length must cover text + prompt + target, not just
+    # the text. Flagged per row so the caller can refuse to train on a poisoned split
+    # rather than discovering it in the results.
+    if return_position_valid:
+        out["position_valid"] = int(example["token_position"]) < len(input_tokens["input_ids"])
+
     return out
+
+
+def assert_positions_intact(dataset, split: str, max_length: int) -> None:
+    """Refuse to train when max_length truncated away introspected tokens."""
+    if "position_valid" not in dataset.column_names:
+        return
+    bad = len(dataset) - int(sum(dataset["position_valid"]))
+    if bad:
+        raise ValueError(
+            f"[{split}] {bad}/{len(dataset)} examples have their introspected token "
+            f"truncated away by max_length={max_length}. The intervention hook would "
+            f"clamp these to the last surviving token and train on the wrong "
+            f"activation. Raise training_config.max_length to cover text + "
+            f"introspection prompt + target."
+        )
 
 
 def get_argmax_from_logits(logits, labels):

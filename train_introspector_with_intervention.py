@@ -242,6 +242,16 @@ def evaluate_interventional_test(
     with open(str(Path(output_dir) / f"interventional_test_metrics{suffix}.json"), "w") as f:
         json.dump({"distribution": distribution, "test": metrics}, f, indent=2)
     df = pd.DataFrame({"predictions": pred.numpy(), "injected": y_inj.numpy()})
+    # Position provenance, so a length-generalization run can bin this by how far back
+    # the introspected token sat. _extract_readout_features iterates with shuffle=False,
+    # so row i here is example i of eval_dataset -- the length check below is what makes
+    # that assumption fail loudly rather than silently misalign the bins.
+    cols = getattr(eval_dataset, "column_names", [])
+    if "token_position" in cols and len(eval_dataset) == len(df):
+        df["token_position"] = list(eval_dataset["token_position"])
+        if "frozen_input_len" in cols:
+            df["text_len"] = list(eval_dataset["frozen_input_len"])
+            df["distance_from_end"] = df["text_len"] - 1 - df["token_position"]
     df.to_csv(str(Path(output_dir) / f"interventional_test_predictions{suffix}.csv"), index=False)
     plt.figure()
     sns.scatterplot(data=df, x="injected", y="predictions")

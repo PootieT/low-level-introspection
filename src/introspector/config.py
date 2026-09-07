@@ -17,6 +17,21 @@ class DatasetConfig(BaseModel):
     text_field: str = "text"
     max_samples: int | None = None
     max_seq_length: int = 128
+    # Minimum TOKEN length (BOS included) a document must have to be kept.
+    # max_seq_length only truncates; without a floor, a "length 512" cache is really
+    # "whatever the corpus gave us, capped at 512". Measured on C4-en (n=10k, Llama-3.2
+    # tokenizer): median 247 tokens, and only 25.1% of documents reach 512 -- so an
+    # unfiltered 512 cache is ~75% short documents, and sample_token_position clamps a
+    # [-1,-512] range down to whatever each document actually has. The length axis and
+    # the distance-to-prompt axis both silently collapse toward the short end, with
+    # nothing in the config or the logs to say so. It never bit the pos=-1 runs because
+    # 98.8% of C4 clears 32 tokens.
+    #
+    # Set this to the LONGEST length in a length sweep (not to each arm's own length),
+    # so every arm draws from the same document population: long C4 documents are
+    # systematically different prose from short ones, and per-arm floors would confound
+    # the length effect with a content shift.
+    min_seq_length: int | None = None
     hf_data_kwargs: dict[str, Any] = {}
     offset: int = 0
 

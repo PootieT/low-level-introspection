@@ -66,6 +66,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-max-samples", type=int)
     parser.add_argument("--hf-data-kwargs", type=str, default="", help="json string of kwargs to pass to HF Dataset constructor (e.g. config)")
     parser.add_argument("--max-seq-length", type=int, default=128)
+    parser.add_argument("--min-seq-length", type=int, default=None,
+                        help="Drop documents shorter than this many tokens (BOS included). "
+                             "max-seq-length only TRUNCATES, so without a floor a nominal "
+                             "length-N cache is really 'whatever the corpus gave, capped at N' "
+                             "-- on C4-en only 25%% of documents reach 512 and the median is 247. "
+                             "In a length sweep set this to the LONGEST arm's length for EVERY "
+                             "arm, so all arms draw from the same document population; per-arm "
+                             "floors confound the length effect with a content shift.")
     parser.add_argument("--text-field", default="text")
     # parser.add_argument("--sample-per-data", type=int, default=1)  # TODO maybe no need better to have diverse datapoints
 
@@ -243,6 +251,7 @@ def main() -> None:
             max_samples=args.train_max_samples,
             hf_data_kwargs=hf_data_kwargs,
             max_seq_length=args.max_seq_length,
+            min_seq_length=args.min_seq_length,
         ),
         dev_dataset=DatasetConfig(
             name=args.train_dataset,
@@ -251,6 +260,7 @@ def main() -> None:
             max_samples=args.dev_max_samples,
             hf_data_kwargs=hf_data_kwargs,
             max_seq_length=args.max_seq_length,
+            min_seq_length=args.min_seq_length,
             offset=args.dev_offset_from_train,
         ),
         test_dataset=DatasetConfig(
@@ -260,6 +270,7 @@ def main() -> None:
             max_samples=args.test_max_samples,
             hf_data_kwargs=hf_data_kwargs,
             max_seq_length=args.max_seq_length,
+            min_seq_length=args.min_seq_length,
         ),
 
         train_signals=train_spec,

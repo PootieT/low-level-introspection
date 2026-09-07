@@ -36,6 +36,7 @@ import json
 import math
 import argparse
 import operator
+from typing import Optional
 from functools import partial
 from pathlib import Path
 
@@ -70,7 +71,7 @@ from src.introspector.training.model import (
     replace_model_with_gated_version,
     replace_lora_with_gated_version,
 )
-from train_introspector import preprocess_example, INTROSPECTION_SEPARATOR
+from train_introspector import preprocess_example, assert_positions_intact, INTROSPECTION_SEPARATOR
 from train_introspector_with_intervention import (
     InterventionTrainer,
     evaluate_interventional_test,
@@ -116,6 +117,20 @@ def parse_args():
                    help="Comma-separated corpus names (default: shuffled,wikipedia,c4_zh,math). "
                         "'shuffled' is the run's own test text with word order destroyed -- the "
                         "cleanest control, and it needs no download.")
+    p.add_argument("--length-eval", action="store_true",
+                   help="After the in-domain evals, score the readout across eval lengths, "
+                        "binned by distance from the introspected token to the readout "
+                        "(see score_length_generalization.py). The point is the bins BEYOND "
+                        "the training window: a run trained on the last k tokens can solve "
+                        "training with a recency prior and fail everywhere else.")
+    p.add_argument("--length-only", action="store_true",
+                   help="Load the checkpoint and run ONLY the length-generalization eval -- "
+                        "no training, no other diagnostics. Writes into the RUN dir so results "
+                        "land where the aggregator looks.")
+    p.add_argument("--eval-lengths", type=str, default=None,
+                   help="Comma-separated eval lengths (default: 16,64,128). Each must be <= the "
+                        "min_seq_length the caches were built with, or documents will not "
+                        "actually reach that length.")
     p.add_argument("--skip-drift-eval", action="store_true",
                    help="Skip the activation-drift measurement (see measure_activation_drift). It runs "
                         "automatically whenever the adapter is active over the input text, because that "
@@ -341,6 +356,45 @@ class JointInterventionTrainer(InterventionTrainer):
         return (loss, out) if return_outputs else loss
 
 
+def _text_len_from_mask(batch) -> torch.Tensor:
+    """Tokenized text length (BOS included) per row, recovered from the LoRA gate mask.
+
+    lora_token_mask is 0 over the input text and 1 over the introspection prompt, with
+    padding zeroed on whichever side the collator padded. Prediction batches are
+    LEFT-padded, so the first 1 sits at (num_left_pad + text_len); subtracting the pad
+    count leaves the text length. Returns -1 where no prompt region exists, so a
+    degenerate row shows up as invalid rather than as distance 0.
+    """
+    mask = batch["lora_token_mask"]
+    num_left_pad = (batch["attention_mask"] == 0).sum(dim=1)
+    first_one = torch.argmax(mask, dim=1)
+    has_prompt = mask.sum(dim=1) > 0
+    return torch.where(has_prompt, first_one - num_left_pad,
+                       torch.full_like(first_one, -1))
+
+
+def _per_signal_metrics(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """Per-(layer, neuron) fidelity from a predictions frame.
+
+    Returns None for a single-signal run, where the pooled metrics already say
+    everything and an extra one-row file is just noise. A neuron whose activation
+    is constant across the eval set has undefined corr; it is reported as NaN
+    rather than dropped, so a capacity cliff cannot hide as a shrinking denominator.
+    """
+    if "signal_index" not in df.columns:
+        return None
+    keys = ["signal_layer", "signal_index"]
+    if df.groupby(keys).ngroups < 2:
+        return None
+    rows = []
+    for (layer, index), g in df.groupby(keys):
+        m = compute_metrics_from_numericals(g["predictions"].to_numpy(),
+                                            g["activation"].to_numpy())
+        rows.append({"signal_layer": int(layer), "signal_index": int(index),
+                     "n": int(len(g)), **m})
+    return pd.DataFrame(rows).sort_values(keys).reset_index(drop=True)
+
+
 @torch.no_grad()
 def eval_endogenous_test(model, dataset, collator, config, output_dir, suffix="_endogenous"):
     """
@@ -353,7 +407,7 @@ def eval_endogenous_test(model, dataset, collator, config, output_dir, suffix="_
     dl = DataLoader(dataset, batch_size=config.training_config.eval_batch_size,
                     collate_fn=collator, shuffle=False)
     head = model.regression_head
-    preds, acts = [], []
+    preds, acts, layers, idxs, tokpos, seqlens = [], [], [], [], [], []
     for batch in dl:
         batch = batch.to(model.device)
         activation = batch["activation"]
@@ -363,13 +417,43 @@ def eval_endogenous_test(model, dataset, collator, config, output_dir, suffix="_
         h = out.hidden_states[-1][:, -1, :]
         pred = head(h.to(device=head.weight.device, dtype=head.weight.dtype)).squeeze(-1)
         preds.append(pred.float().cpu()); acts.append(activation.float().cpu())
+        # Per-signal provenance: with >1 neuron in the run, a single pooled corr is
+        # not interpretable -- pooling across neurons with different activation
+        # scales inflates it (between-neuron variance is counted as signal). The
+        # multi-neuron scaling curve needs the per-neuron breakdown, and the pooled
+        # number stays only for continuity with single-neuron runs.
+        layers.append(batch["signal_layer"].cpu()); idxs.append(batch["signal_index"].cpu())
+        # token_position + the text length behind it: without these, a length-generalization
+        # run cannot be binned by distance-to-readout after the fact, and every distance
+        # bin would need its own eval cache.
+        # The collator POPS frozen_input_len and folds it into lora_token_mask (0 over the
+        # text, 1 over the introspection prompt), so the length is recovered from the mask
+        # rather than read off the batch -- adding a key here would also hand it to
+        # model(**inputs) during training.
+        tokpos.append(batch["token_position"].cpu())
+        seqlens.append(_text_len_from_mask(batch).cpu())
     pred, act = torch.cat(preds).numpy(), torch.cat(acts).numpy()
+    layer_col = torch.cat(layers).numpy(); index_col = torch.cat(idxs).numpy()
+    pos_col = torch.cat(tokpos).numpy(); len_col = torch.cat(seqlens).numpy()
 
     metrics = compute_metrics_from_numericals(pred, act)   # corr, l2_dist, avg_diff, std_diff, ...
+    df = pd.DataFrame({"predictions": pred, "activation": act,
+                       "signal_layer": layer_col, "signal_index": index_col,
+                       "token_position": pos_col, "text_len": len_col})
+    df["distance_from_end"] = np.where(df["text_len"] > 0,
+                                       df["text_len"] - 1 - df["token_position"], -1)
+    per_signal = _per_signal_metrics(df)
+    if per_signal is not None:
+        per_signal.to_csv(
+            Path(output_dir) / f"endogenous_test_by_signal{suffix}.csv", index=False)
+        # Macro-average over neurons: the honest headline when n_signals > 1.
+        metrics["n_signals"] = int(len(per_signal))
+        metrics["corr_macro"] = float(per_signal["corr"].mean())
+        metrics["corr_macro_std"] = float(per_signal["corr"].std(ddof=0))
+        metrics["corr_macro_min"] = float(per_signal["corr"].min())
     with open(Path(output_dir) / f"endogenous_test_metrics{suffix}.json", "w") as f:
         json.dump(metrics, f, indent=2)
-    pd.DataFrame({"predictions": pred, "activation": act}).to_csv(
-        Path(output_dir) / f"endogenous_test_predictions{suffix}.csv", index=False)
+    df.to_csv(Path(output_dir) / f"endogenous_test_predictions{suffix}.csv", index=False)
 
     plt.figure(figsize=(6, 6))
     plt.scatter(act, pred, s=12, alpha=0.5)
@@ -946,7 +1030,8 @@ def main():
     output_dir = Path(config.output_dir) / config.experiment_name
     output_dir.mkdir(parents=True, exist_ok=True)
     if ((output_dir / "routing_probe_by_position.csv").exists()
-            and not args.overwrite_cache and not args.diag_only and not args.ood_only):
+            and not args.overwrite_cache and not args.diag_only and not args.ood_only
+            and not args.length_only):
         print(f"Experiments ran already, skipping.. {output_dir}")
         return
 
@@ -978,7 +1063,8 @@ def main():
         out = preprocess_example(ex, tokenizer=tokenizer,
                                  prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
                                  max_length=config.training_config.max_seq_length,
-                                 return_frozen_input_len=True, for_prediction=True)
+                                 return_frozen_input_len=True, return_position_valid=True,
+                                 for_prediction=True)
         out["token_position"] = ex["token_position"]
         out["signal_layer"] = ex["signal_layer"]
         out["signal_index"] = ex["signal_index"]
@@ -989,10 +1075,28 @@ def main():
     dev_dataset = dev_raw.map(preprocess, remove_columns=dev_raw.column_names)
     test_dataset_pred = test_raw.map(preprocess, remove_columns=test_raw.column_names)
 
+    # Fail loudly if max_length truncated any introspected token away, then drop the
+    # flag -- these datasets are collated straight into model kwargs, so it cannot stay.
+    max_len = config.training_config.max_seq_length
+    for name, ds in (("train", train_dataset), ("dev", dev_dataset), ("test", test_dataset_pred)):
+        assert_positions_intact(ds, name, max_len)
+    train_dataset = train_dataset.remove_columns("position_valid")
+    dev_dataset = dev_dataset.remove_columns("position_valid")
+    test_dataset_pred = test_dataset_pred.remove_columns("position_valid")
+
     # ---- OOD caches BEFORE the model loads ----
     # cache_signals runs as a subprocess and needs the GPU itself; once this process has
     # a model on the device, that second CUDA context fails with "CUDA-capable device(s)
     # is/are busy or unavailable". Preparing here keeps the device free for it.
+    # Same GPU-ordering constraint as the OOD caches below: cache_signals is a
+    # subprocess and needs the device, so this must happen before the model takes it.
+    length_prepared, eval_lengths = None, None
+    if args.length_eval or args.length_only:
+        from score_length_generalization import prepare_length_caches, DEFAULT_EVAL_LENGTHS
+        eval_lengths = ([int(x) for x in args.eval_lengths.split(",")]
+                        if args.eval_lengths else list(DEFAULT_EVAL_LENGTHS))
+        length_prepared = prepare_length_caches(config, eval_lengths=eval_lengths)
+
     ood_prepared, ood_corpora = None, None
     if args.ood_eval or args.ood_only:
         from score_ood_generalization import prepare_ood_caches, DEFAULT_CORPORA
@@ -1006,7 +1110,7 @@ def main():
         torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32)
     base.resize_token_embeddings(len(tokenizer))
     diag_ckpt = None
-    load_from_ckpt = args.diag_only or args.ood_only
+    load_from_ckpt = args.diag_only or args.ood_only or args.length_only
     if load_from_ckpt:
         # load a specific (possibly mid-run) checkpoint's adapter for eval WITHOUT training
         from peft import PeftModel
@@ -1014,7 +1118,7 @@ def main():
         diag_ckpt = Path(args.checkpoint) if args.checkpoint else (
             Path(max(ckpts, key=os.path.getctime)) if ckpts else None)
         if diag_ckpt is None:
-            raise SystemExit("--diag-only/--ood-only need a checkpoint "
+            raise SystemExit("--diag-only/--ood-only/--length-only need a checkpoint "
                              "(none found; pass --checkpoint).")
         model = PeftModel.from_pretrained(base, str(diag_ckpt), autocast_adapter_dtype=False)
     else:
@@ -1043,6 +1147,18 @@ def main():
           f"{config.training_config.lora_dropout}")
     pred_collator = collator_cls(tokenizer=tokenizer, model=model, padding=True,
                                  label_pad_token_id=-100, return_tensors="pt", for_prediction=True)
+
+    if args.length_only:
+        # same shape as --ood-only: checkpoint loaded, collator built, Trainer skipped.
+        # No preprocess_fn is passed -- it is rebuilt per eval length, because this run's
+        # closes over a max_seq_length sized for the TRAINING length and would truncate
+        # every longer eval document.
+        from score_length_generalization import evaluate_length_grid
+        print(f"[joint] --length-only: {diag_ckpt} -> {output_dir} | lengths={eval_lengths}")
+        evaluate_length_grid(model, config, tokenizer, pred_collator,
+                             output_dir=output_dir, eval_lengths=eval_lengths,
+                             prepared=length_prepared)
+        return
 
     if args.ood_only:
         # everything needed for the OOD pass exists by now (checkpoint loaded, collator
@@ -1144,6 +1260,12 @@ def main():
     scales = [float(x) for x in args.scale_sweep.split(",")]
     interventional_scale_sweep(model, test_dataset_pred, pred_collator, config, eval_out_dir,
                                scales=scales, n_pca=args.routing_probe_pca)
+
+    if args.length_eval:
+        from score_length_generalization import evaluate_length_grid
+        evaluate_length_grid(model, config, tokenizer, pred_collator,
+                             output_dir=eval_out_dir, eval_lengths=eval_lengths,
+                             prepared=length_prepared)
 
     if args.ood_eval:
         # lazy import: score_ood_generalization imports this module's eval helpers
