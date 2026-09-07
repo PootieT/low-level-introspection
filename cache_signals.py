@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import operator
 import pdb
 import random
@@ -29,7 +30,7 @@ from pathlib import Path
 from typing import Any, List, Dict
 
 from tqdm import tqdm
-from datasets import Dataset, load_dataset
+from datasets import Dataset, concatenate_datasets, load_dataset
 from nnsight import LanguageModel
 import torch
 import transformers
@@ -267,10 +268,40 @@ def build_split(
     :param config: ExperimentConfig
     :return:
     """
-    rows = []
-    n_batches = dataset_config.max_samples // config.training_config.eval_batch_size
-    for batch in tqdm(hf_dataset.batch(config.training_config.eval_batch_size), total=n_batches):
+    batch_size = config.training_config.eval_batch_size
+    n_batches = math.ceil(dataset_config.max_samples / batch_size)
+
+    # Two independent bounds, because the failure mode is expensive and silent.
+    # `i >= n_batches` is the structural one: it holds even if the caller forgets to
+    # .take() the stream, which has happened -- an unbounded test stream walks the whole
+    # split (364,608 documents for C4-en validation) without erroring.
+    #
+    # Rows are flushed to Arrow in chunks rather than held as Python dicts to the end.
+    # A row carries `text` and `text_input_ids` duplicated once PER SIGNAL, so a 200-neuron
+    # cache over 3k texts is 600k dicts -- ~1.7 GB as Python objects, and Dataset.from_list
+    # then builds the Arrow table on top of that, roughly doubling the peak. Arrow holds
+    # the same content several times smaller, so flushing bounds the peak at one chunk.
+    shards, rows = [], []
+    CHUNK = 50_000
+
+    def _flush():
+        if rows:
+            shards.append(Dataset.from_list(rows))
+            rows.clear()
+
+    seen = 0
+    for i, batch in enumerate(tqdm(hf_dataset.batch(batch_size), total=n_batches)):
+        if seen >= dataset_config.max_samples:
+            print(f"[cache] stream yielded more than {dataset_config.max_samples} samples; "
+                  f"stopping at the configured limit")
+            break
         text_batch = batch[dataset_config.text_field]
+        # trim the final batch: max_samples need not be a multiple of the batch size, and
+        # at many signals per text an overshoot of a few texts is a few thousand rows
+        room = dataset_config.max_samples - seen
+        if len(text_batch) > room:
+            text_batch = text_batch[:room]
+        seen += len(text_batch)
         batch_row = create_batch_example(
             texts=text_batch,
             signals=signals,
@@ -280,8 +311,13 @@ def build_split(
         )
 
         rows.extend(batch_row)
+        if len(rows) >= CHUNK:
+            _flush()
+    _flush()
 
-    return Dataset.from_list(rows)
+    if not shards:
+        return Dataset.from_list([])
+    return shards[0] if len(shards) == 1 else concatenate_datasets(shards)
 
 
 def report_signal_statistics(dataset: Dataset):
@@ -558,6 +594,12 @@ def main():
         hf_dataset_dev = hf_dataset_dev.skip(dev_skip)
         hf_dataset_dev = _apply_min_len(hf_dataset_dev, config.train_dataset, length_tokenizer)
         hf_dataset_dev = hf_dataset_dev.take(config.dev_dataset.max_samples)
+
+        # DO NOT REMOVE. Without this the test stream is unbounded and build_split walks
+        # the entire split -- 364,608 documents for C4-en validation instead of the
+        # configured few thousand. It does not error; it just runs ~100x too long and,
+        # at many signals per text, accumulates enough rows to exhaust memory.
+        hf_dataset_test = hf_dataset_test.take(config.test_dataset.max_samples)
     else:
         hf_dataset_dev = _apply_min_len(hf_dataset_dev, config.train_dataset, length_tokenizer)
 

@@ -132,9 +132,21 @@ def derive_config(base_config: ExperimentConfig, corpus: str, spec: dict,
     # The OFFSET matters as much as the size: inheriting the run's usual 1,000,000 would
     # make .skip() walk a million streaming documents per derived cache, which reads as
     # a hang rather than an error.
-    cfg.train_dataset = cfg.train_dataset.model_copy(update={"max_samples": 64})
+    # CANONICALISE THE TRAINING SIDE. dataset_identity hashes all three splits and all
+    # three token selectors, so a derived config still carried train_dataset.max_seq_length,
+    # the training token selector and the dev split -- none of which affect one byte of the
+    # test data. Two runs differing only in training length or window therefore derived
+    # DIFFERENT cache names for identical eval data and each rebuilt it from scratch
+    # (measured: 6 distinct caches for one eval split; across the sweep, ~200 where 20
+    # would do). Pinning these to fixed values makes the derived identity depend only on
+    # what actually varies the test rows: corpus, min_seq_length, signals, selector, size.
+    # NOT a change to dataset_identity itself -- training caches keep their names.
+    canon = {"max_samples": 64, "max_seq_length": cfg.test_dataset.max_seq_length}
+    cfg.train_dataset = cfg.train_dataset.model_copy(update=canon)
     cfg.dev_dataset = cfg.dev_dataset.model_copy(update={
-        "max_samples": 64, "offset": 2000, "split": cfg.train_dataset.split})
+        **canon, "offset": 2000, "split": cfg.train_dataset.split})
+    cfg.train_token_selector = cfg.test_token_selector
+    cfg.dev_token_selector = cfg.test_token_selector
     cfg.dataset_name = None
     cfg.dataset_name = canonical_dataset_name(cfg)
     cfg.experiment_name = f"{base_config.experiment_name}__ood_{corpus}"
