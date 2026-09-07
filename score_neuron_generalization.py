@@ -98,8 +98,32 @@ def _activation_stats(raw) -> pd.DataFrame:
                          }).reset_index()
 
 
+def resolve_eval_cache(config: ExperimentConfig, pool_config: str | Path | None):
+    """Which cached test split to evaluate on, and which neurons it holds.
+
+    A run's OWN cache only contains the neurons it trained on, because sizing it to hold
+    all 200 would multiply its train split by 200 (300k texts x 200 neurons = 60M rows,
+    almost all of it built and never used). So the held-out neurons come from a separate
+    POOL config -- typically the cell config the sweep already generated and cached,
+    whose test split carries every neuron at a text count sized for evaluation only.
+
+    Falls back to the run's own test split when no pool is given, which yields a seen
+    arm and an empty unseen arm rather than an error.
+    """
+    if pool_config is None:
+        return config, load_from_disk(str(config.dataset_cache_dir / "test"))
+    pool = ExperimentConfig.model_validate_json(Path(pool_config).read_text())
+    path = pool.dataset_cache_dir / "test"
+    if not path.exists():
+        raise SystemExit(
+            f"neuron-gen pool cache missing: {path}. Build it first with\n"
+            f"    python cache_signals.py --config {pool_config}")
+    return pool, load_from_disk(str(path))
+
+
 def evaluate_neuron_generalization(model, config: ExperimentConfig, tokenizer, collator,
-                                   preprocess_fn, output_dir, max_unseen: int | None = None):
+                                   preprocess_fn, output_dir, max_unseen: int | None = None,
+                                   pool_config: str | Path | None = None):
     """
     Evaluate one trained checkpoint on EVERY neuron in the cache, in a single pass,
     labelling each as trained or held-out afterwards.
@@ -119,7 +143,10 @@ def evaluate_neuron_generalization(model, config: ExperimentConfig, tokenizer, c
     from train_introspector_with_intervention import evaluate_interventional_test
 
     output_dir = Path(output_dir)
-    test_raw = load_from_disk(str(config.dataset_cache_dir / "test"))
+    _pool_cfg, test_raw = resolve_eval_cache(config, pool_config)
+    # The partition is defined by THIS run's trained signals, read against whatever the
+    # pool cache happens to hold -- so the same pool serves every run in the sweep and
+    # each one labels it differently.
     seen, unseen = split_seen_unseen(config, test_raw)
     if max_unseen is not None and max_unseen < len(unseen):
         keep = set(seen) | set(unseen[:max_unseen])

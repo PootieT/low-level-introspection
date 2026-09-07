@@ -381,6 +381,26 @@ class JointInterventionTrainer(InterventionTrainer):
         return (loss, out) if return_outputs else loss
 
 
+def _checkpoint_is_complete(ckpt) -> bool:
+    """True when this checkpoint already sits at the end of its training run.
+
+    Matters because trainer.train(resume_from_checkpoint=...) on a FINISHED run is not
+    a no-op: with ignore_data_skip off (the default) the Trainer walks the dataloader
+    forward to restore data order before training zero further steps. At 300k examples
+    that is many minutes of collating batches it will never use, and it presents as a
+    progress bar frozen at 0/<max_steps> with no error -- indistinguishable from a hang.
+    """
+    state = Path(ckpt) / "trainer_state.json"
+    if not state.exists():
+        return False
+    try:
+        st = json.loads(state.read_text())
+    except Exception:
+        return False
+    gs, ms = st.get("global_step"), st.get("max_steps")
+    return bool(gs and ms and gs >= ms)
+
+
 def _text_len_from_mask(batch) -> torch.Tensor:
     """Tokenized text length (BOS included) per row, recovered from the LoRA gate mask.
 
@@ -1158,14 +1178,25 @@ def main():
         torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32)
     base.resize_token_embeddings(len(tokenizer))
     diag_ckpt = None
-    load_from_ckpt = (args.diag_only or args.ood_only or args.length_only
-                      or args.neuron_gen_only)
+    eval_only_flags = (args.diag_only or args.ood_only or args.length_only
+                       or args.neuron_gen_only)
+    _ckpts = glob.glob(f"{output_dir}/checkpoint-*")
+    _latest = (Path(args.checkpoint) if args.checkpoint
+               else (Path(max(_ckpts, key=os.path.getctime)) if _ckpts else None))
+    # A run that finished training and then died in a downstream eval leaves a complete
+    # checkpoint. Re-entering trainer.train() on it trains nothing but still replays the
+    # dataloader (see _checkpoint_is_complete), so load the weights directly instead.
+    training_complete = (_latest is not None and not args.overwrite_cache
+                         and not eval_only_flags and _checkpoint_is_complete(_latest))
+    if training_complete:
+        print(f"[joint] {_latest.name} is already at the end of training "
+              f"(global_step == max_steps); loading its weights and skipping "
+              f"trainer.train(). Pass --overwrite-cache to retrain from scratch.")
+    load_from_ckpt = eval_only_flags or training_complete
     if load_from_ckpt:
         # load a specific (possibly mid-run) checkpoint's adapter for eval WITHOUT training
         from peft import PeftModel
-        ckpts = glob.glob(f"{output_dir}/checkpoint-*")
-        diag_ckpt = Path(args.checkpoint) if args.checkpoint else (
-            Path(max(ckpts, key=os.path.getctime)) if ckpts else None)
+        diag_ckpt = _latest
         if diag_ckpt is None:
             raise SystemExit("--diag-only/--ood-only/--length-only/--neuron-gen-only "
                              "need a checkpoint "
@@ -1291,8 +1322,12 @@ def main():
         print(f"[joint] diag-only: loaded {diag_ckpt}; writing diagnostics to {eval_out_dir}")
     elif ckpt_dirs and not args.overwrite_cache:
         latest = str(args.checkpoint) if args.checkpoint else max(ckpt_dirs, key=os.path.getctime)
-        print(f"Found checkpoint, resuming/loading from {latest}")
-        train_results = trainer.train(resume_from_checkpoint=latest)
+        if training_complete:
+            # adapter weights already loaded above via PeftModel.from_pretrained
+            print(f"[joint] using completed checkpoint {latest} as-is; going straight to evals")
+        else:
+            print(f"Found PARTIAL checkpoint, resuming training from {latest}")
+            train_results = trainer.train(resume_from_checkpoint=latest)
         load_regression_head(model, latest)
         load_added_token_embeddings(model, latest)
     else:

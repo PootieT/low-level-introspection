@@ -15,16 +15,29 @@
 # NEURON GENERALIZATION: does the readout carry neurons it was never trained on,
 # and what does adding neurons cost the ones already there?
 #
-# One (layer, position) cell is cached ONCE with 200 neurons -- one forward pass per
-# text yields every neuron's activation, so the marginal cost of the 200th is nothing.
-# The first 100 are the TRAIN pool, the last 100 are held out and never trained. Every
-# run trains on a prefix of the train pool and is evaluated on both arms off that same
-# cached test split (no second dataset, no extra caching).
+# TWO caches, and the split between them is the whole trick:
 #
-# ARM A -- scaling (tasks 1-5): N = 1, 3, 10, 30, 100 neurons, TOTAL examples fixed.
+#   POOL cache (shared, built once)   3k texts x 200 neurons, TEST SPLIT ONLY. Its train
+#       split is stubbed to 64 texts because nothing trains on it. This is what the
+#       unseen arm reads: it holds every neuron, trained or not.
+#   PER-CELL train cache              (TARGET_ROWS / N) texts x N neurons. Sized so every
+#       cell costs the SAME number of rows, which is what "fixed total budget" means.
+#
+# Why not one shared cache for both. A row is one (text, neuron) pair, and max_samples
+# counts TEXTS, so rows = texts x neurons. Sizing a single cache to serve the N=1 cell
+# (300k texts, so that 1 neuron reaches the budget) while also holding 200 neurons gives
+# 300k x 200 = 60 MILLION rows -- roughly 15 GB with text_input_ids duplicated per row --
+# of which each run would use 300k. Splitting it costs 443k forward passes across the
+# five cells against 300k for one, since a forward serves every neuron of a text at once,
+# and drops the cache from 60M rows to about 2M.
+#
+# ARM A -- scaling (tasks 1-5): N = 1, 3, 10, 30, 100 neurons, TOTAL ROWS fixed.
 #   Prefixes are NESTED, so neuron #1 is in every run and its fidelity can be tracked
 #   as N grows. That is the interference measurement: does training neuron 100 damage
-#   neuron 1? Non-nested sets would confound it with neuron heterogeneity.
+#   neuron 1? Non-nested sets would confound it with neuron heterogeneity. The prefix is
+#   cut from the POOL's neuron list explicitly rather than by re-sampling at a smaller
+#   signals_per_layer -- random.sample gives no guarantee that sample(pool, 10) is a
+#   prefix of sample(pool, 200), so re-sampling could silently break the nesting.
 #
 # ARM B -- data-matched null (tasks 6-9; arm A's N=1 cell serves as its full-data point): N = 1 neuron, examples = TOTAL/{1,3,10,30,100}.
 #   Arm A holds total data fixed, so per-neuron data falls as 1/N. That is deliberate --
@@ -88,8 +101,9 @@ index=$(($SGE_TASK_ID-1))
 LAYER=4                  # same layer as the length-gen experiment, and in the main
                          # layer/token grid's list, so the three are comparable
 TOKEN_POS=-1
-N_CACHE=200              # 100 train pool + 100 held out, cached once
-N_POOL=100               # first N_POOL of the cached set are trainable
+N_CACHE=200              # neurons in the POOL cache: trainable prefix + held-out rest
+TARGET_ROWS=300000       # (text, neuron) pairs per run -- the fixed budget for arm A
+N_POOL_TEST=3000         # texts in the pool cache's test split (rows = this x 200)
 SEED=21                  # same sampler seed as the layer/token grid
 
 GATE=off
@@ -100,8 +114,7 @@ LORA_R=16
 LORA_ALPHA=$((LORA_R * 2))
 LORA_DO=0.0
 BS=32
-N_TOTAL=300000           # total TRAIN examples, held fixed across arm A
-N_TEST=3000
+N_TEST=3000              # texts in each run's OWN test split
 MIN_LEN=""               # no length floor: pos=-1 needs no length guarantee, and a
                          # floor would make this cache incomparable to the pos=-1 runs
 PROMPT_TYPE=prompt_no_token_index   # neuron is named by index either way; the token
@@ -113,17 +126,19 @@ PROMPT_TYPE=prompt_no_token_index   # neuron is named by index either way; the t
 # listed once and shared: with a fixed seed a second copy would be bit-identical, not a
 # noise estimate. Arm B therefore has 4 tasks, not 5.
 CELLS=(
-  # arm A: scaling, total data fixed
-  "1:$N_TOTAL"  "3:$N_TOTAL"  "10:$N_TOTAL"  "30:$N_TOTAL"  "100:$N_TOTAL"
+  # arm A: scaling, total ROWS fixed
+  "1:$TARGET_ROWS"  "3:$TARGET_ROWS"  "10:$TARGET_ROWS"  "30:$TARGET_ROWS"  "100:$TARGET_ROWS"
   # arm B: data-matched null, 1 neuron at arm A's per-neuron budget
-  "1:$((N_TOTAL/3))"  "1:$((N_TOTAL/10))"  "1:$((N_TOTAL/30))"  "1:$((N_TOTAL/100))"
+  "1:$((TARGET_ROWS/3))"  "1:$((TARGET_ROWS/10))"  "1:$((TARGET_ROWS/30))"  "1:$((TARGET_ROWS/100))"
 )
 ARMS=(A A A A A B B B B)
 
 CELL=${CELLS[$index]}
 ARM=${ARMS[$index]}
 N_NEURONS=${CELL%%:*}
-N_TRAIN=${CELL##*:}
+N_ROWS=${CELL##*:}
+# rows = texts x neurons, and --train-max-samples counts TEXTS
+N_TEXTS=$((N_ROWS / N_NEURONS))
 
 # set to --overwrite-cache to force config/dataset/run regeneration
 OVERWRITE=""
@@ -133,23 +148,23 @@ if [ -n "$MIN_LEN" ]; then MIN_FLAG="--min-seq-length $MIN_LEN"; else MIN_FLAG="
 
 EXP_GROUP=mlp_neurongen
 
-# ---- step 1: one shared 200-neuron cache for the cell ----------------------
-# Every run passes the SAME 200-signal sampler, so all 10 tasks resolve to ONE canonical
-# dataset name and the cache is built once. --signal-filter selects each run's subset
-# and is deliberately NOT part of the cache identity.
+# ---- step 1: the shared POOL cache (test split only) -----------------------
+# All 200 neurons over N_POOL_TEST texts. Every task generates the identical config, so
+# it resolves to ONE canonical dataset name and is built once; the rest no-op.
+# Train/dev are stubbed to 64 texts -- nothing trains here, and at 200 neurons every
+# extra text costs 200 rows.
 SAMPLER="{\"type\":\"uniform_layer_sampler\",\"signal_type\":\"mlp\",\"layers\":[${LAYER}],\"signals_per_layer\":${N_CACHE},\"seed\":${SEED}}"
-CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_L${LAYER}_POS${TOKEN_POS}.json
+POOL_CONFIG=experiment_configs/$EXP_GROUP/_pool_L${LAYER}_POS${TOKEN_POS}.json
 
 python generate_experiment_config.py \
-    --experiment-name "_cell_L${LAYER}_POS${TOKEN_POS}" \
+    --experiment-name "_pool_L${LAYER}_POS${TOKEN_POS}" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" \
-    --train-max-samples $N_TOTAL \
-    --dev-max-samples 200 \
-    --dev-dataset-split "validation" \
-    --dev-offset-from-train 8000 \
+    --train-max-samples 64 \
+    --dev-max-samples 64 \
+    --dev-offset-from-train 2000 \
     --test-dataset allenai/c4 --test-dataset-split "validation" \
-    --test-max-samples $N_TEST \
+    --test-max-samples $N_POOL_TEST \
     --max-seq-length 32 $MIN_FLAG \
     --hf-data-kwargs '{"config": "en", "streaming": true}' \
     --train-signals "$SAMPLER" \
@@ -160,35 +175,35 @@ python generate_experiment_config.py \
     --prompt-type $PROMPT_TYPE \
     --precision 3 \
     --cache-dir data --output-dir outputs/runs/$EXP_GROUP \
-    --output "$CELL_CONFIG"
+    --output "$POOL_CONFIG"
 
 # the full cached neuron list, in sampler order -- the prefix structure below depends
 # on this order being stable, which the per-(seed,layer) sampler guarantees
 ALL_NEURONS=($(python -c "
 import json
-cfg = json.load(open('$CELL_CONFIG'))
+cfg = json.load(open('$POOL_CONFIG'))
 print(' '.join(f\"N{s['layer']}.{s['index']}\" for s in cfg['train_signals']))
 "))
-ALL_LIST=$(IFS=,; echo "${ALL_NEURONS[*]}")
 
-python cache_signals.py --config "$CELL_CONFIG" $OVERWRITE
+python cache_signals.py --config "$POOL_CONFIG" $OVERWRITE
 
 # ---- step 2: this task's run ----------------------------------------------
 # NESTED prefix of the train pool: run with N neurons trains on the first N, so every
 # run shares neuron #1 and the interference readout is meaningful.
 TRAIN_NEURONS=$(IFS=,; echo "${ALL_NEURONS[*]:0:$N_NEURONS}")
 
-EXP_NAME="neurongen_arm${ARM}_L${LAYER}_n${N_NEURONS}_d${N_TRAIN}_gate${GATE}_w${W}"
+EXP_NAME="neurongen_arm${ARM}_L${LAYER}_n${N_NEURONS}_r${N_ROWS}_gate${GATE}_w${W}"
 CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
-echo "task=$SGE_TASK_ID arm=$ARM neurons=$N_NEURONS train_examples=$N_TRAIN -> $EXP_NAME"
+echo "task=$SGE_TASK_ID arm=$ARM neurons=$N_NEURONS rows=$N_ROWS texts=$N_TEXTS -> $EXP_NAME"
 
-# --train-signals is the FULL cached list so the cache identity matches the cell config;
-# --signal-filter is what actually restricts this run to its N neurons.
+# This run's OWN cache holds exactly its N neurons over N_TEXTS texts, so it is already
+# the right size and needs no --signal-filter and no row cap. The held-out neurons come
+# from the pool cache at eval time (--neuron-gen-pool-config).
 python generate_experiment_config.py \
     --experiment-name "$EXP_NAME" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" \
-    --train-max-samples $N_TOTAL \
+    --train-max-samples $N_TEXTS \
     --dev-max-samples 200 \
     --dev-dataset-split "validation" \
     --dev-offset-from-train 8000 \
@@ -196,10 +211,9 @@ python generate_experiment_config.py \
     --test-max-samples $N_TEST \
     --max-seq-length 32 $MIN_FLAG \
     --hf-data-kwargs '{"config": "en", "streaming": true}' \
-    --train-signals "$ALL_LIST" \
-    --test-signals "$ALL_LIST" \
+    --train-signals "$TRAIN_NEURONS" \
+    --test-signals "$TRAIN_NEURONS" \
     --same-train-test-signals \
-    --signal-filter "$TRAIN_NEURONS" \
     --train-token-selector=$TOKEN_POS \
     --test-token-selector=$TOKEN_POS \
     --prompt-type $PROMPT_TYPE \
@@ -219,15 +233,14 @@ python generate_experiment_config.py \
     --output "$CONFIG" \
     $OVERWRITE
 
-# max-train-examples caps the TRAIN rows for arm B without rebuilding the cache
 python train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     --force-drift-eval \
-    --max-train-examples $N_TRAIN \
     --neuron-gen-eval \
+    --neuron-gen-pool-config "$POOL_CONFIG" \
     $OVERWRITE
 
 # Re-run ONLY the neuron-generalization eval on an existing checkpoint:
 #   python train_introspector_joint.py --config "$CONFIG" --joint-loss-weight $W \
-#       --neuron-gen-only
+#       --neuron-gen-only --neuron-gen-pool-config "$POOL_CONFIG"
