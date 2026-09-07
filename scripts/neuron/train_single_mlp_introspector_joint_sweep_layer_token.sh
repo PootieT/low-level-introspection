@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1-128
+#$ -t 18
 
 # ============================================================================
 # MAIN GRID: joint introspection training across 8 layers x 8 token positions,
@@ -67,9 +67,10 @@ set -e
 # outer they are 64 tasks apart, and every set of concurrently-running tasks touches a
 # DIFFERENT cell. (For a hard guarantee, run a cache-only pass first and submit the
 # training array with -hold_jid.)
+SGE_TASK_ID=10
 index=$(($SGE_TASK_ID-1))
 LAYERS=(0 2 4 6 8 10 12 14)
-POSS=(-1 -4 -8 -12 -16 -20 -24 -28)
+POSS=(-1 -4 -8 -12 -16 -20 -24 -28)  # (2,-4):10, (2,-12):12, (4, -4):18
 REGIMES=("kl0.1" "unanchored")
 REGIME=${REGIMES[$((index / 64))]}
 cell_idx=$((index % 64))
@@ -199,6 +200,14 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
       --joint-loss-weight $W \
       $KL_FLAG \
       $OOD_FLAG \
+      $OVERWRITE
+
+  python train_introspector_joint.py \
+      --config "$CONFIG" \
+      --joint-loss-weight $W \
+      $KL_FLAG \
+      $OOD_FLAG \
+      --ood-only \
       $OVERWRITE
 
   # LM cost. Both scorers skip when their output exists, so resubmitting a partially

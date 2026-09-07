@@ -160,7 +160,7 @@ LORA_ALPHA=$((LORA_R * 2))
 LORA_DO=0.0
 BS=32
 N_TRAIN=300000           # held FIXED across cells on purpose -- see header
-N_TEST=3000
+N_TEST=30000
 
 # PROMPT: the index arm. At 128 tokens duplicate tokens are near-certain, so naming a
 # token by its string alone is genuinely ambiguous and the index is not optional.
@@ -174,7 +174,7 @@ OVERWRITE=""
 
 if [ "$GATE" = "on" ]; then GATE_FLAG="--disable-adapter-in-input"; else GATE_FLAG=""; fi
 
-EXP_GROUP=mlp_lengen
+if [ "$PROMPT_TYPE" = "prompt_with_token_index" ]; then EXP_GROUP="mlp_lengen"; else GATE_FLAG="mlp_lengen_prompt_no_token_index"; fi
 EXP_NAME="lengen_N${SIG}_len${TRAIN_LEN}_win${WINDOW}_gate${GATE}_${KL_TAG}_w${W}"
 CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
 echo "task=$SGE_TASK_ID cell=$CELL neuron=$SIG -> $EXP_NAME"

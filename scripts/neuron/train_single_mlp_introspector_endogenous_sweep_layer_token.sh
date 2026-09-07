@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 58,61
+#$ -t 1-128
 
 # ============================================================================
 # ENDOGENOUS-ONLY (no interventional loss) regressor sweep over
@@ -75,10 +75,7 @@ GATE=${GATES[$((index / 64))]}
 cell_idx=$((index % 64))
 LAYER=${LAYERS[$((cell_idx / 8))]}
 TOKEN_POS=${POSS[$((cell_idx % 8))]}
-#     eval_type  layer  position  n_neurons   jobid
-#    endogenous      4       -24          7   63
-#    endogenous     10        -8          1   43
-#    endogenous     14       -24         10   23
+
 # GATE now comes from the array index -- both arms in one submission:
 #   on  = gated. No trainable parameter touches the introspected token, so the model
 #         cannot read the neuron: interventional corr pins at 0, and whatever endogenous
@@ -201,4 +198,12 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
       $DRIFT \
       $OOD_FLAG \
       $OVERWRITE
+
+  python train_introspector_joint.py \
+    --config "$CONFIG" \
+    --joint-loss-weight $W \
+    $DRIFT \
+    $OOD_FLAG \
+    --ood-only \
+    $OVERWRITE
 done
