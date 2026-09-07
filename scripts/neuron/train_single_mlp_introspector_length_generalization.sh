@@ -61,6 +61,23 @@
 #   NOTE this makes these runs NOT directly comparable to the earlier unfiltered pos=-1
 #   sweeps; min_seq_length is part of the cache identity, so they will not collide.
 #
+# KL: UNCONSTRAINED, and this is not a free choice -- a budget would silently decide
+#   the result. From the layer-10 KL sweep already in outputs/, interventional corr:
+#       distance  0 (pos -1) : KL 0.1 -> 0.845    unconstrained -> 0.836
+#       distance 27 (pos -28): KL 0.1 -> 0.185    KL 3.0 -> 0.726    unconstrained -> 0.957
+#   A budget that is ample at distance 0 is catastrophic at distance 27. Running this
+#   grid at KL 0.1 would starve every wide-window cell and the curve would read as
+#   "no length generalization" when it was really "no capacity". So the budget is
+#   removed as a variable here and the grid measures the mechanism.
+#   NOTE this does NOT measure capacity. Unconstrained training drifts as far as the
+#   optimizer finds convenient, not as far as the task requires, and with the anchor on
+#   the achieved KL just tracks the target by construction -- neither is a minimum.
+#   Capacity is the KNEE of the budget-vs-performance frontier, so measure it with a KL
+#   sweep on a few cells (e.g. len 128 x windows 16/64/128 x KL {0.1,0.3,1,3,inf}) and
+#   read how the knee moves with window width. Also note the unconstrained arm wrecks
+#   the LM (ppl x500+ at gate-off), so it answers "does the mechanism exist and
+#   generalize", not "is this deployable".
+#
 # DATA: total examples held FIXED across all cells, deliberately. As the window widens,
 #   examples per position fall -- and that is the measurement, not a confound. If
 #   positions share one mechanism, examples are fungible across them and per-position
@@ -99,7 +116,17 @@ CELLS=(
   "64:16"  "64:32"  "64:64"
   "128:16" "128:32" "128:64" "128:128"
 )
-NEURONS=(10.24 10.1087 10.3391 10.5507 10.7802)
+# LAYER 4, not 10. The injected signal has to be carried by ATTENTION from the
+# introspected position to the readout position, and attention can only move it in
+# layers ABOVE the injection site. Llama-3.2-1B has 16 layers, so injecting at L10
+# leaves 6 layers of transport and L4 leaves 12 -- and transport across distance is
+# exactly the thing this experiment asks to generalize. Not earlier than ~4: neurons in
+# the first couple of layers are close to token-identity detectors, which makes the
+# ENDOGENOUS half solvable by reading the token off the input (bypass) and inflates its
+# correlation for the wrong reason. The interventional half stays valid either way.
+# These are the same 5 neurons the layer/token grid draws at L4 (seed 21, first 5 of
+# 10), so the two experiments are directly comparable at this layer.
+NEURONS=(4.5676 4.520 4.1216 4.6896 4.6386)
 
 # NEURON is the FAST axis and CELL the slow one, so the 5 tasks that share a cell's
 # dataset cache are adjacent -- but they are then serialized by the cache-build race,
@@ -126,7 +153,7 @@ GATE=off                 # adapter active over the input text; gate-on cannot re
                          # earlier positions at all (no trainable param at the site)
 W=0.01                   # weight on the ENDOGENOUS term; interventional gets (1-W)
 SCALE=10
-KL=0.1                   # KL budget: gate-off collapses the LM without an anchor
+KL_TAG=klinf             # unconstrained -- see below; no --kl-anchor-target is passed
 LR=5e-5
 LORA_R=16
 LORA_ALPHA=$((LORA_R * 2))
@@ -148,7 +175,7 @@ OVERWRITE=""
 if [ "$GATE" = "on" ]; then GATE_FLAG="--disable-adapter-in-input"; else GATE_FLAG=""; fi
 
 EXP_GROUP=mlp_lengen
-EXP_NAME="lengen_N${SIG}_len${TRAIN_LEN}_win${WINDOW}_gate${GATE}_kl${KL}_w${W}"
+EXP_NAME="lengen_N${SIG}_len${TRAIN_LEN}_win${WINDOW}_gate${GATE}_${KL_TAG}_w${W}"
 CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
 echo "task=$SGE_TASK_ID cell=$CELL neuron=$SIG -> $EXP_NAME"
 
@@ -206,7 +233,6 @@ python train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     --force-drift-eval \
-    --kl-anchor-target $KL \
     --length-eval \
     --eval-lengths $EVAL_LENGTHS \
     $OVERWRITE
