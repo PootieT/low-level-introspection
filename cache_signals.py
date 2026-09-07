@@ -316,6 +316,46 @@ def _git_sha():
         return None
 
 
+def _raw_span(n_filtered: int, floor, config, tokenizer, probe: int = 2000) -> int:
+    """How many RAW documents a take(n_filtered) actually consumes.
+
+    Without a floor the two are equal. With one, the filter's pass rate is estimated on
+    a short prefix and the span is n/pass_rate. This is what makes dev's raw offset
+    checkable: train takes n FILTERED documents but walks past far more raw ones, and
+    an offset that looked safe against max_samples can land inside train's raw span.
+    """
+    if not floor or not n_filtered:
+        return n_filtered or 0
+    ds_cfg = config.train_dataset
+    kwargs = dict(ds_cfg.hf_data_kwargs)
+    name_config = kwargs.pop("config", None)
+    args = (ds_cfg.name, name_config) if name_config else (ds_cfg.name,)
+    stream = load_dataset(*args, split=ds_cfg.split, **kwargs)
+    kept = seen = 0
+    for ex in stream:
+        seen += 1
+        if len(tokenizer(ex[ds_cfg.text_field], add_special_tokens=True)["input_ids"]) >= floor:
+            kept += 1
+        if seen >= probe:
+            break
+    rate = max(kept / seen, 1e-3) if seen else 1.0
+    span = int(n_filtered / rate)
+    print(f"[cache] min_seq_length={floor}: ~{rate*100:.1f}% of documents pass "
+          f"(probe n={seen}); take({n_filtered}) spans ~{span} raw documents")
+    return span
+
+
+def _assert_dev_disjoint(dev_skip: int, train_raw_span: int, floor) -> None:
+    """Dev's raw offset must clear the raw span train consumed, or the splits overlap."""
+    if dev_skip >= train_raw_span:
+        return
+    raise ValueError(
+        f"dev offset ({dev_skip} raw documents) lands inside train's raw span "
+        f"(~{train_raw_span} documents: max_samples filtered at min_seq_length={floor}). "
+        f"Train and dev would overlap. Raise --dev-offset-from-train above "
+        f"{train_raw_span}, or point dev at a different split.")
+
+
 def _realized_stats(dataset) -> dict:
     """Observed sequence-length and introspected-position distribution of a built split.
 
@@ -471,15 +511,55 @@ def main():
             lambda ex: len(tokenizer(ex[field], add_special_tokens=True)["input_ids"]) >= floor)
 
     length_tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    floor = config.train_dataset.min_seq_length
+
+    # DEV's skip happens on the RAW stream, BEFORE the filter; train and test filter
+    # first. The asymmetry is deliberate and it is a large constant factor:
+    # .skip(n) on a filtered stream has to TOKENIZE every document it walks past, at
+    # roughly 1.1k docs/s versus 2.9k docs/s for the raw stream -- and it walks past
+    # n/pass_rate of them, not n. Measured on C4-en at a 128-token floor, skipping a
+    # million documents costs ~21 min filtered against ~6 min raw. That reads as a hang.
+    # Filtering AFTER the skip is still correct as long as the raw offset clears the raw
+    # span train consumed, which _assert_dev_disjoint checks below instead of assuming.
     hf_dataset_train = _apply_min_len(hf_dataset_train, config.train_dataset, length_tokenizer)
-    hf_dataset_dev = _apply_min_len(hf_dataset_dev, config.train_dataset, length_tokenizer)
     hf_dataset_test = _apply_min_len(hf_dataset_test, config.test_dataset, length_tokenizer)
 
     # assume dataset is large and is not truncated so using streaming mode
     if isinstance(hf_dataset_train, IterableDataset):
         hf_dataset_train = hf_dataset_train.take(config.train_dataset.max_samples)
-        hf_dataset_dev = hf_dataset_dev.skip(max(config.train_dataset.max_samples, config.dev_dataset.offset)).take(config.dev_dataset.max_samples)
-        hf_dataset_test = hf_dataset_test.take(config.test_dataset.max_samples)
+
+        # Only guard against train when dev is drawn from the SAME split. Previously the
+        # max() applied unconditionally, so pointing dev at a different split still paid
+        # a max_samples-sized skip it had no reason to pay.
+        same_stream = config.dev_dataset.split == config.train_dataset.split
+        if same_stream:
+            train_raw_span = _raw_span(config.train_dataset.max_samples, floor,
+                                       config, length_tokenizer)
+            dev_skip = max(train_raw_span, config.dev_dataset.offset)
+            _assert_dev_disjoint(dev_skip, train_raw_span, floor)
+        else:
+            dev_skip = config.dev_dataset.offset
+            # Dev on a different split from train usually means the TEST split, and then
+            # the collision to worry about is with test, not train. Same trap as above:
+            # test takes max_samples FILTERED rows and walks past more raw ones, so an
+            # offset equal to test's max_samples still lands inside it.
+            if (config.dev_dataset.split == config.test_dataset.split
+                    and config.train_dataset.name == config.test_dataset.name):
+                test_raw_span = _raw_span(config.test_dataset.max_samples, floor,
+                                          config, length_tokenizer)
+                if dev_skip < test_raw_span:
+                    raise ValueError(
+                        f"dev offset ({dev_skip}) lands inside TEST's raw span "
+                        f"(~{test_raw_span} documents) -- dev and test share split "
+                        f"'{config.test_dataset.split}' of {config.test_dataset.name} and "
+                        f"would overlap. Raise --dev-offset-from-train above {test_raw_span}.")
+        print(f"[cache] dev: skip {dev_skip} raw documents"
+              f"{' (same split as train)' if same_stream else ' (separate split)'}")
+        hf_dataset_dev = hf_dataset_dev.skip(dev_skip)
+        hf_dataset_dev = _apply_min_len(hf_dataset_dev, config.train_dataset, length_tokenizer)
+        hf_dataset_dev = hf_dataset_dev.take(config.dev_dataset.max_samples)
+    else:
+        hf_dataset_dev = _apply_min_len(hf_dataset_dev, config.train_dataset, length_tokenizer)
 
 
     # load model and tokenizer

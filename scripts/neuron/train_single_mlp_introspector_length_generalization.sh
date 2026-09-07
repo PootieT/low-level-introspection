@@ -78,6 +78,15 @@
 #   the LM (ppl x500+ at gate-off), so it answers "does the mechanism exist and
 #   generalize", not "is this deployable".
 #
+# DEV comes from VALIDATION, not from a million-document skip into train. Building
+#   dev used to be the slowest part of a cache: on a STREAMING dataset .skip(1_000_000)
+#   really does walk a million documents (~6 min), and with a length floor in front of
+#   it, it TOKENIZES every one it walks past (~21 min). Dev only needs to be disjoint
+#   from the other splits, so it takes validation documents past test's slice instead:
+#   ~8k documents, a few seconds. The offset clears test's RAW span (3000 rows at a
+#   ~73% pass rate is ~4.1k documents, not 3000) -- cache_signals checks this rather
+#   than trusting it, and refuses to build overlapping splits.
+#
 # DATA: total examples held FIXED across all cells, deliberately. As the window widens,
 #   examples per position fall -- and that is the measurement, not a confound. If
 #   positions share one mechanism, examples are fungible across them and per-position
@@ -190,6 +199,7 @@ python generate_experiment_config.py \
     --train-dataset-split "train" \
     --train-max-samples $N_TRAIN \
     --dev-max-samples 200 \
+    --dev-dataset-split "validation" \
     --dev-offset-from-train 1000000 \
     --test-dataset allenai/c4 \
     --test-dataset-split "validation" \
