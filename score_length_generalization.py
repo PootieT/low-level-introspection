@@ -66,7 +66,8 @@ DISTANCE_BINS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 
 # preprocess_example truncates on training_config.max_seq_length, which has to cover
 # text + introspection prompt + target. Too small and the introspected token is cut off
-# entirely -- assert_positions_intact refuses to run rather than let the hooks clamp it
+# entirely -- drop_invalid_positions drops those rows (or refuses, if there are enough
+# to mean something is misconfigured) rather than let the hooks clamp them
 # to the wrong token.
 PROMPT_HEADROOM = 40
 
@@ -117,8 +118,19 @@ def derive_config(base_config: ExperimentConfig, eval_len: int, config_dir: Path
     # Nothing trains here, but cache_signals builds all three splits. Shrink them, and
     # keep dev's offset small: on a streaming dataset the run's usual .skip(1_000_000)
     # actually iterates a million documents per cache build, which reads as a hang.
+    # Dev is only built because cache_signals builds all three splits; nothing here
+    # trains or validates. Point it at the TRAIN split rather than inheriting the run's
+    # dev split: the run's dev may live on the same split as this config's test (c4
+    # validation for a length eval, and for the c4_zh / c4_bn corpora), and dev would
+    # then have to clear TEST's raw span instead of a 64-row train span. Offset 2000
+    # clears the shrunken train span (64 rows is ~90 raw documents under a length floor)
+    # with a wide margin and still costs under a second.
+    # The OFFSET matters as much as the size: inheriting the run's usual 1,000,000 would
+    # make .skip() walk a million streaming documents per derived cache, which reads as
+    # a hang rather than an error.
     cfg.train_dataset = cfg.train_dataset.model_copy(update={"max_samples": 64})
-    cfg.dev_dataset = cfg.dev_dataset.model_copy(update={"max_samples": 64, "offset": 64})
+    cfg.dev_dataset = cfg.dev_dataset.model_copy(update={
+        "max_samples": 64, "offset": 2000, "split": cfg.train_dataset.split})
 
     cfg.training_config = cfg.training_config.model_copy(
         update={"max_seq_length": eval_len + PROMPT_HEADROOM})
@@ -241,7 +253,7 @@ def evaluate_length_grid(model, base_config: ExperimentConfig, tokenizer, collat
     caller: it closes over training_config.max_seq_length, and the caller's is sized for
     the TRAINING length, which would truncate every longer eval document.
     """
-    from train_introspector import preprocess_example, assert_positions_intact
+    from train_introspector import preprocess_example, drop_invalid_positions
     from train_introspector_joint import eval_endogenous_test
     from train_introspector_with_intervention import evaluate_interventional_test
     from src.introspector.prompts import PROMPT_REGISTRY
@@ -284,9 +296,8 @@ def evaluate_length_grid(model, base_config: ExperimentConfig, tokenizer, collat
                 return out
 
             ds = raw.map(preprocess, remove_columns=raw.column_names)
-            assert_positions_intact(ds, f"lengen/len{eval_len}",
-                                    cfg.training_config.max_seq_length)
-            ds = ds.remove_columns("position_valid")
+            ds = drop_invalid_positions(ds, f"lengen/len{eval_len}",
+                                        cfg.training_config.max_seq_length)
 
             suffix = f"_len{eval_len}"
             interv = evaluate_interventional_test(

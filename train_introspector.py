@@ -165,24 +165,77 @@ def preprocess_example(
     # the text. Flagged per row so the caller can refuse to train on a poisoned split
     # rather than discovering it in the results.
     if return_position_valid:
-        out["position_valid"] = int(example["token_position"]) < len(input_tokens["input_ids"])
+        n_text = len(input_tokens["input_ids"])
+        out["position_valid"] = int(example["token_position"]) < n_text
+        # Distinguishes the TWO ways a position can go out of range, which need opposite
+        # responses. Truncation is systematic and fixable (raise max_length); a
+        # decode/re-encode round trip that lands on a different token count is neither.
+        out["text_truncated"] = n_text >= max_length
 
     return out
 
 
-def assert_positions_intact(dataset, split: str, max_length: int) -> None:
-    """Refuse to train when max_length truncated away introspected tokens."""
-    if "position_valid" not in dataset.column_names:
-        return
-    bad = len(dataset) - int(sum(dataset["position_valid"]))
-    if bad:
+# A handful of rows per split is expected (decode/re-encode round trips), a systematic
+# fraction is a misconfiguration. Anything at or below this is dropped with a warning.
+POSITION_DROP_TOLERANCE = 0.001
+
+
+def drop_invalid_positions(dataset, split: str, max_length: int,
+                           tolerance: float = POSITION_DROP_TOLERANCE):
+    """Drop rows whose introspected token is not addressable, or refuse if there are many.
+
+    A row is unusable when token_position indexes past the re-tokenized text: the
+    intervention and capture hooks .clamp() the position into range, so it would train
+    on the WRONG activation while looking perfectly healthy.
+
+    There are two causes and they want opposite responses:
+
+      TRUNCATION      max_length cut the text short. Systematic, scales with the data,
+                      and fixable by raising training_config.max_seq_length to cover
+                      text + introspection prompt + target.
+      ROUND TRIP      cache_signals stores `text` as a DECODED string, so training
+                      re-tokenizes it. For a small number of documents that round trip
+                      does not reproduce the original token count, and the cached
+                      token_position no longer addresses the intended token. Not
+                      fixable by any max_length; those rows are simply unusable.
+                      (The cache also stores text_input_ids -- training from those
+                      directly would remove the round trip and this whole failure mode.)
+
+    So: drop a tolerable fraction with a warning naming the dominant cause, and raise
+    only when enough rows fail that something is actually misconfigured.
+    """
+    cols = getattr(dataset, "column_names", [])
+    if "position_valid" not in cols:
+        return dataset
+    valid = np.asarray(dataset["position_valid"], dtype=bool)
+    n_bad = int((~valid).sum())
+    drop_cols = [c for c in ("position_valid", "text_truncated") if c in cols]
+    if n_bad == 0:
+        return dataset.remove_columns(drop_cols)
+
+    frac = n_bad / len(dataset)
+    n_trunc = 0
+    if "text_truncated" in cols:
+        n_trunc = int((np.asarray(dataset["text_truncated"], dtype=bool) & ~valid).sum())
+    cause = (f"{n_trunc} truncated by max_length={max_length}, "
+             f"{n_bad - n_trunc} from decode/re-encode round trips")
+    if frac > tolerance:
         raise ValueError(
-            f"[{split}] {bad}/{len(dataset)} examples have their introspected token "
-            f"truncated away by max_length={max_length}. The intervention hook would "
-            f"clamp these to the last surviving token and train on the wrong "
-            f"activation. Raise training_config.max_length to cover text + "
-            f"introspection prompt + target."
+            f"[{split}] {n_bad}/{len(dataset)} ({frac:.2%}) examples have an "
+            f"unaddressable introspected token ({cause}). The hooks would clamp these to "
+            f"the last surviving token and train on the wrong activation. "
+            + (f"Raise training_config.max_seq_length above {max_length} to cover text + "
+               f"introspection prompt + target."
+               if n_trunc > n_bad - n_trunc else
+               "This is NOT a max_length problem -- the text re-tokenizes to a different "
+               "length than the cache recorded. Rebuild the cache, or train from the "
+               "cached text_input_ids.")
         )
+    print(f"[{split}] dropping {n_bad}/{len(dataset)} ({frac:.3%}) rows with an "
+          f"unaddressable introspected token ({cause}); under the {tolerance:.1%} "
+          f"tolerance, so continuing.")
+    kept = dataset.filter(lambda ex: ex["position_valid"])
+    return kept.remove_columns(drop_cols)
 
 
 def get_argmax_from_logits(logits, labels):

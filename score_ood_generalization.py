@@ -122,13 +122,19 @@ def derive_config(base_config: ExperimentConfig, corpus: str, spec: dict,
         max_seq_length=base_config.test_dataset.max_seq_length,
         hf_data_kwargs=test["hf_data_kwargs"],
     )
-    # Nothing trains here, but cache_signals builds all three splits, so shrink the two
-    # we never use. The OFFSET matters as much as the size: dev normally skips 1,000,000
-    # documents to stay clear of train, and on a STREAMING dataset .skip(1_000_000)
-    # actually iterates a million examples -- once per OOD cache build. That reads as a
-    # hang, not an error.
+    # Dev is only built because cache_signals builds all three splits; nothing here
+    # trains or validates. Point it at the TRAIN split rather than inheriting the run's
+    # dev split: the run's dev may live on the same split as this config's test (c4
+    # validation for a length eval, and for the c4_zh / c4_bn corpora), and dev would
+    # then have to clear TEST's raw span instead of a 64-row train span. Offset 2000
+    # clears the shrunken train span (64 rows is ~90 raw documents under a length floor)
+    # with a wide margin and still costs under a second.
+    # The OFFSET matters as much as the size: inheriting the run's usual 1,000,000 would
+    # make .skip() walk a million streaming documents per derived cache, which reads as
+    # a hang rather than an error.
     cfg.train_dataset = cfg.train_dataset.model_copy(update={"max_samples": 64})
-    cfg.dev_dataset = cfg.dev_dataset.model_copy(update={"max_samples": 64, "offset": 64})
+    cfg.dev_dataset = cfg.dev_dataset.model_copy(update={
+        "max_samples": 64, "offset": 2000, "split": cfg.train_dataset.split})
     cfg.dataset_name = None
     cfg.dataset_name = canonical_dataset_name(cfg)
     cfg.experiment_name = f"{base_config.experiment_name}__ood_{corpus}"

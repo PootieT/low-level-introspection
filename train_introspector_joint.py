@@ -71,7 +71,7 @@ from src.introspector.training.model import (
     replace_model_with_gated_version,
     replace_lora_with_gated_version,
 )
-from train_introspector import preprocess_example, assert_positions_intact, INTROSPECTION_SEPARATOR
+from train_introspector import preprocess_example, drop_invalid_positions, INTROSPECTION_SEPARATOR
 from train_introspector_with_intervention import (
     InterventionTrainer,
     evaluate_interventional_test,
@@ -1118,14 +1118,13 @@ def main():
     dev_dataset = dev_raw.map(preprocess, remove_columns=dev_raw.column_names)
     test_dataset_pred = test_raw.map(preprocess, remove_columns=test_raw.column_names)
 
-    # Fail loudly if max_length truncated any introspected token away, then drop the
-    # flag -- these datasets are collated straight into model kwargs, so it cannot stay.
+    # Drop rows whose introspected token is not addressable (or refuse, if there are
+    # enough of them to mean something is misconfigured), then drop the flags -- these
+    # datasets are collated straight into model kwargs, so they cannot stay.
     max_len = config.training_config.max_seq_length
-    for name, ds in (("train", train_dataset), ("dev", dev_dataset), ("test", test_dataset_pred)):
-        assert_positions_intact(ds, name, max_len)
-    train_dataset = train_dataset.remove_columns("position_valid")
-    dev_dataset = dev_dataset.remove_columns("position_valid")
-    test_dataset_pred = test_dataset_pred.remove_columns("position_valid")
+    train_dataset = drop_invalid_positions(train_dataset, "train", max_len)
+    dev_dataset = drop_invalid_positions(dev_dataset, "dev", max_len)
+    test_dataset_pred = drop_invalid_positions(test_dataset_pred, "test", max_len)
 
     # ---- OOD caches BEFORE the model loads ----
     # cache_signals runs as a subprocess and needs the GPU itself; once this process has
