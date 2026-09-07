@@ -165,7 +165,16 @@ def canonical_dataset_name(config) -> str:
 
 
 def parse_signal_filter(spec: str) -> dict[str, Any]:
-    """'N10.24' / '10.24' -> {'signal_type': 'mlp', 'signal_layer': 10, 'signal_index': 24}."""
+    """'N10.24' / '10.24' -> {'signal_type': 'mlp', 'signal_layer': 10, 'signal_index': 24}.
+
+    ONE signal. Callers that select a single feature (the SAE detector) depend on that,
+    so a comma-separated list is rejected rather than silently truncated: _FILTER_RE is
+    unanchored at the end and would happily match the first entry of 'N1.2,N3.4' and
+    drop the rest. Use parse_signal_filters for a list.
+    """
+    if "," in spec:
+        raise ValueError(
+            f"parse_signal_filter takes ONE signal, got {spec!r}. Use parse_signal_filters().")
     m = _FILTER_RE.match(spec.strip())
     if not m:
         raise ValueError(f"Bad signal filter {spec!r}; expected e.g. 'N10.24' (type letter optional).")
@@ -178,27 +187,51 @@ def parse_signal_filter(spec: str) -> dict[str, Any]:
             "signal_index": int(m.group("index"))}
 
 
+def parse_signal_filters(spec: str) -> list[dict[str, Any]]:
+    """Comma-separated signals -> list of match dicts. 'N10.24' gives a 1-element list."""
+    parts = [p for p in (x.strip() for x in spec.split(",")) if p]
+    if not parts:
+        raise ValueError(f"Empty signal filter {spec!r}.")
+    return [parse_signal_filter(p) for p in parts]
+
+
 def apply_signal_filter(dataset, spec: Optional[str], split_name: str = ""):
     """
-    Keep only the rows for ONE signal out of a shared multi-signal cache.
+    Keep only the rows for the named signal(s) out of a shared multi-signal cache.
 
     This is what makes per-neuron runs affordable in a sweep: cache a (layer,
-    position) cell ONCE with all 10 neurons -- one forward pass per text serves
+    position) cell ONCE with all its neurons -- one forward pass per text serves
     every neuron -- then give each run its own signal here. Returns the dataset
     unchanged when spec is None.
+
+    Accepts a COMMA-SEPARATED list as well as a single signal, which is what lets a
+    multi-neuron run train on a subset of a shared cache, and lets an eval split the
+    same cached test split into trained and held-out neurons without building a second
+    dataset. Rows matching ANY listed signal are kept.
     """
     if not spec:
         return dataset
-    want = parse_signal_filter(spec)
+    wants = parse_signal_filters(spec)
+    keys = {(w["signal_type"], w["signal_layer"], w["signal_index"]) for w in wants}
     before = len(dataset)
     filtered = dataset.filter(
-        lambda ex: (ex["signal_type"] == want["signal_type"]
-                    and ex["signal_layer"] == want["signal_layer"]
-                    and ex["signal_index"] == want["signal_index"]))
+        lambda ex: (ex["signal_type"], ex["signal_layer"], ex["signal_index"]) in keys)
     if len(filtered) == 0:
         present = sorted({(t, l, i) for t, l, i in zip(dataset["signal_type"], dataset["signal_layer"],
                                                        dataset["signal_index"])})
         raise SystemExit(f"signal_filter {spec!r} matched 0 of {before} rows in {split_name or 'dataset'}. "
-                         f"Signals present: {present}")
-    print(f"[signal_filter] {split_name or 'dataset'}: {spec} -> {len(filtered)}/{before} rows")
+                         f"Signals present: {present[:20]}{' ...' if len(present) > 20 else ''}")
+    # A partial match is worth naming: asking for 100 neurons and getting 60 means the
+    # cache was built with a different set, and the run would quietly train on fewer.
+    got = {(t, l, i) for t, l, i in zip(filtered["signal_type"], filtered["signal_layer"],
+                                        filtered["signal_index"])}
+    missing = keys - got
+    label = spec if len(wants) <= 3 else f"{len(wants)} signals"
+    if missing:
+        raise SystemExit(
+            f"signal_filter ({label}) in {split_name or 'dataset'}: "
+            f"{len(missing)} of {len(keys)} requested signals are absent from the cache, "
+            f"e.g. {sorted(missing)[:5]}. The cache was built with a different signal set.")
+    print(f"[signal_filter] {split_name or 'dataset'}: {label} -> {len(filtered)}/{before} rows "
+          f"({len(got)} signals)")
     return filtered

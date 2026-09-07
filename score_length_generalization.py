@@ -196,13 +196,26 @@ def _bin_by_distance(df: pd.DataFrame, value_col: str, target_col: str,
         return pd.DataFrame()
     edges = list(DISTANCE_BINS)
     labels = [f"<={b}" for b in edges]
-    edge_of = dict(zip(labels, edges))     # keep the numeric edge; do not re-parse the label
+    # keep the numeric span; do not re-parse the label
+    span_of = dict(zip(labels, zip([-1] + edges[:-1], edges)))
     d["bin"] = pd.cut(d["distance_from_end"], bins=[-1] + edges, labels=labels)
     rows = []
     for name, g in d.groupby("bin", observed=True):
-        hi = edge_of[str(name)]
-        row = {"bin": str(name), "n": len(g), "max_distance": hi,
-               "in_train_range": None if train_window is None else bool(hi <= train_window),
+        lo, hi = span_of[str(name)]
+        # A bin covers distances (lo, hi]. Labelling it by its UPPER edge alone is wrong
+        # at the boundary: with a window of 128 (trained distances 0-127) the "<=128" bin
+        # spans 65-128 and is almost entirely in range, but hi=128 would mark the whole
+        # bin out-of-range -- understating in-range fidelity and inflating the gap. So a
+        # bin is in-range only if it lies WHOLLY inside the window, out-of-range only if
+        # wholly outside, and straddling otherwise. Straddling bins are excluded from the
+        # gap rather than assigned to a side.
+        if train_window is None:
+            in_range, straddles = None, False
+        else:
+            in_range = hi <= train_window
+            straddles = (lo < train_window) and (hi > train_window)
+        row = {"bin": str(name), "n": len(g), "min_distance": lo + 1, "max_distance": hi,
+               "in_train_range": in_range, "straddles_window": straddles,
                "corr": np.nan, "l2_dist": np.nan}
         # corr over fewer than 2 points is undefined; the row is still emitted so a
         # thin or empty bin is visible rather than silently absent from the curve

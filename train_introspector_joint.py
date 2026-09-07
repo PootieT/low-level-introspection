@@ -131,6 +131,25 @@ def parse_args():
                    help="Comma-separated eval lengths (default: 16,64,128). Each must be <= the "
                         "min_seq_length the caches were built with, or documents will not "
                         "actually reach that length.")
+    p.add_argument("--neuron-gen-eval", action="store_true",
+                   help="After the in-domain evals, score the readout on the trained neurons "
+                        "AND on neurons cached but never trained (see "
+                        "score_neuron_generalization.py). Both arms read this run's own test "
+                        "split, so no extra caching. Interventional corr is the metric to "
+                        "believe on the unseen arm: the injected value is independent per row, "
+                        "so a readout that ignores which neuron the prompt names scores 0.")
+    p.add_argument("--neuron-gen-only", action="store_true",
+                   help="Load the checkpoint and run ONLY the neuron-generalization eval. "
+                        "Writes into the RUN dir so results land where the aggregator looks.")
+    p.add_argument("--max-unseen-neurons", type=int, default=None,
+                   help="Cap the held-out neurons evaluated (default: every neuron in the "
+                        "cache that the run did not train on).")
+    p.add_argument("--max-train-examples", type=int, default=None,
+                   help="Cap TRAIN rows after the signal filter, without rebuilding the cache. "
+                        "A row is one (text, neuron) pair, so with N neurons this caps rows, "
+                        "not texts, and per-neuron data falls as 1/N -- which is what makes a "
+                        "fixed total budget the sharing measurement. Also how the data-matched "
+                        "control arm reaches a fraction of the budget on one neuron.")
     p.add_argument("--skip-drift-eval", action="store_true",
                    help="Skip the activation-drift measurement (see measure_activation_drift). It runs "
                         "automatically whenever the adapter is active over the input text, because that "
@@ -359,13 +378,27 @@ class JointInterventionTrainer(InterventionTrainer):
 def _text_len_from_mask(batch) -> torch.Tensor:
     """Tokenized text length (BOS included) per row, recovered from the LoRA gate mask.
 
-    lora_token_mask is 0 over the input text and 1 over the introspection prompt, with
-    padding zeroed on whichever side the collator padded. Prediction batches are
-    LEFT-padded, so the first 1 sits at (num_left_pad + text_len); subtracting the pad
-    count leaves the text length. Returns -1 where no prompt region exists, so a
-    degenerate row shows up as invalid rather than as distance 0.
+    The mask is 0 over the input text and 1 over the introspection prompt, with padding
+    zeroed on whichever side the collator padded. Prediction batches are LEFT-padded, so
+    the first 1 sits at (num_left_pad + text_len); subtracting the pad count leaves the
+    text length.
+
+    The key differs by collator and BOTH must be handled: UngatedCollator (gate off --
+    the setting every current experiment runs in) moves the mask to `anchor_region_mask`,
+    because the patched forward reads `lora_token_mask` and its mere presence would
+    re-enable gating. The semantics are identical, only the name differs.
+
+    Returns -1 per row when neither key is present, or where no prompt region exists.
+    Deliberately not an error: this runs AFTER training, and a collator variant that
+    carries the mask under some third name should cost the distance column, not the
+    whole finished run.
     """
-    mask = batch["lora_token_mask"]
+    mask = batch.get("lora_token_mask")
+    if mask is None:
+        mask = batch.get("anchor_region_mask")
+    if mask is None:
+        n = batch["input_ids"].shape[0]
+        return torch.full((n,), -1, dtype=torch.long, device=batch["input_ids"].device)
     num_left_pad = (batch["attention_mask"] == 0).sum(dim=1)
     first_one = torch.argmax(mask, dim=1)
     has_prompt = mask.sum(dim=1) > 0
@@ -373,7 +406,8 @@ def _text_len_from_mask(batch) -> torch.Tensor:
                        torch.full_like(first_one, -1))
 
 
-def _per_signal_metrics(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+def _per_signal_metrics(df: pd.DataFrame, value_col: str = "predictions",
+                        target_col: str = "activation") -> Optional[pd.DataFrame]:
     """Per-(layer, neuron) fidelity from a predictions frame.
 
     Returns None for a single-signal run, where the pooled metrics already say
@@ -388,8 +422,8 @@ def _per_signal_metrics(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         return None
     rows = []
     for (layer, index), g in df.groupby(keys):
-        m = compute_metrics_from_numericals(g["predictions"].to_numpy(),
-                                            g["activation"].to_numpy())
+        m = compute_metrics_from_numericals(g[value_col].to_numpy(),
+                                            g[target_col].to_numpy())
         rows.append({"signal_layer": int(layer), "signal_index": int(index),
                      "n": int(len(g)), **m})
     return pd.DataFrame(rows).sort_values(keys).reset_index(drop=True)
@@ -1031,7 +1065,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     if ((output_dir / "routing_probe_by_position.csv").exists()
             and not args.overwrite_cache and not args.diag_only and not args.ood_only
-            and not args.length_only):
+            and not args.length_only and not args.neuron_gen_only):
         print(f"Experiments ran already, skipping.. {output_dir}")
         return
 
@@ -1052,6 +1086,15 @@ def main():
     train_raw = apply_signal_filter(train_raw, config.signal_filter, "train")
     dev_raw = apply_signal_filter(dev_raw, config.signal_filter, "dev")
     test_raw = apply_signal_filter(test_raw, config.signal_filter, "test")
+
+    if args.max_train_examples is not None and args.max_train_examples < len(train_raw):
+        # Contiguous prefix, NOT a shuffle: cache_signals emits every signal of a text
+        # consecutively (for text: for signal: append), so a prefix holds an equal number
+        # of rows per neuron by construction. Shuffling would only approximate that, and
+        # an unbalanced cap would confound the per-neuron data budget this arm is setting.
+        n = args.max_train_examples
+        print(f"[joint] --max-train-examples: {len(train_raw)} -> {n} train rows")
+        train_raw = train_raw.select(range(n))
 
     df = train_raw.to_pandas()
     signal_ranges = {}
@@ -1110,7 +1153,8 @@ def main():
         torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32)
     base.resize_token_embeddings(len(tokenizer))
     diag_ckpt = None
-    load_from_ckpt = args.diag_only or args.ood_only or args.length_only
+    load_from_ckpt = (args.diag_only or args.ood_only or args.length_only
+                      or args.neuron_gen_only)
     if load_from_ckpt:
         # load a specific (possibly mid-run) checkpoint's adapter for eval WITHOUT training
         from peft import PeftModel
@@ -1118,7 +1162,8 @@ def main():
         diag_ckpt = Path(args.checkpoint) if args.checkpoint else (
             Path(max(ckpts, key=os.path.getctime)) if ckpts else None)
         if diag_ckpt is None:
-            raise SystemExit("--diag-only/--ood-only/--length-only need a checkpoint "
+            raise SystemExit("--diag-only/--ood-only/--length-only/--neuron-gen-only "
+                             "need a checkpoint "
                              "(none found; pass --checkpoint).")
         model = PeftModel.from_pretrained(base, str(diag_ckpt), autocast_adapter_dtype=False)
     else:
@@ -1147,6 +1192,16 @@ def main():
           f"{config.training_config.lora_dropout}")
     pred_collator = collator_cls(tokenizer=tokenizer, model=model, padding=True,
                                  label_pad_token_id=-100, return_tensors="pt", for_prediction=True)
+
+    if args.neuron_gen_only:
+        # No cache prep needed: both arms read this run's own test split, unlike the
+        # OOD and length evals which each build a new one.
+        from score_neuron_generalization import evaluate_neuron_generalization
+        print(f"[joint] --neuron-gen-only: {diag_ckpt} -> {output_dir}")
+        evaluate_neuron_generalization(model, config, tokenizer, pred_collator,
+                                       preprocess_fn=preprocess, output_dir=output_dir,
+                                       max_unseen=args.max_unseen_neurons)
+        return
 
     if args.length_only:
         # same shape as --ood-only: checkpoint loaded, collator built, Trainer skipped.
@@ -1260,6 +1315,12 @@ def main():
     scales = [float(x) for x in args.scale_sweep.split(",")]
     interventional_scale_sweep(model, test_dataset_pred, pred_collator, config, eval_out_dir,
                                scales=scales, n_pca=args.routing_probe_pca)
+
+    if args.neuron_gen_eval:
+        from score_neuron_generalization import evaluate_neuron_generalization
+        evaluate_neuron_generalization(model, config, tokenizer, pred_collator,
+                                       preprocess_fn=preprocess, output_dir=eval_out_dir,
+                                       max_unseen=args.max_unseen_neurons)
 
     if args.length_eval:
         from score_length_generalization import evaluate_length_grid

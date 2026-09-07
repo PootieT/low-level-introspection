@@ -247,6 +247,13 @@ def evaluate_interventional_test(
     # so row i here is example i of eval_dataset -- the length check below is what makes
     # that assumption fail loudly rather than silently misalign the bins.
     cols = getattr(eval_dataset, "column_names", [])
+    if len(eval_dataset) == len(df):
+        # signal identity, so a multi-neuron run can be broken down per neuron -- a
+        # pooled correlation over neurons with different activation scales counts the
+        # between-neuron variance as signal
+        for c in ("signal_layer", "signal_index"):
+            if c in cols:
+                df[c] = list(eval_dataset[c])
     if "token_position" in cols and len(eval_dataset) == len(df):
         df["token_position"] = list(eval_dataset["token_position"])
         if "frozen_input_len" in cols:
