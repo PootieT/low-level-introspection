@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 18
+#$ -t 12,18
 
 # ============================================================================
 # MAIN GRID: joint introspection training across 8 layers x 8 token positions,
@@ -67,9 +67,9 @@ set -e
 # outer they are 64 tasks apart, and every set of concurrently-running tasks touches a
 # DIFFERENT cell. (For a hard guarantee, run a cache-only pass first and submit the
 # training array with -hold_jid.)
-SGE_TASK_ID=10
 index=$(($SGE_TASK_ID-1))
 LAYERS=(0 2 4 6 8 10 12 14)
+# N2.2566,N2.1886,N2.5949,N2.6998,N2.1447,N2.868,N2.1134,N2.1027,N2.8085,N2.1583
 POSS=(-1 -4 -8 -12 -16 -20 -24 -28)  # (2,-4):10, (2,-12):12, (4, -4):18
 REGIMES=("kl0.1" "unanchored")
 REGIME=${REGIMES[$((index / 64))]}

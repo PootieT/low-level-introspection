@@ -103,7 +103,7 @@ LAYER=4                  # same layer as the length-gen experiment, and in the m
 TOKEN_POS=-1
 N_CACHE=200              # neurons in the POOL cache: trainable prefix + held-out rest
 TARGET_ROWS=300000       # (text, neuron) pairs per run -- the fixed budget for arm A
-N_POOL_TEST=3000         # texts in the pool cache's test split (rows = this x 200)
+N_POOL_TEST=500          # texts in the pool cache's test split (rows = this x 200)
 SEED=21                  # same sampler seed as the layer/token grid
 
 GATE=off
@@ -114,7 +114,7 @@ LORA_R=16
 LORA_ALPHA=$((LORA_R * 2))
 LORA_DO=0.0
 BS=32
-N_TEST=3000              # texts in each run's OWN test split
+N_TEST=500              # texts in each run's OWN test split
 MIN_LEN=""               # no length floor: pos=-1 needs no length guarantee, and a
                          # floor would make this cache incomparable to the pos=-1 runs
 PROMPT_TYPE=prompt_no_token_index   # neuron is named by index either way; the token

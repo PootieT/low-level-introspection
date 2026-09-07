@@ -5,11 +5,11 @@
 #$ -l gpus=1
 #$ -l gpu_c=8.5
 #$ -l gpu_memory=47G
-#$ -l h_rt=6:00:00
+#$ -l h_rt=12:00:00
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1-50
+#$ -t 12
 
 # ============================================================================
 # LENGTH GENERALIZATION: does the readout reach tokens further back than it was
@@ -116,7 +116,7 @@ export WANDB_RUN_GROUP=mlp_lengen
 set -e
 
 index=$(($SGE_TASK_ID-1))
-
+#index=1
 # ---- grid ----------------------------------------------------------------
 # One entry per cell, "train_len:train_window". Add a cell here and bump #$ -t.
 CELLS=(
@@ -198,7 +198,7 @@ python generate_experiment_config.py \
     --train-dataset allenai/c4 \
     --train-dataset-split "train" \
     --train-max-samples $N_TRAIN \
-    --dev-max-samples 200 \
+    --dev-max-samples 1000 \
     --dev-dataset-split "validation" \
     --dev-offset-from-train 1000000 \
     --test-dataset allenai/c4 \
@@ -248,5 +248,8 @@ python train_introspector_joint.py \
     $OVERWRITE
 
 # Re-run ONLY the length eval on an existing checkpoint (no retraining):
-#   python train_introspector_joint.py --config "$CONFIG" --joint-loss-weight $W \
-#       --length-only --eval-lengths $EVAL_LENGTHS
+#   python train_introspector_joint.py \
+#   --config "$CONFIG" \
+#   --joint-loss-weight $W \
+#   --length-only \
+#   --eval-lengths $EVAL_LENGTHS
