@@ -53,7 +53,7 @@ from src.introspector.training.model import (
     StripEmbeddingSaveCallback, load_added_token_embeddings,
 )
 from src.introspector.training.metrics import compute_metrics, get_numericals, compute_metrics_from_numericals
-from src.introspector.prompts import PROMPT_REGISTRY
+from src.introspector.prompts import PROMPT_REGISTRY, build_prompt_kwargs
 
 INTROSPECTION_SEPARATOR = "<|introspection|>"
 
@@ -83,12 +83,13 @@ def preprocess_example(
     :param for_prediction: if True, do not suffix the target activation, and left-pad the batches
     :return:
     """
+    # Argument list depends on the signal type (attention names a source token as well
+    # as a destination one), so the mapping lives in prompts.build_prompt_kwargs rather
+    # than being spelled out here -- this function is the shared entry point for a dozen
+    # callers. For mlp/sae/residual it produces exactly the arguments this used to pass.
     introspection_prompt = prompt_fn(
         signal_type=example["signal_type"],
-        layer=example["signal_layer"],
-        signal_index=example["signal_index"],
-        token=example["token"],
-        token_index=example["token_position"],
+        **build_prompt_kwargs(example),
     )
     full_prompt = f"{example['text']} {INTROSPECTION_SEPARATOR}{introspection_prompt}"
 
@@ -166,7 +167,16 @@ def preprocess_example(
     # rather than discovering it in the results.
     if return_position_valid:
         n_text = len(input_tokens["input_ids"])
-        out["position_valid"] = int(example["token_position"]) < n_text
+        valid = int(example["token_position"]) < n_text
+        # An attention row addresses TWO tokens. The source is always at or before the
+        # destination, so it survives whenever the destination does -- but only if it is
+        # also >= 0, which a re-tokenization that shortened the text can break. Checking
+        # it explicitly costs nothing and stops a row with an unaddressable source from
+        # reaching the port's assert mid-training.
+        src_pos = example.get("src_token_position")
+        if src_pos is not None:
+            valid = valid and 0 <= int(src_pos) < n_text
+        out["position_valid"] = valid
         # Distinguishes the TWO ways a position can go out of range, which need opposite
         # responses. Truncation is systematic and fixable (raise max_length); a
         # decode/re-encode round trip that lands on a different token count is neither.

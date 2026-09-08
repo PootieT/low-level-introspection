@@ -34,7 +34,7 @@ from src.introspector.utils import int_or_str
 from src.introspector.dataset_utils import canonical_dataset_name, parse_signal_filters
 from src.introspector.config import DatasetConfig, ExperimentConfig, TrainingConfig, EvalConfig
 from src.introspector.signals.schema import ExplicitSignalSpec, FixedTokenSelector, RandomRangeTokenSelector, \
-    ExplicitSignalSpec, UniformLayerSampler, SignalSource
+    ExplicitSignalSpec, UniformLayerSampler, AttentionLayerSampler, SignalSource
 from src.introspector.signals.resolution import resolve_signal_source
 
 
@@ -197,19 +197,38 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Sampler classes by their `type` discriminator. Dispatching through a table instead of
+# an if/else on "explicit" means adding a sampler is one entry here, and an unknown type
+# fails with a list of what IS supported rather than a pydantic error about the fields of
+# whichever class the else-branch happened to pick.
+_SIGNAL_SOURCE_BY_TYPE = {
+    "explicit": ExplicitSignalSpec,
+    "uniform_layer_sampler": UniformLayerSampler,
+    "attention_layer_sampler": AttentionLayerSampler,
+}
+
+
+def _validate_signal_source(spec_dict: dict):
+    kind = spec_dict.get("type")
+    if kind not in _SIGNAL_SOURCE_BY_TYPE:
+        raise ValueError(
+            f"Unknown signal source type {kind!r}; expected one of "
+            f"{sorted(_SIGNAL_SOURCE_BY_TYPE)}.")
+    return _SIGNAL_SOURCE_BY_TYPE[kind].model_validate(spec_dict)
+
+
 def load_spec(value: str):
     if value.endswith(".json"):
-        spec_dict= json.loads(Path(value).read_text())
-        return ExplicitSignalSpec.model_validate(spec_dict) if spec_dict["type"]=="explicit" else UniformLayerSampler.model_validate(spec_dict)
+        return _validate_signal_source(json.loads(Path(value).read_text()))
     else:
         try:
             spec_dict = json.loads(value)
-            return SignalSource.model_validate(spec_dict) if spec_dict["type"]=="explicit" else UniformLayerSampler.model_validate(spec_dict)
         except json.decoder.JSONDecodeError:
             print(f"{value} is not a valid JSON, assuming it is a single signal or comma separated list of signals.")
             if any(s in value for s in ["[", "{","t"]):
                 raise ValueError(f"Not a comma separated list: {value}")
             return ExplicitSignalSpec(type="explicit", signals=value.split(","))
+        return _validate_signal_source(spec_dict)
 
 def load_token_selector(value: Union[int,str]):
     if isinstance(value, int):

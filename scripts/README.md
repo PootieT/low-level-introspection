@@ -41,6 +41,8 @@ reuse — migrate a script into this directory rather than running it in place.
 | `sae/precompute_sae_feature_stats.sh` | per-layer SAE feature density stats (one task per layer, skips existing); the sweep's feature picker needs these to avoid dead/punctuation features |
 | `sae/train_single_sae_introspector_sweep_layer_position.sh` | SAE DETECTION grid: 8 layers x 8 positions x 5 features x {gate on, gate off} = 128 cells; the SAE analogue of the endogenous neuron sweep |
 | `sae/train_sae_intervention_pilot.sh` | interventional SAE detection training on 3 features x 3 positions: does steering on/off during training break the bypass before the full grid is worth running |
+| `attention/train_single_attn_logit_introspector_endogenous_sweep_layer_srctoken.sh` | ATTENTION LOGIT grid: 8 layers x 10 source offsets x 8 heads x {gate on, off} = 1280 runs, destination pinned to the last token. `HEAD_SELECT=random` (default) samples 8 heads per layer; `HEAD_SELECT=fixed` pins (0 4 8 12 16 20 24 28) -- the same file is both experiments |
+| `attention/pilot/pilot_attn_logit_one_cell.sh` | **run this first.** One cell of the above at 3K samples / 2 heads, with a printed PASS/FAIL verdict on cache alignment, the injection-scale saturation table, and a wall-time extrapolation for sizing `h_rt` |
 
 Others are migrated as the experiment list for the paper firms up.
 
@@ -65,3 +67,54 @@ rate. The same conventions above apply, plus:
   undefined AP, not a bad one — filter on `base_rate_positive`.
 - **`score_lm_degradation.py` / `score_lighteval_benchmarks.py`** are signal-agnostic
   and apply unchanged, but only to **gate-off** checkpoints.
+
+## Attention-specific notes
+
+The signal is the PRE-SOFTMAX attention logit, `q.k/sqrt(d_head)` after RoPE and before
+the causal mask and the softmax, at one `(layer, head, destination token, source token)`
+cell. Signals are named **`A<layer>.<head>@<src_offset>`** (e.g. `A10.5@-3`), where the
+offset is the source token's distance behind the destination token and the destination
+comes from the token selector as usual. `P<layer>.<head>@<src>` is reserved for the
+post-softmax weight. The same conventions as above apply, plus:
+
+- **`--min-seq-length` must equal `--max-seq-length`** (32 in the sweep). The deepest
+  offset is meant to be BOS, and `sample_token_position` CLAMPS a destination that a
+  short document cannot support -- so without a floor, offset -31 silently resolves to
+  position 0 on a short document and to an ordinary token on a long one, and the
+  attention-sink measurement is right only by accident. `cache_signals.py` refuses an
+  attention config whose offsets the floor cannot honour. Note the neuron sweeps set no
+  floor, so the two families do not draw from an identical document population.
+- **`--signal-filter A<layer>.<head>@<src>` must include the offset.** A cell caches 8
+  heads at one offset and each run trains one of them; a filter without `@<src>` is
+  rejected rather than matching every offset in the cell.
+- **`--force-drift-eval` runs `measure_attention_alignment`**, the attention analogue of
+  the neuron drift check. Want best offset `+0`, corr ~0.9999, `alignment OK`. This is
+  the ONLY automatic check that the live logit is the quantity `cache_signals` wrote: a
+  failure here usually means caching and training ran under different attention
+  implementations (compare `capture.attn_implementation` in the cache's `metadata.json`)
+  or the `(dst, src)` pair is off by one.
+- **The attention implementation is chosen from the config's signal types**, not by a
+  flag: attention runs load with `attn_implementation="introspection_logit"` (an eager
+  variant carrying the read/write port), neuron and SAE runs keep loading under sdpa and
+  their numbers do not move. Both cache and trainer derive it the same way, so they
+  cannot disagree unless one of them is edited.
+- **`--intervention-extreme-scale` does not mean the same thing here.** `extreme` draws
+  uniformly from `scale x` the empirical RANGE, so a logit range of ~30 at scale 10
+  injects +/-150 -- past which the softmax saturates and different injected values give
+  the SAME forward pass, i.e. a value the model cannot report even in principle. At
+  `W=1.0` the flag is inert (no interventional training; `evaluate_interventional_test`
+  forces gaussian at scale 1.0) but it does reach `interventional_scale_sweep`. Read that
+  sweep before choosing a scale for any joint (`W<1`) follow-up.
+- **Reading the grid.** Layer 0 is a text-only CEILING CONTROL (its logit is a function of
+  embeddings and RoPE alone, hence determined by the two token strings the prompt already
+  names), and the BOS offset is a separate regime whose small variance can make corr
+  meaningless -- check the per-signal `std` in `dataset_signal_stats.json`.
+  `analysis/plot_attention_srctoken_sweep.py` marks both.
+- **Prompt ambiguity is measured, not assumed.** The prompt names the source token by
+  string only, so a token repeated in the 32-token context does not identify a position.
+  `cache_signals` records `src_token_unique_rate` in the cache metadata; split on it
+  rather than assuming the cost is zero.
+- The neuron analysis scripts parse `N<layer>.<index>` out of run names and skip
+  non-matching directories **without warning**, so they ignore attention runs. Use
+  `analysis/plot_attention_srctoken_sweep.py`, which owns its own pattern; do not widen
+  the neuron regexes in place.

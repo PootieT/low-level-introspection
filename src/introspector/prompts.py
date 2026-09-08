@@ -59,24 +59,56 @@ def mlp_prompt(
 
 
 def attention_score_prompt(
-    text: str,
     layer: int,
     signal_index: int,
     src_token: str,
-    src_token_index: int,
     dst_token: str,
-    dst_token_index: int,
 ) -> str:
+    """Ask for the pre-softmax attention logit of head `signal_index` at `layer`,
+    from the destination token to the source token.
+
+    `signal_index` IS the query head. Two fixes against the previous version:
+      - the first template referenced {TGT_TOKEN}, a placeholder .format() was never
+        given, so one draw in four raised KeyError;
+      - the tokens were unquoted, unlike every other prompt family here. Quoting them
+        matters more for attention than for MLP, because the prompt names TWO tokens and
+        without delimiters the boundary between them and the template words is guesswork
+        for a token like " the".
+
+    KNOWN AMBIGUITY (accepted deliberately): the source is named by its string only, so
+    when the same token occurs several times in the context the prompt does not say
+    which occurrence is meant. cache_signals records `src_token_unique_rate` in the
+    dataset metadata so the effect can be measured instead of assumed.
+    """
     templates = [
-        "At token {DST_TOKEN}, the attention score for head {SIGNAL_IDX} on {TGT_TOKEN} at layer {LAYER} is",
-        "The attention score for head {SIGNAL_IDX} from {SRC_TOKEN} to {DST_TOKEN} at layer {LAYER} is",
-        "Attention head {LAYER}.{SIGNAL_IDX} from {SRC_TOKEN} to {DST_TOKEN} has attention score of",
-        "Attention head {SIGNAL_IDX} at layer {LAYER}, from token {SRC_TOKEN} to {DST_TOKEN} has attention score of",
+        'At token "{DST_TOKEN}", the attention score for head {HEAD} at layer {LAYER} on token "{SRC_TOKEN}" is',
+        'The attention score for head {HEAD} at layer {LAYER}, from token "{DST_TOKEN}" to token "{SRC_TOKEN}", is',
+        'Attention head {LAYER}.{HEAD} at token "{DST_TOKEN}", attending to token "{SRC_TOKEN}", has attention score of',
+        'Head {HEAD} at layer {LAYER} gives token "{SRC_TOKEN}" an attention score, at token "{DST_TOKEN}", of',
     ]
-    prompt = random.choice(templates).format(
-        SRC_TOKEN=src_token, SIGNAL_IDX=signal_index, LAYER=layer, DST_TOKEN=dst_token,
+    return random.choice(templates).format(
+        SRC_TOKEN=src_token, HEAD=signal_index, LAYER=layer, DST_TOKEN=dst_token,
     )
-    return prompt
+
+
+def attention_weight_prompt(
+    layer: int,
+    signal_index: int,
+    src_token: str,
+    dst_token: str,
+) -> str:
+    """Post-softmax counterpart of attention_score_prompt. Worded as a *weight* (a
+    probability), not a score, so the two signal types are not asked for in the same
+    words -- a model trained on one should not be able to mistake it for the other."""
+    templates = [
+        'At token "{DST_TOKEN}", the attention weight for head {HEAD} at layer {LAYER} on token "{SRC_TOKEN}" is',
+        'The attention weight for head {HEAD} at layer {LAYER}, from token "{DST_TOKEN}" to token "{SRC_TOKEN}", is',
+        'Attention head {LAYER}.{HEAD} at token "{DST_TOKEN}", attending to token "{SRC_TOKEN}", has attention weight of',
+        'Head {HEAD} at layer {LAYER} puts, at token "{DST_TOKEN}", an attention weight on token "{SRC_TOKEN}" of',
+    ]
+    return random.choice(templates).format(
+        SRC_TOKEN=src_token, HEAD=signal_index, LAYER=layer, DST_TOKEN=dst_token,
+    )
 
 
 def residual_stream_prompt(
@@ -117,13 +149,15 @@ def sae_prompt(
 
 
 def prompt_no_token_index(
-    signal_type: Literal["mlp", "attention_score", "residual_stream", "sae"],
+    signal_type: Literal["mlp", "attention_score", "attention_weight", "residual_stream", "sae"],
     **kwargs
 ):
     if signal_type == "mlp":
         return mlp_prompt(**kwargs)
     elif signal_type == "attention_score":
         return attention_score_prompt(**kwargs)
+    elif signal_type == "attention_weight":
+        return attention_weight_prompt(**kwargs)
     elif signal_type == "residual_stream":
         return residual_stream_prompt(**kwargs)
     elif signal_type == "sae":
@@ -132,12 +166,12 @@ def prompt_no_token_index(
         raise ValueError()
 
 def prompt_with_token_index(
-        signal_type: Literal["mlp", "attention_score", "residual_stream"],
+        signal_type: Literal["mlp", "attention_score", "attention_weight", "residual_stream"],
         **kwargs
 ):
     if signal_type == "mlp":
         return mlp_prompt_with_token_index(**kwargs)
-    elif signal_type == "attention_score":
+    elif signal_type in ("attention_score", "attention_weight"):
         raise NotImplementedError()
     elif signal_type == "residual_stream":
         raise NotImplementedError()
@@ -148,3 +182,41 @@ PROMPT_REGISTRY = {
     "prompt_no_token_index": prompt_no_token_index,
     "prompt_with_token_index": prompt_with_token_index,
 }
+
+# Signal types whose prompt names a source token as well as a destination token.
+_ATTENTION_TYPES = ("attention_score", "attention_weight")
+
+
+def build_prompt_kwargs(example) -> dict:
+    """Cache row -> the keyword arguments that row's prompt family takes.
+
+    THE point of this function is that it is the ONLY place that knows a prompt's
+    argument list depends on the signal type. preprocess_example used to hardcode the
+    five MLP kwargs, so an attention row raised TypeError there; and preprocess_example
+    is the shared entry point for a dozen call sites, so widening it in place would have
+    meant touching all of them.
+
+    The MLP/SAE/residual branch reproduces the old argument list exactly, so existing
+    runs build byte-identical prompts.
+    """
+    signal_type = example["signal_type"]
+    if signal_type in _ATTENTION_TYPES:
+        # `token`/`token_position` are the DESTINATION for attention rows; the source
+        # comes from the columns cache_signals adds for these signal types.
+        src_token = example.get("src_token")
+        if src_token is None:
+            raise ValueError(
+                f"{signal_type} row has no `src_token`; the cache predates attention "
+                f"signals or was built by a different code path. Re-cache it.")
+        return {
+            "layer": example["signal_layer"],
+            "signal_index": example["signal_index"],   # query head
+            "src_token": src_token,
+            "dst_token": example["token"],
+        }
+    return {
+        "layer": example["signal_layer"],
+        "signal_index": example["signal_index"],
+        "token": example["token"],
+        "token_index": example["token_position"],
+    }

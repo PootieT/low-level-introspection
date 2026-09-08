@@ -120,6 +120,12 @@ def derive_config(base_config: ExperimentConfig, corpus: str, spec: dict,
         name=test["name"], split=test["split"], text_field=test["text_field"],
         max_samples=n_test,
         max_seq_length=base_config.test_dataset.max_seq_length,
+        # Carry the length floor. Constructing a fresh DatasetConfig defaults it to None,
+        # which drops the run's floor -- for an attention signal that is fatal (its source
+        # offset needs documents of a guaranteed length, and cache_signals refuses the
+        # config), and for any run it silently changes which documents the OOD corpus
+        # contributes relative to the in-distribution split it is compared against.
+        min_seq_length=base_config.test_dataset.min_seq_length,
         hf_data_kwargs=test["hf_data_kwargs"],
     )
     # Dev is only built because cache_signals builds all three splits; nothing here

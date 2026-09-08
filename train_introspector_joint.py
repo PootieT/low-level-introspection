@@ -58,10 +58,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 from src.introspector.config import ExperimentConfig
 from src.introspector.dataset_utils import apply_signal_filter
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
+from src.introspector.models.attention_logits import (
+    AttentionLogitPort, PortFanOut, attention_model_kwargs, installed_ports,
+    is_attention_type,
+)
 from src.introspector.prompts import PROMPT_REGISTRY
 from src.introspector.training.collator import LoRAGatingCollator
 from src.introspector.training.metrics import compute_metrics, compute_metrics_from_numericals
 from src.introspector.training.model import (
+    signal_range_key,
     IntrospectionRegressionModel,
     RegressionHeadSaveCallback,
     InterventionAnnealCallback,
@@ -646,6 +651,185 @@ def _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offs
     return out, preds
 
 
+def _capture_attention_logits(model, batch, abs_dst, abs_src, signal_layer,
+                              signal_index, offsets):
+    """One forward capturing the introspected attention logit at several offsets.
+
+    The attention analogue of _capture_activations. It cannot reuse that function at
+    all: an attention logit is not a module output (see models/attention_logits.py), so
+    there is nothing to register a forward hook on. Ports do the reading instead, one
+    per (layer, offset).
+
+    An offset shifts the destination AND the source together, keeping their relative
+    distance -- that distance IS the signal's identity, so moving only one would read a
+    different signal rather than a mis-positioned one. Shifting both is exactly what an
+    off-by-one in `token_position` would look like, which is what this check exists to
+    catch.
+
+    Positions are clamped, and only for the diagnostic offsets: at offset +1 the
+    destination of a pos=-1 row runs past the end of the sequence. Offset 0 is never
+    clamped in practice, and it is the only offset the verdict depends on.
+    """
+    bs = abs_dst.shape[0]
+    seq_len = batch["input_ids"].shape[1]
+    out = {off: torch.full((bs,), float("nan")) for off in offsets}
+    layer_ports, port_index = {}, {}
+    for layer in torch.unique(signal_layer).tolist():
+        m = signal_layer == layer
+        rows = torch.nonzero(m, as_tuple=True)[0]
+        ports = []
+        for off in offsets:
+            dst = (abs_dst[m] + off).clamp(0, seq_len - 1)
+            # keep the source at the same distance behind the destination
+            src = (abs_src[m] + off).clamp(0, seq_len - 1).minimum(dst)
+            ports.append(AttentionLogitPort(heads=signal_index[m], dst=dst, src=src))
+        layer_ports[layer] = PortFanOut(ports)
+        port_index[layer] = (rows, ports)
+    with installed_ports(model, layer_ports):
+        outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+                        lora_token_mask=batch.get("lora_token_mask"), do_intervention=False)
+    for layer, (rows, ports) in port_index.items():
+        for off, port in zip(offsets, ports):
+            out[off][rows.cpu()] = port.read.cpu()
+    head = model.regression_head
+    h = outputs.hidden_states[-1][:, -1, :]
+    # .detach() BEFORE .cpu(): moving a tensor to CPU does NOT break the autograd graph,
+    # and the caller keeps every batch's `preds` in a list for the whole loop. Without
+    # this, each batch's graph -- and every GPU activation it references -- stays alive
+    # until the loop ends. That OOMed at 42GB on a 44GB card the first time this ran.
+    # The decorator on the caller makes it moot in practice; keep it so this helper is
+    # also safe if it is ever called from outside a no_grad context.
+    preds = head(h.to(device=head.weight.device, dtype=head.weight.dtype)).squeeze(-1)
+    preds = preds.float().detach().cpu()
+    return out, preds
+
+
+# no_grad, exactly as on measure_activation_drift below. Without it this walks the whole
+# test split with autograd enabled, running TWO forwards per batch (tuned + adapters
+# off), and nothing is freed until the loop ends -- 42GB on a 44GB card. It is a
+# read-only diagnostic; there is never a backward pass here.
+@torch.no_grad()
+def measure_attention_alignment(model, dataset, collator, config, output_dir, suffix="",
+                                offsets=DRIFT_OFFSETS):
+    """Attention counterpart of measure_activation_drift.
+
+    Answers the same two questions with the same numbers, minus the MLP-specific
+    transmission analysis (up_proj/gate_proj have no attention analogue):
+
+      ALIGNMENT  corr(base_live, cached) per offset. Exactly one offset must be ~1.0,
+                 and it must be 0. This is the ONLY automatic check that the new
+                 extraction path reads the same quantity cache_signals wrote -- if
+                 caching and training ended up on different attention implementations,
+                 or the source position is off by one, it shows up here and nowhere
+                 else. Do not skip it.
+      DRIFT      corr(tuned_live, base_live) at offset 0: has the adapter moved the
+                 signal the endogenous target was frozen from.
+
+    Writes activation_drift{suffix}.{json,csv,png} under the same names as the MLP
+    version so the existing analysis scripts keep finding it.
+    """
+    model.eval()
+    dl = DataLoader(dataset, batch_size=config.training_config.eval_batch_size,
+                    collate_fn=collator, shuffle=False)
+    cached_all, pos_all, pred_all = [], [], []
+    tuned_all = {off: [] for off in offsets}
+    base_all = {off: [] for off in offsets}
+
+    for batch in dl:
+        batch = batch.to(model.device)
+        token_position = batch["token_position"]
+        # same left-pad correction the intervention path applies
+        num_left_pad = (batch["attention_mask"] == 0).sum(dim=1).to(token_position.device)
+        abs_dst = token_position + num_left_pad
+        abs_src = batch["src_token_position"] + num_left_pad
+        signal_layer, signal_index = batch["signal_layer"], batch["signal_index"]
+
+        tuned, preds = _capture_attention_logits(model, batch, abs_dst, abs_src,
+                                                 signal_layer, signal_index, offsets)
+        with model.disable_adapter():
+            base, _ = _capture_attention_logits(model, batch, abs_dst, abs_src,
+                                                signal_layer, signal_index, offsets)
+        cached_all.append(batch["activation"].float().cpu())
+        pred_all.append(preds)
+        pos_all.append(token_position.cpu())
+        for off in offsets:
+            tuned_all[off].append(tuned[off])
+            base_all[off].append(base[off])
+
+    cached = torch.cat(cached_all).numpy()
+    pred = torch.cat(pred_all).numpy()
+    pos = torch.cat(pos_all).numpy()
+    tuned = {off: torch.cat(v).numpy() for off, v in tuned_all.items()}
+    base = {off: torch.cat(v).numpy() for off, v in base_all.items()}
+
+    alignment = [dict(offset=off, **_drift_stats(base[off], cached)) for off in offsets]
+    align_df = pd.DataFrame(alignment)
+    corrs = {o: _corr_or_nan(base[o], cached) for o in offsets}
+    best = max(offsets, key=lambda o: -np.inf if np.isnan(corrs[o]) else corrs[o])
+    best_corr = corrs[best]
+    drift_vs_base = _drift_stats(tuned[TRAIN_OFFSET], base[TRAIN_OFFSET])
+    drift_vs_cached = _drift_stats(tuned[TRAIN_OFFSET], cached)
+    readout = {
+        "corr_pred_cached": _corr_or_nan(pred, cached),
+        "corr_pred_tuned_live": _corr_or_nan(pred, tuned[TRAIN_OFFSET]),
+        "corr_pred_base_live": _corr_or_nan(pred, base[TRAIN_OFFSET]),
+    }
+    readout["coupling_gap"] = readout["corr_pred_tuned_live"] - readout["corr_pred_cached"]
+
+    metrics = {
+        "signal_family": "attention",
+        "train_offset": TRAIN_OFFSET,
+        "alignment": alignment,
+        "best_alignment_offset": int(best),
+        "best_alignment_corr": best_corr,
+        "alignment_ok": bool(best == TRAIN_OFFSET and best_corr > 0.99),
+        "drift_tuned_vs_base": drift_vs_base,
+        "drift_tuned_vs_cached": drift_vs_cached,
+        "readout_tracking": readout,
+        # no transmission_path: up_proj/gate_proj are MLP-only, and there is no
+        # attention analogue of "the neuron's share of its layer's write".
+        "transmission_path": None,
+    }
+    out = Path(output_dir)
+    with open(out / f"activation_drift{suffix}.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+    pd.DataFrame({"token_position": pos, "cached": cached, "prediction": pred,
+                  **{f"base_off{off}": base[off] for off in offsets},
+                  **{f"tuned_off{off}": tuned[off] for off in offsets}}
+                 ).to_csv(out / f"activation_drift{suffix}.csv", index=False)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
+    axes[0].scatter(cached, base[best], s=10, alpha=0.4)
+    axes[0].set_xlabel("cached attention logit")
+    axes[0].set_ylabel(f"live, adapters OFF (offset {best:+d})")
+    axes[0].set_title(f"cache alignment (corr={best_corr:.4f})")
+    axes[1].scatter(base[TRAIN_OFFSET], tuned[TRAIN_OFFSET], s=10, alpha=0.4)
+    axes[1].set_xlabel("live, adapters OFF"); axes[1].set_ylabel("live, adapter ON")
+    axes[1].set_title(f"drift (corr={drift_vs_base['corr']:.4f}, "
+                      f"std ratio={drift_vs_base['std_ratio']:.3f})")
+    for ax in axes:
+        lim = [min(ax.get_xlim()[0], ax.get_ylim()[0]), max(ax.get_xlim()[1], ax.get_ylim()[1])]
+        ax.plot(lim, lim, "k--", lw=1, alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(out / f"activation_drift{suffix}.png", dpi=150)
+    plt.close()
+
+    print("[drift] attention-logit cache alignment (adapters OFF vs cached column):")
+    print(align_df.to_string(index=False))
+    if metrics["alignment_ok"]:
+        print(f"[drift] alignment OK: offset {TRAIN_OFFSET:+d} reproduces the cache "
+              f"(corr={best_corr:.4f}).")
+    else:
+        print(f"[drift] *** ALIGNMENT MISMATCH *** best offset {best:+d} (corr={best_corr:.4f}), "
+              f"expected {TRAIN_OFFSET:+d}. Either the (dst, src) pair is off by "
+              f"{TRAIN_OFFSET - best:+d} tokens, or caching and training ran under "
+              f"different attention implementations -- check capture.attn_implementation "
+              f"in the cache metadata.json against this run.")
+    print(f"[drift] tuned vs base @offset {TRAIN_OFFSET:+d}: corr={drift_vs_base['corr']:.4f} "
+          f"std_ratio={drift_vs_base['std_ratio']:.3f}")
+    return metrics
+
+
 def _drift_stats(x, ref):
     """Agreement of `x` with reference `ref`: correlation, spread ratio, mean
     shift, and RMSE in units of the reference's std (so it reads as 'how big is
@@ -930,10 +1114,18 @@ def _extract_interv_readout(model, dataset, collator, config, scale, distributio
     feats, inj, hpred, pos = [], [], [], []
     for batch in dl:
         batch = batch.to(model.device)
+        # Unlike compute_loss (which forwards the whole batch), this builds the kwargs by
+        # hand -- so the attention columns have to be added explicitly. Omitting them
+        # would not error: forward would take the MLP branch and inject the value into
+        # MLP neuron number `head` instead of the attention logit. The model asserts
+        # against that too, but passing them is the fix.
+        interv_kwargs = {k: batch[k] for k in ("src_token_position", "signal_src_offset")
+                         if k in batch}
         out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
                     lora_token_mask=batch.get("lora_token_mask"),
                     token_position=batch["token_position"], signal_layer=batch["signal_layer"],
-                    signal_index=batch["signal_index"], do_intervention=True, output_hidden_states=True)
+                    signal_index=batch["signal_index"], **interv_kwargs,
+                    do_intervention=True, output_hidden_states=True)
         h = out.hidden_states[-1][:, -1, :]
         feats.append(h.float().cpu())
         inj.append(out.intervention_values.float().cpu())
@@ -1097,10 +1289,24 @@ def main():
         train_raw = train_raw.select(range(n))
 
     df = train_raw.to_pandas()
+    # An attention signal is (layer, head, source offset); an MLP neuron is (layer,
+    # index). Grouping attention rows on (layer, head) alone would pool ten different
+    # source offsets -- whose ranges differ by an order of magnitude between the BOS
+    # sink and a mid-context token -- into one range, and every intervention would then
+    # be drawn from the wrong distribution. signal_range_key builds the same key that
+    # IntrospectionRegressionModel.sample_intervention_values looks up.
+    attention_run = bool(len(df)) and is_attention_type(df["signal_type"].iloc[0])
+    if attention_run:
+        assert df["src_offset"].notna().all(), (
+            "attention rows without src_offset -- cache predates attention signals")
+        group_cols = ["signal_layer", "signal_index", "src_offset"]
+    else:
+        group_cols = ["signal_layer", "signal_index"]
     signal_ranges = {}
-    for key, vals in df.groupby(["signal_layer", "signal_index"])["activation"]:
-        signal_ranges[key] = {"min": float(vals.min()), "max": float(vals.max()),
-                              "mean": float(vals.mean()), "std": float(vals.std())}
+    for key, vals in df.groupby(group_cols)["activation"]:
+        signal_ranges[signal_range_key(*key)] = {
+            "min": float(vals.min()), "max": float(vals.max()),
+            "mean": float(vals.mean()), "std": float(vals.std())}
 
     def preprocess(ex):
         out = preprocess_example(ex, tokenizer=tokenizer,
@@ -1112,6 +1318,13 @@ def main():
         out["signal_layer"] = ex["signal_layer"]
         out["signal_index"] = ex["signal_index"]
         out["activation"] = ex["activation"]
+        # Attention needs the SOURCE token as well as the destination, and the source
+        # offset to identify the signal. Emitted only for attention rows: these columns
+        # are collated straight into model kwargs, and a column of Nones would reach
+        # the forward as a tensor of nulls.
+        if is_attention_type(ex["signal_type"]):
+            out["src_token_position"] = ex["src_token_position"]
+            out["signal_src_offset"] = ex["src_offset"]
         return out
 
     train_dataset = train_raw.map(preprocess, remove_columns=train_raw.column_names)
@@ -1147,9 +1360,14 @@ def main():
         ood_prepared = prepare_ood_caches(config, corpora=ood_corpora)
 
     # ---- model (regressor + gated LoRA) ----
+    # The attention implementation MUST match the one cache_signals used, or the live
+    # logit and the cached target disagree at the bf16 level and the alignment check
+    # cannot reach corr ~0.9999. attention_model_kwargs returns {} for neuron/SAE runs,
+    # which therefore keep loading under sdpa exactly as before.
     base = AutoModelForCausalLM.from_pretrained(
         config.model_name, device_map="auto",
-        torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32)
+        torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32,
+        **attention_model_kwargs(config.train_signals))
     base.resize_token_embeddings(len(tokenizer))
     diag_ckpt = None
     load_from_ckpt = (args.diag_only or args.ood_only or args.length_only
@@ -1299,7 +1517,12 @@ def main():
     # is the cached endogenous target still what the model computes? (auto-runs
     # whenever the adapter is active over the input text, where it can go stale)
     if not args.skip_drift_eval and (not gate_input or args.force_drift_eval):
-        measure_activation_drift(model, test_dataset_pred, pred_collator, config, eval_out_dir)
+        # The MLP version reads the neuron through a forward hook on act_fn and also
+        # measures up_proj/gate_proj transmission; an attention logit is not a module
+        # output and has no transmission analogue, so that family gets its own
+        # implementation of the same two measurements, writing the same filenames.
+        drift_fn = measure_attention_alignment if attention_run else measure_activation_drift
+        drift_fn(model, test_dataset_pred, pred_collator, config, eval_out_dir)
 
     eval_endogenous_test(model, test_dataset_pred, pred_collator, config, eval_out_dir)
 

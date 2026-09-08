@@ -43,6 +43,10 @@ from src.introspector.dataset_utils import (
 from src.introspector.models.signal_paths import (
     resolve_mlp_signal_path, resolve_resid_signal_path, resolve_sae_hook_path,
 )
+from src.introspector.models.attention_logits import (
+    AttentionLogitPort, attention_model_kwargs, fan_out_ports, installed_ports,
+    is_attention_type,
+)
 from src.introspector.prompts import PROMPT_REGISTRY
 from src.introspector.signals.schema import SignalSpec, TokenSelector
 from src.introspector.signals.sae import load_sae
@@ -108,26 +112,68 @@ def sample_token_position(
     return selected_pos
 
 
+def attention_src_positions(spec, batch_token_positions, seq_lens) -> List[int]:
+    """Absolute source positions for one attention spec, one per example.
+
+    `batch_token_positions` are the DESTINATION positions (what the token selector
+    chose); the source sits `spec.src_offset` tokens before each of them.
+
+    Deliberately does NOT clamp. sample_token_position clamps because a token selector
+    is allowed to ask for more context than a document has; here an out-of-range source
+    means the cell being asked for does not exist in this document, and clamping would
+    quietly substitute a DIFFERENT, plausible-looking position -- exactly the failure
+    that produced scripts_old_with_off_by_one_bug/. `validate_attention_offsets` refuses
+    such a config up front (raise), and this asserts the invariant per batch.
+    """
+    src = [dst + spec.src_offset for dst in batch_token_positions]
+    for i, (s_pos, dst, seq_len) in enumerate(zip(src, batch_token_positions, seq_lens)):
+        assert 0 <= s_pos <= dst < int(seq_len), (
+            f"{spec.type} src position out of range for example {i}: "
+            f"src={s_pos} (dst={dst} + offset={spec.src_offset}), seq_len={int(seq_len)}. "
+            f"Set --min-seq-length so every document is long enough for this offset.")
+    return src
+
+
 def extract_activations_batch(
     model: LanguageModel,
     batch_tokens: BatchEncoding,
     signal_specs: List[SignalSpec],
     batch_token_positions: List[int],
+    seq_lens=None,
 ) -> Dict[SignalSpec, List[float]]:
     """
     Extract internal signals using NNsight.
     :param model: Language model.
     :param batch_tokens: Batch of text tokens encoded.
     :param signal_specs: Signal specifications for each piece of text in batch
-    :param batch_token_positions: Batch token positions for signal.
+    :param batch_token_positions: Batch token positions for signal (DESTINATION token
+        for attention signals).
+    :param seq_lens: unpadded length per example; required when attention signals are
+        present, to bound-check the source positions.
     :return: Extracted signals.
     """
     signal_activations = {}
     mlp_signal_specs = [s for s in signal_specs if s.type == "mlp"]
-    att_signal_specs = [s for s in signal_specs if s.type == "attention_score"]
+    att_signal_specs = [s for s in signal_specs if is_attention_type(s.type)]
     rs_signal_specs = [s for s in signal_specs if s.type == "residual_stream"]
     sae_signal_specs = [s for s in signal_specs if s.type == "sae"]
     bs = len(batch_tokens["input_ids"])
+
+    # ---- attention: one port per layer, read for every (head, src_offset) at once ----
+    # A port reads ONE cell per example, so a layer holding k attention signals needs k
+    # ports. They all read the same [B, Hq, L, L] tensor that the single forward already
+    # computes, so k costs k gathers, not k forwards -- which is what makes caching a
+    # whole cell (8 heads x 10 offsets) as cheap as caching one signal.
+    att_ports = {}   # spec -> AttentionLogitPort
+    if att_signal_specs:
+        assert seq_lens is not None, "attention signals need seq_lens for bound checks"
+        for spec in att_signal_specs:
+            src = attention_src_positions(spec, batch_token_positions, seq_lens)
+            att_ports[spec] = AttentionLogitPort(
+                heads=torch.full((bs,), spec.index, dtype=torch.long),
+                dst=torch.tensor(batch_token_positions, dtype=torch.long),
+                src=torch.tensor(src, dtype=torch.long),
+            )
 
     # SAE features are a non-native (encoder) readout, so we cannot index them
     # in-trace like a module output: we save the residual at the SAE's hook site
@@ -137,7 +183,11 @@ def extract_activations_batch(
     sae_hook_paths = {L: resolve_sae_hook_path(model, L, path_to_output=True) for L in sae_layers}
     sae_resid_proxies = {}
 
-    with torch.no_grad(), model.trace(batch_tokens):
+    # ports are keyed by layer, but several specs can share a layer, so wrap the
+    # per-layer port in a fan-out that feeds each spec's own port.
+    layer_ports = fan_out_ports(att_ports)
+
+    with torch.no_grad(), installed_ports(model, layer_ports), model.trace(batch_tokens):
         for layer in range(model.config.num_hidden_layers): # TODO llama3 path here, not sure for others
             # extract MLPs
             if mlp_signal_specs:
@@ -160,8 +210,9 @@ def extract_activations_batch(
                     for signal_spec in rs_signal_specs_layer:
                         signal_activations[signal_spec] = rs_out_layer[signal_spec.index].save().tolist().item()
 
-            if att_signal_specs:
-                raise NotImplementedError("avoiding the headache right now")
+            # attention logits are read by the ports installed around the trace, not
+            # from a module output -- they are not the output of any module (see
+            # src/introspector/models/attention_logits.py for why).
 
         # save full residual [bs, token, h] at each SAE hook site (encode below)
         for L in sae_layers:
@@ -185,6 +236,13 @@ def extract_activations_batch(
             for signal_spec in specs:
                 acts = feats_at_tok[:, signal_spec.index]
                 signal_activations[signal_spec] = acts.float().cpu().tolist()
+
+    for spec, port in att_ports.items():
+        assert port.read is not None, (
+            f"port for {spec} never fired -- the model is not running the introspection "
+            f"attention implementation, so nothing was captured")
+        assert len(port.read) == bs, f"port read {len(port.read)} values, expected {bs}"
+        signal_activations[spec] = port.read.cpu().tolist()
 
     return signal_activations
 
@@ -213,6 +271,7 @@ def create_batch_example(
         batch_tokens=encoded,
         signal_specs=signals,
         batch_token_positions=batch_token_positions,
+        seq_lens=seq_lens,
     )
     out = []
 
@@ -229,6 +288,18 @@ def create_batch_example(
         for signal in signals:
             token_position = batch_token_positions[data_idx]
             token_str = model.tokenizer.decode(encoded["input_ids"][data_idx][token_position], clean_up_tokenization_spaces=False)
+            # SOURCE token, attention signals only. `token_position`/`token` keep meaning
+            # the DESTINATION for every signal type, so nothing that reads them changes.
+            # The three columns are emitted on EVERY row (None for non-attention): rows
+            # of one Dataset.from_list must share a key set or Arrow's schema inference
+            # breaks, and nothing on the MLP path reads them.
+            src_offset = getattr(signal, "src_offset", None) if is_attention_type(signal.type) else None
+            if src_offset is None:
+                src_position, src_token_str = None, None
+            else:
+                src_position = token_position + src_offset
+                src_token_str = model.tokenizer.decode(
+                    encoded["input_ids"][data_idx][src_position], clean_up_tokenization_spaces=False)
             out.append({
                 "text": truncated_texts[data_idx],
                 "signal_type": signal.type,
@@ -236,6 +307,9 @@ def create_batch_example(
                 "signal_index": signal.index,
                 "token_position": batch_token_positions[data_idx],
                 "token": token_str,
+                "src_offset": src_offset,
+                "src_token_position": src_position,
+                "src_token": src_token_str,
                 "text_input_ids": row_input_ids,
                 "activation": signals_activations[signal][data_idx],
                 "target": float_to_str_target(signals_activations[signal][data_idx], signal.precision) #f"{'+' if signals_activations[signal][data_idx]>0 else ''}{signals_activations[signal][data_idx]:.{signal.precision}f}",
@@ -287,7 +361,13 @@ def build_split(
 def report_signal_statistics(dataset: Dataset):
     df = dataset.to_pandas()
     assert len(df) > 0, "dataset is empty!"
-    dscr = df.groupby(["signal_type", "signal_layer", "signal_index"])["activation"].describe()
+    # src_offset joins the key when present: two attention signals of the same
+    # (layer, head) at different source offsets are DIFFERENT signals, and grouping
+    # without it would average them into one meaningless std.
+    keys = ["signal_type", "signal_layer", "signal_index"]
+    if "src_offset" in df.columns and df["src_offset"].notna().all():
+        keys.append("src_offset")
+    dscr = df.groupby(keys)["activation"].describe()
     print(dscr)
     return dscr.reset_index().to_dict(orient="records")
 
@@ -314,6 +394,46 @@ def _git_sha():
                                        stderr=subprocess.DEVNULL, text=True).strip()
     except Exception:
         return None
+
+
+def validate_attention_offsets(config, signal_specs) -> None:
+    """Refuse an attention config whose source offsets cannot be honoured.
+
+    A cached document is `seq_len` tokens; the destination sits at some position `dst`
+    and the source at `dst + src_offset`. If `min_seq_length` is unset, C4 supplies
+    documents shorter than `max_seq_length`, and on those `sample_token_position` clamps
+    the destination toward the front -- so an offset of -31 silently resolves to position
+    0 (BOS) for a short document and to a real token for a long one. The BOS/attention-
+    sink measurement would then be right only by accident.
+
+    Requiring `min_seq_length >= |min offset| + 1` makes every document long enough for
+    the deepest offset. Setting min == max (e.g. both 32) additionally pins every
+    document to exactly that length, so dst=-1 is position L-1 and offset -(L-1) is
+    exactly BOS. Config input, so this raises rather than asserts.
+    """
+    att = [s for s in signal_specs if is_attention_type(s.type)]
+    if not att:
+        return
+    deepest = min(s.src_offset for s in att)          # most negative
+    need = abs(deepest) + 1                            # source, destination, and between
+    for name, ds_cfg, sel in (
+        ("train", config.train_dataset, config.train_token_selector),
+        ("dev", config.dev_dataset, config.dev_token_selector),
+        ("test", config.test_dataset, config.test_token_selector),
+    ):
+        floor = ds_cfg.min_seq_length
+        if not floor or floor < need:
+            raise ValueError(
+                f"attention signals reach {deepest} tokens back, which needs every "
+                f"{name} document to be at least {need} tokens, but "
+                f"min_seq_length={floor!r}. Pass --min-seq-length {need} (or more) so "
+                f"short documents are filtered out instead of having their source "
+                f"position silently clamped onto a different token.")
+        if sel.type == "fixed" and sel.position >= 0 and sel.position + deepest < 0:
+            raise ValueError(
+                f"{name} token selector is fixed at position {sel.position}, so a source "
+                f"offset of {deepest} lands at {sel.position + deepest} (before BOS). "
+                f"Use a negative (end-relative) destination or a shallower offset.")
 
 
 def _raw_span(n_filtered: int, floor, config, tokenizer, probe: int = 2000) -> int:
@@ -374,7 +494,7 @@ def _realized_stats(dataset) -> dict:
     pos = np.array(dataset["token_position"])
     dist = seq_len - 1 - pos
     pct = [5, 25, 50, 75, 95]
-    return {
+    out = {
         "seq_len": {"min": int(seq_len.min()), "max": int(seq_len.max()),
                     "mean": round(float(seq_len.mean()), 1),
                     "pct": {p: int(np.percentile(seq_len, p)) for p in pct}},
@@ -384,6 +504,45 @@ def _realized_stats(dataset) -> dict:
                               "mean": round(float(dist.mean()), 1),
                               "pct": {p: int(np.percentile(dist, p)) for p in pct}},
     }
+    if "src_token_position" in dataset.column_names:
+        src = [x for x in dataset["src_token_position"] if x is not None]
+        if src:
+            src = np.array(src)
+            out["src_token_position"] = {
+                "min": int(src.min()), "max": int(src.max()),
+                "pct": {p: int(np.percentile(src, p)) for p in pct}}
+            # PROMPT AMBIGUITY, measured rather than assumed. The prompt names the
+            # source token by its string only, so when that token appears more than once
+            # in the 32-token context the prompt does not identify WHICH occurrence is
+            # meant. That is a confound the MLP experiments never had (they name one
+            # token). Recording the rate here lets the analysis split corr by
+            # unique/duplicated instead of guessing how much it costs.
+            ids = dataset["text_input_ids"]
+            n_uni = n_tot = 0
+            for row_ids, sp in zip(ids, dataset["src_token_position"]):
+                if sp is None:
+                    continue
+                n_tot += 1
+                n_uni += int(row_ids.count(row_ids[sp]) == 1)
+            out["src_token_unique_rate"] = round(n_uni / n_tot, 4) if n_tot else None
+    return out
+
+
+_SIGNAL_SITES = {
+    "mlp": "mlp.act_fn output (post-activation neuron)",
+    "attention_score": "pre-softmax attention logit q.k/sqrt(d_head), after RoPE, "
+                       "before causal mask and softmax",
+    "attention_weight": "post-softmax attention weight",
+    "residual_stream": "decoder layer output (residual stream)",
+    "sae": "SAE feature activation at the SAE's hook site",
+}
+
+
+def _signal_site(specs) -> str:
+    """Human description of WHAT was captured. Was hardcoded to the MLP string, which
+    would have mislabelled every attention cache built after this."""
+    kinds = sorted({s.type for s in specs})
+    return " + ".join(_SIGNAL_SITES.get(k, k) for k in kinds) if kinds else "none"
 
 
 def write_dataset_metadata(config: ExperimentConfig, output_dir: Path, model,
@@ -421,7 +580,8 @@ def write_dataset_metadata(config: ExperimentConfig, output_dir: Path, model,
                 "test": config.test_dataset.max_seq_length,
             },
         },
-        "capture": {"model_dtype": dtype, "signal_site": "mlp.act_fn output (post-activation neuron)"},
+        "capture": {"model_dtype": dtype, "signal_site": _signal_site(config.train_signals),
+                    "attn_implementation": getattr(model.config, "_attn_implementation", None)},
         "row_counts": row_counts,
         # What the cache ACTUALLY contains, not what was requested. A length sweep is
         # only meaningful if the documents really reach the nominal length: max_seq_length
@@ -468,6 +628,9 @@ def main():
         return
 
     set_seed(config.seed)
+
+    all_signals = list(config.train_signals) + list(config.dev_signals) + list(config.test_signals)
+    validate_attention_offsets(config, all_signals)
 
     # load datasets from hf. Each split is loaded from ITS OWN DatasetConfig: the
     # previous version branched on whether the TRAIN kwargs carried "config" and then
@@ -524,6 +687,20 @@ def main():
     hf_dataset_train = _apply_min_len(hf_dataset_train, config.train_dataset, length_tokenizer)
     hf_dataset_test = _apply_min_len(hf_dataset_test, config.test_dataset, length_tokenizer)
 
+    # TEST was never truncated. Train and dev are take()n below, but the test split fell
+    # through: under streaming, `for batch in hf_dataset.batch(...)` in build_split runs
+    # to the END OF THE CORPUS, so --test-max-samples 3000 actually cached all ~45K
+    # documents of c4 validation. The tqdm total is computed from max_samples, so the bar
+    # just runs past 100% -- no error, only a much larger and slower test split than the
+    # config asked for. It has to be truncated the same way train and dev are.
+    # (This does not move any cache key, so caches already on disk are still found and
+    # reused unchanged; only freshly built ones get the configured size.)
+    if config.test_dataset.max_samples:
+        hf_dataset_test = (hf_dataset_test.take(config.test_dataset.max_samples)
+                           if isinstance(hf_dataset_test, IterableDataset)
+                           else hf_dataset_test.select(
+                               range(min(config.test_dataset.max_samples, len(hf_dataset_test)))))
+
     # assume dataset is large and is not truncated so using streaming mode
     if isinstance(hf_dataset_train, IterableDataset):
         hf_dataset_train = hf_dataset_train.take(config.train_dataset.max_samples)
@@ -563,10 +740,17 @@ def main():
 
 
     # load model and tokenizer
+    #
+    # attention_model_kwargs returns {} unless an attention signal is being cached, so a
+    # neuron/SAE cache is still built under sdpa and its values are bit-identical to what
+    # they always were. When it does fire, the SAME implementation must be used by the
+    # trainer, or the cached value and the live value disagree at the bf16 level and the
+    # alignment check will not reach corr ~0.9999.
     model = LanguageModel(
         config.model_name,
         device_map="auto",
-        quantization_config=get_quantization_config(config)
+        quantization_config=get_quantization_config(config),
+        **attention_model_kwargs(all_signals),
     )
     if model.tokenizer.pad_token is None:
         model.tokenizer.pad_token = model.tokenizer.eos_token

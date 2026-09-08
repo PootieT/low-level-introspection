@@ -13,6 +13,10 @@ from peft.tuners.lora.layer import Linear
 from transformers import TrainerCallback
 
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
+from src.introspector.models.attention_logits import (
+    AttentionLogitPort, PORT_ATTR, assert_attention_impl, is_attention_type,
+    resolve_attention_module,
+)
 
 # the custom regression head is NOT part of the PEFT adapter, so PEFT's
 # save_pretrained never serializes it. We persist/load it under this filename
@@ -146,6 +150,33 @@ def replace_model_with_gated_version(model: PeftModelForCausalLM):
 # ============================================================
 # Hook helpers
 # ============================================================
+def signal_range_key(layer, index, src_offset=None):
+    """Key into `signal_ranges`. 2-tuple for MLP/SAE (unchanged), 3-tuple for attention.
+
+    One function so the dict that trainers BUILD and the sampler that READS it cannot
+    drift apart -- a mismatch there is a KeyError at best and a wrong intervention
+    distribution at worst.
+    """
+    if src_offset is None:
+        return (int(layer), int(index))
+    return (int(layer), int(index), int(src_offset))
+
+
+class _PortHandle:
+    """Mimics a pytorch hook handle so ports and forward hooks share one cleanup path.
+
+    Removal must be unconditional (the caller does it in `finally`): a port left attached
+    would silently intervene on the NEXT forward, which is how an endogenous evaluation
+    would end up secretly interventional.
+    """
+
+    def __init__(self, module):
+        self.module = module
+
+    def remove(self):
+        setattr(self.module, PORT_ATTR, None)
+
+
 class InterventionHook:
     # TODO extend to other types of signals
     def __init__(self, token_positions, signal_indices, intervention_values):
@@ -236,8 +267,17 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
             f"{self.regression_head.weight.dtype}, device={self.regression_head.weight.device}"
         )
         self._printed_forward_dtypes = False
-        # {(layer, idx): {"min","max","mean","std"}}
+        # {(layer, idx): {...}} for mlp/sae, {(layer, head, src_offset): {...}} for
+        # attention (see signal_range_key).
         self.signal_ranges = signal_ranges
+        key_lens = {len(k) for k in (signal_ranges or {})}
+        assert len(key_lens) <= 1, f"mixed signal_ranges key shapes: {key_lens}"
+        # Which intervention site this run uses. Kept so forward can REFUSE to inject an
+        # attention signal's value into an MLP neuron: the two paths differ only by
+        # whether src_token_position was passed, and a caller that forgot it would
+        # otherwise write into `mlp.act_fn` at index `head` -- a real neuron, a plausible
+        # number, and a completely wrong experiment.
+        self._attention_signals = key_lens == {3}
         self.intervention_distribution = intervention_distribution
         self.intervention_extreme_scale = intervention_extreme_scale
         self.intervention_fn = intervention_fn  # optional custom intervention sampler
@@ -260,10 +300,17 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
         """Set the current intervention spread multiplier (annealing hook)."""
         self.intervention_scale = float(scale)
 
-    def sample_intervention_values(self,signal_layers,signal_indices,device):
+    def sample_intervention_values(self, signal_layers, signal_indices, device,
+                                   signal_src_offsets=None):
         vals = []
-        for layer, idx in zip(signal_layers.tolist(),signal_indices.tolist()):
-            stats = self.signal_ranges[(layer, idx)]
+        # An attention signal is only identified once the source offset is included:
+        # (layer, head) alone names ten different signals in a cell, whose ranges differ
+        # by an order of magnitude (the BOS sink against a mid-context token). Keying
+        # without it would sample every offset's intervention from one pooled range.
+        offsets = (signal_src_offsets.tolist() if signal_src_offsets is not None
+                   else [None] * len(signal_layers))
+        for layer, idx, off in zip(signal_layers.tolist(), signal_indices.tolist(), offsets):
+            stats = self.signal_ranges[signal_range_key(layer, idx, off)]
             if self.intervention_fn is not None:
                 val = self.intervention_fn(layer=layer, idx=idx, **stats)
             elif self.intervention_distribution == "gaussian":
@@ -292,6 +339,8 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
         token_position=None, # intervention inputs
         signal_layer=None,
         signal_index=None,
+        src_token_position=None,  # attention signals: SOURCE token (token_position is dst)
+        signal_src_offset=None,   # attention signals: part of the signal identity
         regression_token_positions=-1, # regression
         labels=None, # labels for regression are scalar and shifted tokens otherwise
         do_intervention=True,
@@ -322,14 +371,50 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
                 # right padding, (attention_mask == 0).sum == leading pad count.)
                 attention_mask = kwargs.get("attention_mask")
                 if attention_mask is not None:
+                    # The comment above only holds under LEFT padding. Assert it instead
+                    # of trusting it: LoRAGatingCollator switches padding side only when
+                    # for_prediction=True, and under right padding this shift would move
+                    # every position by the WRONG amount without raising.
+                    assert bool((attention_mask[:, -1] == 1).all()), (
+                        "intervention assumes LEFT padding (no zeros at the end of "
+                        "attention_mask), but some rows are right-padded")
                     num_left_pad = (attention_mask == 0).sum(dim=1).to(token_position.device)
                     token_position = token_position + num_left_pad
+                    if src_token_position is not None:
+                        src_token_position = src_token_position + num_left_pad.to(
+                            src_token_position.device)
 
                 # sample interventions INSIDE forward
-                intervention_values = self.sample_intervention_values(signal_layer,signal_index,device)
+                intervention_values = self.sample_intervention_values(
+                    signal_layer, signal_index, device, signal_src_offset)
+                attention_batch = src_token_position is not None
+                assert attention_batch == self._attention_signals, (
+                    f"intervention site mismatch: signal_ranges says "
+                    f"attention={self._attention_signals} but the batch "
+                    f"{'carries' if attention_batch else 'lacks'} src_token_position. "
+                    f"A caller building forward kwargs by hand must pass "
+                    f"src_token_position and signal_src_offset for attention signals.")
                 unique_layers = torch.unique(signal_layer)
                 for layer in unique_layers.tolist():
                     mask = signal_layer == layer
+                    if attention_batch:
+                        # An attention logit is not any module's output, so it cannot be
+                        # written by a forward hook. The port is read/written inside the
+                        # custom attention function; see models/attention_logits.py.
+                        port = AttentionLogitPort(
+                            heads=signal_index[mask],
+                            dst=token_position[mask],
+                            src=src_token_position[mask],
+                            values=intervention_values[mask],
+                        )
+                        module = resolve_attention_module(self, layer)
+                        assert getattr(module, PORT_ATTR, None) is None, (
+                            f"layer {layer} already carries a port; a previous forward "
+                            f"leaked one and this batch would be intervened twice")
+                        setattr(module, PORT_ATTR, port)
+                        hooks.append(_PortHandle(module))
+                        continue
+
                     hook = InterventionHook(
                         token_positions=token_position[mask],
                         signal_indices=signal_index[mask],
@@ -340,6 +425,8 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
                     module = operator.attrgetter(module_path)(self)
                     handle =  module.register_forward_hook(hook)
                     hooks.append(handle)
+                if attention_batch:
+                    assert_attention_impl(self)
 
                 # regression target = intervention value
                 if labels is not None and labels.ndim == 1:

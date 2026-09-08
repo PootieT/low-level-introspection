@@ -4,7 +4,11 @@ Investigating whether LMs can be finetuned to introspect low level signals, and 
 ## Signal Types
 Currently we have the following types of signals written for training:
 - MLP neuron (after non-linearity)
-- Attention Score (TOOD)
+- Attention logit (pre-softmax `q.k/sqrt(d_head)`, after RoPE) at one
+  `(layer, head, destination token, source token)` cell -- named `A<layer>.<head>@<src_offset>`
+- Attention weight (post-softmax, code `P`): spec/parse/identity plumbing is in place,
+  extraction reads the same port one step later (not wired yet)
+- SAE feature
 - Residual Stream (TODO)
 
 ## Repo Structure
