@@ -233,6 +233,12 @@ python generate_experiment_config.py \
     --output "$CONFIG" \
     $OVERWRITE
 
+### cache this run's OWN dataset
+# Required since each cell now has its own cache (its N neurons over N_TEXTS texts).
+# In the previous design every run shared the pool cache via --signal-filter, so caching
+# the pool alone was enough; it no longer is.
+python cache_signals.py --config "$CONFIG" $OVERWRITE
+
 python train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
