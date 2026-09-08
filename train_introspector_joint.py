@@ -150,6 +150,14 @@ def parse_args():
     p.add_argument("--max-unseen-neurons", type=int, default=None,
                    help="Cap the held-out neurons evaluated (default: every neuron in the "
                         "cache that the run did not train on).")
+    p.add_argument("--evals-per-run", type=int, default=25,
+                   help="How many dev evaluations to run over the whole training run. "
+                        "eval_steps was previously a fixed 400-examples cadence, which is "
+                        "781 evaluations on a 300k-row single-epoch run -- invisible when "
+                        "dev was 200 rows, ruinous once dev scales with the neuron count. "
+                        "Scale-invariant: the cadence follows the run length. Dev is a "
+                        "monitor only (no load_best_model_at_end), so this cannot change "
+                        "the trained model.")
     p.add_argument("--max-train-examples", type=int, default=None,
                    help="Cap TRAIN rows after the signal filter, without rebuilding the cache. "
                         "A row is one (text, neuron) pair, so with N neurons this caps rows, "
@@ -379,6 +387,21 @@ class JointInterventionTrainer(InterventionTrainer):
             self.log(log)
         out = interv_out if interv_out is not None else endo_out
         return (loss, out) if return_outputs else loss
+
+
+def _eval_steps(n_train_rows: int, config, evals_per_run: int) -> int:
+    """Dev-eval cadence, expressed as a COUNT of evaluations rather than a fixed
+    examples-per-eval interval.
+
+    The old formula (every 400 examples) gives 781 evaluations on a 300k-row single-epoch
+    run. That was cheap while dev was 200 rows; with a multi-neuron cache dev rows are
+    texts x neurons, so at 100 neurons each evaluation is 157 batches and the run spends
+    longer in dev than in training. Tying the cadence to run length keeps it bounded
+    whatever the dataset size.
+    """
+    steps_per_epoch = math.ceil(n_train_rows / config.training_config.train_batch_size)
+    total = max(1, steps_per_epoch * max(1, config.training_config.num_epochs))
+    return max(1, total // max(1, evals_per_run))
 
 
 def _checkpoint_is_complete(ckpt) -> bool:
@@ -1275,7 +1298,7 @@ def main():
         per_device_eval_batch_size=config.training_config.eval_batch_size,
         num_train_epochs=config.training_config.num_epochs,
         logging_steps=math.ceil(100 / config.training_config.train_batch_size),
-        eval_strategy="steps", eval_steps=math.ceil(400 // config.training_config.train_batch_size),
+        eval_strategy="steps", eval_steps=_eval_steps(len(train_dataset), config, args.evals_per_run),
         bf16=config.training_config.bf16,
         remove_unused_columns=False, report_to="wandb", **save_kwargs)
 

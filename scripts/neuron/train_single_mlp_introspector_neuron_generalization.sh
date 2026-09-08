@@ -17,7 +17,7 @@
 #
 # TWO caches, and the split between them is the whole trick:
 #
-#   POOL cache (shared, built once)   3k texts x 200 neurons, TEST SPLIT ONLY. Its train
+#   POOL cache (shared, built once)   N_POOL_TEST texts x N_CACHE neurons, TEST SPLIT ONLY. Its train
 #       split is stubbed to 64 texts because nothing trains on it. This is what the
 #       unseen arm reads: it holds every neuron, trained or not.
 #   PER-CELL train cache              (TARGET_ROWS / N) texts x N neurons. Sized so every
@@ -103,7 +103,7 @@ LAYER=4                  # same layer as the length-gen experiment, and in the m
 TOKEN_POS=-1
 N_CACHE=200              # neurons in the POOL cache: trainable prefix + held-out rest
 TARGET_ROWS=300000       # (text, neuron) pairs per run -- the fixed budget for arm A
-N_POOL_TEST=500          # texts in the pool cache's test split (rows = this x 200)
+N_POOL_TEST=3000          # texts in the pool cache's test split (rows = this x 200)
 SEED=21                  # same sampler seed as the layer/token grid
 
 GATE=off
@@ -114,7 +114,14 @@ LORA_R=16
 LORA_ALPHA=$((LORA_R * 2))
 LORA_DO=0.0
 BS=32
-N_TEST=500              # texts in each run's OWN test split
+N_TEST=3000              # texts in each run's OWN test split
+# Dev is sized in ROWS, like the train budget. rows = texts x neurons, so a flat text
+# count made dev 100x more expensive at N=100 than at N=1. The 50-text FLOOR keeps enough
+# distinct contexts once N is large (the row target alone would give 20 texts at N=100).
+# The in-training dev metric is POOLED over all rows -- not macro-averaged per neuron --
+# so what stabilises it is TOTAL rows, not rows per neuron.
+DEV_ROWS=2000
+DEV_MIN_TEXTS=50
 MIN_LEN=""               # no length floor: pos=-1 needs no length guarantee, and a
                          # floor would make this cache incomparable to the pos=-1 runs
 PROMPT_TYPE=prompt_no_token_index   # neuron is named by index either way; the token
@@ -139,6 +146,8 @@ N_NEURONS=${CELL%%:*}
 N_ROWS=${CELL##*:}
 # rows = texts x neurons, and --train-max-samples counts TEXTS
 N_TEXTS=$((N_ROWS / N_NEURONS))
+DEV_TEXTS=$((DEV_ROWS / N_NEURONS))
+if [ "$DEV_TEXTS" -lt "$DEV_MIN_TEXTS" ]; then DEV_TEXTS=$DEV_MIN_TEXTS; fi
 
 # set to --overwrite-cache to force config/dataset/run regeneration
 OVERWRITE=""
@@ -194,7 +203,7 @@ TRAIN_NEURONS=$(IFS=,; echo "${ALL_NEURONS[*]:0:$N_NEURONS}")
 
 EXP_NAME="neurongen_arm${ARM}_L${LAYER}_n${N_NEURONS}_r${N_ROWS}_gate${GATE}_w${W}"
 CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
-echo "task=$SGE_TASK_ID arm=$ARM neurons=$N_NEURONS rows=$N_ROWS texts=$N_TEXTS -> $EXP_NAME"
+echo "task=$SGE_TASK_ID arm=$ARM neurons=$N_NEURONS rows=$N_ROWS texts=$N_TEXTS dev_texts=$DEV_TEXTS -> $EXP_NAME"
 
 # This run's OWN cache holds exactly its N neurons over N_TEXTS texts, so it is already
 # the right size and needs no --signal-filter and no row cap. The held-out neurons come
@@ -204,7 +213,7 @@ python generate_experiment_config.py \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" \
     --train-max-samples $N_TEXTS \
-    --dev-max-samples 200 \
+    --dev-max-samples $DEV_TEXTS \
     --dev-dataset-split "validation" \
     --dev-offset-from-train 8000 \
     --test-dataset allenai/c4 --test-dataset-split "validation" \
