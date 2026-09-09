@@ -16,7 +16,7 @@
 #$ -o logs
 #$ -j y
 ###$ -m ea
-#$ -t 1-160
+#$ -t 81-160
 
 # ============================================================================
 # ENDOGENOUS-ONLY (no interventional loss) regressor sweep over ATTENTION LOGITS:
