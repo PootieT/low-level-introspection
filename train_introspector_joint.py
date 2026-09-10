@@ -123,6 +123,11 @@ def parse_args():
                         "(see score_length_generalization.py). The point is the bins BEYOND "
                         "the training window: a run trained on the last k tokens can solve "
                         "training with a recency prior and fail everywhere else.")
+    p.add_argument("--eval-n-test", type=int, default=None,
+                   help="Texts per length-eval cache. Default: inherit the run's own test "
+                        "split size. Set this rather than editing --test-max-samples: that "
+                        "is part of the dataset IDENTITY, so changing it renames the run's "
+                        "TRAINING cache too and --length-only would then fail to load it.")
     p.add_argument("--length-only", action="store_true",
                    help="Load the checkpoint and run ONLY the length-generalization eval -- "
                         "no training, no other diagnostics. Writes into the RUN dir so results "
@@ -1186,7 +1191,8 @@ def main():
         from score_length_generalization import prepare_length_caches, DEFAULT_EVAL_LENGTHS
         eval_lengths = ([int(x) for x in args.eval_lengths.split(",")]
                         if args.eval_lengths else list(DEFAULT_EVAL_LENGTHS))
-        length_prepared = prepare_length_caches(config, eval_lengths=eval_lengths)
+        length_prepared = prepare_length_caches(config, eval_lengths=eval_lengths,
+                                                n_test=args.eval_n_test)
 
     ood_prepared, ood_corpora = None, None
     if args.ood_eval or args.ood_only:
@@ -1272,7 +1278,7 @@ def main():
         print(f"[joint] --length-only: {diag_ckpt} -> {output_dir} | lengths={eval_lengths}")
         evaluate_length_grid(model, config, tokenizer, pred_collator,
                              output_dir=output_dir, eval_lengths=eval_lengths,
-                             prepared=length_prepared)
+                             n_test=args.eval_n_test, prepared=length_prepared)
         return
 
     if args.ood_only:
@@ -1391,7 +1397,7 @@ def main():
         from score_length_generalization import evaluate_length_grid
         evaluate_length_grid(model, config, tokenizer, pred_collator,
                              output_dir=eval_out_dir, eval_lengths=eval_lengths,
-                             prepared=length_prepared)
+                             n_test=args.eval_n_test, prepared=length_prepared)
 
     if args.ood_eval:
         # lazy import: score_ood_generalization imports this module's eval helpers
