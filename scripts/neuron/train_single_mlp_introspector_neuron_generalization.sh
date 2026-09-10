@@ -97,7 +97,7 @@ export WANDB_RUN_GROUP=mlp_neurongen
 set -e
 
 index=$(($SGE_TASK_ID-1))
-
+index=4
 LAYER=4                  # same layer as the length-gen experiment, and in the main
                          # layer/token grid's list, so the three are comparable
 TOKEN_POS=-1
@@ -150,7 +150,7 @@ DEV_TEXTS=$((DEV_ROWS / N_NEURONS))
 if [ "$DEV_TEXTS" -lt "$DEV_MIN_TEXTS" ]; then DEV_TEXTS=$DEV_MIN_TEXTS; fi
 
 # set to --overwrite-cache to force config/dataset/run regeneration
-OVERWRITE=""
+OVERWRITE="--overwrite-cache"
 
 if [ "$GATE" = "on" ]; then GATE_FLAG="--disable-adapter-in-input"; else GATE_FLAG=""; fi
 if [ -n "$MIN_LEN" ]; then MIN_FLAG="--min-seq-length $MIN_LEN"; else MIN_FLAG=""; fi
