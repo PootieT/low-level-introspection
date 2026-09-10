@@ -450,43 +450,32 @@ def plot_variance_sources(b: pd.DataFrame, out_dir, eval_type="interventional"):
     plt.close(fig)
 
 
-def plot_relative_generalization(pooled: pd.DataFrame, out_dir, eval_type="interventional"):
-    """Does degradation track the LENGTH RATIO rather than the absolute length?
+def _relative_table(pooled: pd.DataFrame, eval_type: str):
+    """Per-(train_len, ratio) relative change against each run's in-distribution score.
 
-    x  eval_len / train_len -- how far past its training length the run is being pushed
-    y  (corr - corr_ID) / corr_ID, where corr_ID is that same run evaluated at its OWN
-       training length. So a run scoring 0.80 in-distribution and 0.70 at 2x reads -12.5%.
-
-    Normalising against each run's own in-distribution score is what makes the training
-    lengths comparable: a run that starts at 0.5 and one that starts at 0.9 cannot be
-    compared on raw corr, and the absolute drop would flatter whichever started lower.
-
-    If the curves LIE ON TOP OF EACH OTHER, degradation is a function of the ratio and
-    training short is free -- push any length by 4x and pay the same fraction. If they
-    SEPARATE, absolute length is what matters and a short-trained run cannot be rescued
-    by the ratio being modest.
+    Normalising against the run's OWN score at its OWN training length is what makes the
+    training lengths comparable: a run starting at 0.5 and one starting at 0.9 cannot be
+    compared on raw corr, and an absolute drop would flatter whichever started lower.
 
     Diagonal cells only (window == train_len), matching ceiling_diagonal: off the diagonal
     the in-distribution reference is itself already a generalization result, so the
     normalisation would divide one unknown by another.
 
-    Uses the POOLED per-eval-length correlation (over that eval set's whole distance
-    range), not a per-bin number: the question is about the eval length as a whole.
+    Uses the POOLED per-eval-length correlation, not a per-bin number -- the question is
+    about the eval length as a whole.
     """
     col = {"interventional": "interventional_corr", "endogenous": "endogenous_corr"}[eval_type]
     if pooled.empty or col not in pooled.columns:
-        return
+        return None, None
     d = pooled[pooled["window"] == pooled["train_len"]].dropna(subset=[col]).copy()
     if d.empty:
-        return
+        return None, None
 
     ref = (d[d["eval_len"] == d["train_len"]]
            .drop_duplicates(subset=["run"]).set_index("run")[col])
     d["id_corr"] = d["run"].map(ref)
-    # Only rows with NO usable denominator are dropped -- the ratio is undefined there,
-    # not merely extreme. Everything else is kept, including runs with a weak
-    # in-distribution score; those get a large relative change, which is a real fact
-    # about them, and the y-axis is clipped below rather than the rows removed.
+    # Only rows with NO usable denominator are dropped -- undefined, not merely extreme.
+    # Weak-but-nonzero references are kept and flagged; the VIEW is clipped, not the data.
     undefined = int((d["id_corr"].isna() | (d["id_corr"] == 0)).sum())
     d = d[d["id_corr"].notna() & (d["id_corr"] != 0)]
     if undefined:
@@ -494,54 +483,86 @@ def plot_relative_generalization(pooled: pd.DataFrame, out_dir, eval_type="inter
               f"in-distribution reference (no eval at their own training length); the "
               f"ratio is undefined for those and they are not plotted")
     if d.empty:
-        return
+        return None, None
 
     d["ratio"] = d["eval_len"] / d["train_len"]
     d["rel"] = (d[col] - d["id_corr"]) / d["id_corr"]
     d = d[d["ratio"] >= 1]
-    weak = d[d["id_corr"].abs() <= 0.05]
+    d["id_corr_weak"] = d["id_corr"].abs() <= 0.05
+    weak = d[d["id_corr_weak"]]
     if len(weak):
         print(f"[lengen] NOTE ({eval_type}): {len(weak)} row(s) normalise against an "
               f"in-distribution |corr| <= 0.05, so their relative change is unstable. "
               f"Kept, and flagged as id_corr_weak in the CSV:")
         for _, r in weak.drop_duplicates(subset=["run"]).iterrows():
             print(f"    {r['run']}  id_corr={r['id_corr']:.3f}")
-    d["id_corr_weak"] = d["id_corr"].abs() <= 0.05
 
-    g = d.groupby(["train_len", "ratio"])["rel"].agg(mean="mean", std="std", n="count").reset_index()
+    gb = d.groupby(["train_len", "ratio"])
+    g = gb["rel"].agg(mean="mean", std="std", n="count").reset_index()
     g["mean_pct"], g["std_pct"] = 100 * g["mean"], 100 * g["std"]
-    g["n_weak"] = d.groupby(["train_len", "ratio"])["id_corr_weak"].sum().values
-    g["id_corr_mean"] = d.groupby(["train_len", "ratio"])["id_corr"].mean().values
-    g.to_csv(Path(out_dir) / f"relative_generalization_{eval_type}.csv", index=False)
+    g["n_weak"] = gb["id_corr_weak"].sum().values
+    g["id_corr_mean"] = gb["id_corr"].mean().values
+    return g, d
 
-    fig, ax = plt.subplots(figsize=(7.5, 5))
-    tls = sorted(g["train_len"].unique())
-    colors = dict(zip(tls, sns.color_palette("mako", len(tls))))
-    for tl in tls:
-        q = g[g["train_len"] == tl].sort_values("ratio")
-        ax.errorbar(q["ratio"], q["mean_pct"], yerr=q["std_pct"].fillna(0),
-                    marker="o", ms=6, capsize=3, lw=1.8, color=colors[tl],
-                    label=f"train len {tl}  (ID corr {d[d.train_len==tl]['id_corr'].mean():.2f})")
-    ax.axhline(0, color="k", lw=0.9, alpha=0.5)
-    # Clip the VIEW, never the data: one run normalising against a near-zero
-    # in-distribution score would otherwise compress every other curve into a flat line.
-    # Points outside the view are still in the CSV and are counted in the caption.
-    lo, hi = -110, max(20, float(np.nanpercentile(g["mean_pct"], 95)) + 10)
-    outside = int(((g["mean_pct"] < lo) | (g["mean_pct"] > hi)).sum())
+
+def plot_relative_generalization(pooled: pd.DataFrame, out_dir):
+    """Does degradation track the LENGTH RATIO rather than the absolute length?
+
+    x  eval_len / train_len -- how far past its training length the run is pushed
+    y  (corr - corr_ID) / corr_ID, against that run at its own training length
+
+    Both readouts on one row and on a SHARED y scale, because the comparison that matters
+    is between them: endogenous holding up while interventional falls means the readout
+    fell back on predicting the activation from context rather than reading it. Separate
+    figures with independently scaled axes hide exactly that.
+
+    Overlapping curves within a panel = degradation is a function of the ratio, so
+    training short is free. Separated = absolute length is what matters.
+    """
+    tables = {}
+    for et in ("endogenous", "interventional"):
+        g, _ = _relative_table(pooled, et)
+        if g is not None:
+            g.to_csv(Path(out_dir) / f"relative_generalization_{et}.csv", index=False)
+            tables[et] = g
+    if not tables:
+        return None
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
+    allv = pd.concat(tables.values())
+    lo = max(-110, float(np.nanmin(allv["mean_pct"] - allv["std_pct"].fillna(0))) - 5)
+    hi = max(15, float(np.nanpercentile(allv["mean_pct"], 95)) + 10)
+    short = {"endogenous": "endo", "interventional": "interventional"}
+    for ax, et in zip(axes, ("endogenous", "interventional")):
+        g = tables.get(et)
+        ax.axhline(0, color="k", lw=0.9, alpha=0.5)
+        ax.set_xscale("log", base=2)
+        ax.set_xlabel("eval length / training length")
+        ax.set_ylabel(f"relative {short[et]} eval (%)")
+        ax.set_title(et)
+        if g is None:
+            continue
+        tls = sorted(g["train_len"].unique())
+        colors = dict(zip(tls, sns.color_palette("mako", len(tls))))
+        for tl in tls:
+            q = g[g["train_len"] == tl].sort_values("ratio")
+            ax.errorbar(q["ratio"], q["mean_pct"], yerr=q["std_pct"].fillna(0),
+                        marker="o", ms=6, capsize=3, lw=1.8, color=colors[tl],
+                        label=f"train len {tl}")
+        ax.legend(fontsize=10)
+    # one shared scale so the two panels are directly comparable; points outside are
+    # still in the CSVs and are counted here rather than dropped
+    outside = int(((allv["mean_pct"] < lo) | (allv["mean_pct"] > hi)).sum())
+    axes[0].set_ylim(lo, hi)
     if outside:
-        ax.set_ylim(lo, hi)
-        ax.text(0.02, 0.02, f"{outside} point(s) outside the view; see the CSV",
-                transform=ax.transAxes, fontsize=9, color="firebrick")
-    ax.set_xscale("log", base=2)
-    ax.set_xlabel("eval length / training length")
-    ax.set_ylabel(f"{eval_type} corr, relative to in-distribution (%)")
-    ax.set_title("Does the drop track the length RATIO?\n"
-                 "overlapping curves = yes; separated = absolute length is what matters")
-    ax.legend(fontsize=10)
+        axes[0].text(0.02, 0.02, f"{outside} point(s) outside the view; see the CSVs",
+                     transform=axes[0].transAxes, fontsize=9, color="firebrick")
+    fig.suptitle("Does the drop track the length RATIO? "
+                 "overlapping curves = yes; separated = absolute length matters")
     fig.tight_layout()
-    fig.savefig(Path(out_dir) / f"relative_generalization_{eval_type}.png", dpi=150)
+    fig.savefig(Path(out_dir) / "relative_generalization.png", dpi=150)
     plt.close(fig)
-    return g
+    return tables
 
 
 def main(exp_group="mlp_lengen", gate="off", expected_cells=None):
@@ -561,8 +582,8 @@ def main(exp_group="mlp_lengen", gate="off", expected_cells=None):
     plot_ceiling(b, out_dir)
     for et in ("interventional", "endogenous"):
         plot_variance_sources(b, out_dir, et)
-        if not pooled.empty:
-            plot_relative_generalization(pooled, out_dir, et)
+    if not pooled.empty:
+        plot_relative_generalization(pooled, out_dir)
     variance_decomposition(b, out_dir)
     print(f"\n[lengen] wrote plots to {out_dir}")
 
