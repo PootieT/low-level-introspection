@@ -121,6 +121,54 @@ def resolve_eval_cache(config: ExperimentConfig, pool_config: str | Path | None)
     return pool, load_from_disk(str(path))
 
 
+def pool_signal_ranges(pool_cfg: ExperimentConfig, fallback) -> dict:
+    """(layer, index) -> activation stats for EVERY neuron in the pool.
+
+    The model's own signal_ranges are built from the run's TRAIN split, which contains
+    only the neurons that run trained on. The intervention sampler looks up
+    signal_ranges[(layer, index)] to choose the injected value, so evaluating a held-out
+    neuron raises KeyError -- the unseen arm cannot even be scored without this.
+
+    Stats come from the pool cache's train/dev splits, which hold all the neurons and are
+    disjoint from the test rows being scored. Estimated the SAME way for trained and
+    held-out neurons, so the two arms cannot differ because of how their injection
+    distribution was fitted. That symmetry costs little: evaluate_interventional_test
+    pins distribution="gaussian" and scale=1.0, so only mean and std are read (never the
+    sample-size-sensitive min/max), and correlation is invariant to the injected scale
+    anyway.
+    """
+    frames = []
+    for split in ("train", "dev"):
+        path = pool_cfg.dataset_cache_dir / split
+        if path.exists():
+            ds = load_from_disk(str(path))
+            frames.append(pd.DataFrame({
+                "signal_layer": ds["signal_layer"], "signal_index": ds["signal_index"],
+                "activation": np.asarray(ds["activation"], dtype=float)}))
+    source = "pool train+dev"
+    if not frames:
+        # No stubbed splits to read: fall back to the rows being evaluated. Only the
+        # injection SCALE comes from this, never the target, so it does not leak the
+        # quantity being predicted -- but say so rather than doing it silently.
+        print("[neurongen] WARNING: pool cache has no train/dev split; fitting the "
+              "injection distribution on the evaluation rows themselves")
+        frames = [pd.DataFrame({
+            "signal_layer": fallback["signal_layer"], "signal_index": fallback["signal_index"],
+            "activation": np.asarray(fallback["activation"], dtype=float)})]
+        source = "pool test (fallback)"
+
+    df = pd.concat(frames, ignore_index=True)
+    ranges, per_neuron = {}, df.groupby(["signal_layer", "signal_index"])["activation"]
+    for (layer, index), vals in per_neuron:
+        ranges[(int(layer), int(index))] = {
+            "min": float(vals.min()), "max": float(vals.max()),
+            "mean": float(vals.mean()), "std": float(vals.std())}
+    n_each = int(df.groupby(["signal_layer", "signal_index"]).size().min())
+    print(f"[neurongen] injection stats for {len(ranges)} neurons from {source} "
+          f"(>={n_each} samples each)")
+    return ranges
+
+
 def evaluate_neuron_generalization(model, config: ExperimentConfig, tokenizer, collator,
                                    preprocess_fn, output_dir, max_unseen: int | None = None,
                                    pool_config: str | Path | None = None):
@@ -162,10 +210,30 @@ def evaluate_neuron_generalization(model, config: ExperimentConfig, tokenizer, c
     act_stats = _activation_stats(test_raw)
     ds = test_raw.map(preprocess_fn, remove_columns=test_raw.column_names)
     suffix = "_neurongen"
-    interv = evaluate_interventional_test(
-        model, eval_dataset=ds, collator=collator, config=config,
-        output_dir=str(output_dir), distribution="gaussian", suffix=suffix)
-    endo = eval_endogenous_test(model, ds, collator, config, output_dir, suffix=suffix)
+
+    # The model only knows the activation range of the neurons it trained on; injecting
+    # into a held-out one would KeyError in sample_intervention_values. Swap in stats
+    # covering the whole pool for the duration of the eval, then put the run's own back
+    # so nothing downstream sees a mutated model.
+    pool_ranges = pool_signal_ranges(_pool_cfg, test_raw)
+    needed = {(int(l), int(i)) for l, i in
+              zip(test_raw["signal_layer"], test_raw["signal_index"])}
+    prev_ranges = model.signal_ranges
+    merged = {**prev_ranges, **pool_ranges}
+    still_missing = sorted(needed - set(merged))
+    if still_missing:
+        raise SystemExit(
+            f"[neurongen] no activation stats for {len(still_missing)} evaluated neuron(s), "
+            f"e.g. {still_missing[:5]}. The pool cache's train/dev splits do not cover the "
+            f"neurons in its test split -- rebuild the pool cache.")
+    model.signal_ranges = merged
+    try:
+        interv = evaluate_interventional_test(
+            model, eval_dataset=ds, collator=collator, config=config,
+            output_dir=str(output_dir), distribution="gaussian", suffix=suffix)
+        endo = eval_endogenous_test(model, ds, collator, config, output_dir, suffix=suffix)
+    finally:
+        model.signal_ranges = prev_ranges
     # The POOLED numbers these return mix trained and held-out neurons and mean nothing
     # here; they are recomputed per arm below. Kept only in the json for traceability.
 
