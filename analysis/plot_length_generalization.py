@@ -483,23 +483,35 @@ def plot_relative_generalization(pooled: pd.DataFrame, out_dir, eval_type="inter
     ref = (d[d["eval_len"] == d["train_len"]]
            .drop_duplicates(subset=["run"]).set_index("run")[col])
     d["id_corr"] = d["run"].map(ref)
-    missing = int(d["id_corr"].isna().sum())
-    # A near-zero in-distribution score makes the ratio explode and means the run failed
-    # at its own training length -- there is no generalization to measure from there.
-    tiny = int((d["id_corr"].abs() <= 0.05).sum())
-    d = d[d["id_corr"].notna() & (d["id_corr"].abs() > 0.05)]
-    if missing or tiny:
-        print(f"[lengen] relative generalization ({eval_type}): dropped {missing} rows with "
-              f"no in-distribution reference and {tiny} whose reference |corr| <= 0.05")
+    # Only rows with NO usable denominator are dropped -- the ratio is undefined there,
+    # not merely extreme. Everything else is kept, including runs with a weak
+    # in-distribution score; those get a large relative change, which is a real fact
+    # about them, and the y-axis is clipped below rather than the rows removed.
+    undefined = int((d["id_corr"].isna() | (d["id_corr"] == 0)).sum())
+    d = d[d["id_corr"].notna() & (d["id_corr"] != 0)]
+    if undefined:
+        print(f"[lengen] relative generalization ({eval_type}): {undefined} row(s) have no "
+              f"in-distribution reference (no eval at their own training length); the "
+              f"ratio is undefined for those and they are not plotted")
     if d.empty:
         return
 
     d["ratio"] = d["eval_len"] / d["train_len"]
     d["rel"] = (d[col] - d["id_corr"]) / d["id_corr"]
     d = d[d["ratio"] >= 1]
+    weak = d[d["id_corr"].abs() <= 0.05]
+    if len(weak):
+        print(f"[lengen] NOTE ({eval_type}): {len(weak)} row(s) normalise against an "
+              f"in-distribution |corr| <= 0.05, so their relative change is unstable. "
+              f"Kept, and flagged as id_corr_weak in the CSV:")
+        for _, r in weak.drop_duplicates(subset=["run"]).iterrows():
+            print(f"    {r['run']}  id_corr={r['id_corr']:.3f}")
+    d["id_corr_weak"] = d["id_corr"].abs() <= 0.05
 
     g = d.groupby(["train_len", "ratio"])["rel"].agg(mean="mean", std="std", n="count").reset_index()
     g["mean_pct"], g["std_pct"] = 100 * g["mean"], 100 * g["std"]
+    g["n_weak"] = d.groupby(["train_len", "ratio"])["id_corr_weak"].sum().values
+    g["id_corr_mean"] = d.groupby(["train_len", "ratio"])["id_corr"].mean().values
     g.to_csv(Path(out_dir) / f"relative_generalization_{eval_type}.csv", index=False)
 
     fig, ax = plt.subplots(figsize=(7.5, 5))
@@ -511,6 +523,15 @@ def plot_relative_generalization(pooled: pd.DataFrame, out_dir, eval_type="inter
                     marker="o", ms=6, capsize=3, lw=1.8, color=colors[tl],
                     label=f"train len {tl}  (ID corr {d[d.train_len==tl]['id_corr'].mean():.2f})")
     ax.axhline(0, color="k", lw=0.9, alpha=0.5)
+    # Clip the VIEW, never the data: one run normalising against a near-zero
+    # in-distribution score would otherwise compress every other curve into a flat line.
+    # Points outside the view are still in the CSV and are counted in the caption.
+    lo, hi = -110, max(20, float(np.nanpercentile(g["mean_pct"], 95)) + 10)
+    outside = int(((g["mean_pct"] < lo) | (g["mean_pct"] > hi)).sum())
+    if outside:
+        ax.set_ylim(lo, hi)
+        ax.text(0.02, 0.02, f"{outside} point(s) outside the view; see the CSV",
+                transform=ax.transAxes, fontsize=9, color="firebrick")
     ax.set_xscale("log", base=2)
     ax.set_xlabel("eval length / training length")
     ax.set_ylabel(f"{eval_type} corr, relative to in-distribution (%)")

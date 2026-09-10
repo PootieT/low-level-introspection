@@ -76,6 +76,19 @@ DISTANCE_BINS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 PROMPT_HEADROOM = 40
 
 
+# Tokens per forward pass to aim for when caching and evaluating. The run's own
+# eval_batch_size is chosen for its TRAINING length; reusing it at 8x the sequence length
+# is 8x the activation memory and is what makes 512/1024 OOM. Sequence length is traded
+# against batch size to hold this roughly constant. 16k = 128 x 128, the largest
+# configuration these sweeps already run without trouble.
+EVAL_TOKEN_BUDGET = 16_384
+
+
+def _scaled_eval_batch(base_batch: int, eval_len: int) -> int:
+    """Batch size for `eval_len`, never larger than the run's own."""
+    return max(1, min(int(base_batch), EVAL_TOKEN_BUDGET // max(1, int(eval_len))))
+
+
 def training_window(config: ExperimentConfig) -> int | None:
     """Widest distance-from-end the run was TRAINED on, or None if not expressible.
 
@@ -162,8 +175,12 @@ def derive_config(base_config: ExperimentConfig, eval_len: int, config_dir: Path
     cfg.train_token_selector = cfg.test_token_selector
     cfg.dev_token_selector = cfg.test_token_selector
 
+    batch = _scaled_eval_batch(cfg.training_config.eval_batch_size, eval_len)
+    if batch != cfg.training_config.eval_batch_size:
+        print(f"[lengen] len={eval_len}: eval batch {cfg.training_config.eval_batch_size} "
+              f"-> {batch} to hold ~{EVAL_TOKEN_BUDGET} tokens per forward")
     cfg.training_config = cfg.training_config.model_copy(
-        update={"max_seq_length": eval_len + PROMPT_HEADROOM})
+        update={"max_seq_length": eval_len + PROMPT_HEADROOM, "eval_batch_size": batch})
     cfg.dataset_name = None
     cfg.dataset_name = canonical_dataset_name(cfg)
     cfg.experiment_name = f"{base_config.experiment_name}__len{eval_len}"
@@ -353,10 +370,18 @@ def evaluate_length_grid(model, base_config: ExperimentConfig, tokenizer, collat
                                         cfg.training_config.max_seq_length)
 
             suffix = f"_len{eval_len}"
+            # eval_endogenous_test / evaluate_interventional_test take their DataLoader
+            # batch size from the config passed in. base_config's is sized for the
+            # training length, so at a long eval length the forward pass OOMs even
+            # though the cache built fine.
+            eval_cfg = base_config.model_copy(deep=True)
+            eval_cfg.training_config = eval_cfg.training_config.model_copy(update={
+                "eval_batch_size": _scaled_eval_batch(
+                    base_config.training_config.eval_batch_size, eval_len)})
             interv = evaluate_interventional_test(
-                model, eval_dataset=ds, collator=collator, config=base_config,
+                model, eval_dataset=ds, collator=collator, config=eval_cfg,
                 output_dir=str(output_dir), distribution="gaussian", suffix=suffix)
-            endo = eval_endogenous_test(model, ds, collator, base_config, output_dir,
+            endo = eval_endogenous_test(model, ds, collator, eval_cfg, output_dir,
                                         suffix=suffix)
 
             # Read the per-example frames back rather than threading them through the
