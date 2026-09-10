@@ -392,7 +392,10 @@ def variance_decomposition(b: pd.DataFrame, out_dir) -> pd.DataFrame:
         out["mean_sd"] = df.groupby(by)["sd_total"].mean().values
         return out
 
-    overall = _roll(cells, ["eval_type"])
+    cells["scope"] = np.where(cells["train_len"] == cells["window"], "diagonal", "off-diagonal")
+    overall = pd.concat([_roll(cells, ["eval_type"]).assign(scope="all cells"),
+                         _roll(cells[cells["scope"] == "diagonal"], ["eval_type"])
+                         .assign(scope="diagonal only")], ignore_index=True)
     by_dist = _roll(cells, ["eval_type", "max_distance"])
     overall.to_csv(Path(out_dir) / "variance_overall.csv", index=False)
     by_dist.to_csv(Path(out_dir) / "variance_by_distance.csv", index=False)
@@ -447,6 +450,79 @@ def plot_variance_sources(b: pd.DataFrame, out_dir, eval_type="interventional"):
     plt.close(fig)
 
 
+def plot_relative_generalization(pooled: pd.DataFrame, out_dir, eval_type="interventional"):
+    """Does degradation track the LENGTH RATIO rather than the absolute length?
+
+    x  eval_len / train_len -- how far past its training length the run is being pushed
+    y  (corr - corr_ID) / corr_ID, where corr_ID is that same run evaluated at its OWN
+       training length. So a run scoring 0.80 in-distribution and 0.70 at 2x reads -12.5%.
+
+    Normalising against each run's own in-distribution score is what makes the training
+    lengths comparable: a run that starts at 0.5 and one that starts at 0.9 cannot be
+    compared on raw corr, and the absolute drop would flatter whichever started lower.
+
+    If the curves LIE ON TOP OF EACH OTHER, degradation is a function of the ratio and
+    training short is free -- push any length by 4x and pay the same fraction. If they
+    SEPARATE, absolute length is what matters and a short-trained run cannot be rescued
+    by the ratio being modest.
+
+    Diagonal cells only (window == train_len), matching ceiling_diagonal: off the diagonal
+    the in-distribution reference is itself already a generalization result, so the
+    normalisation would divide one unknown by another.
+
+    Uses the POOLED per-eval-length correlation (over that eval set's whole distance
+    range), not a per-bin number: the question is about the eval length as a whole.
+    """
+    col = {"interventional": "interventional_corr", "endogenous": "endogenous_corr"}[eval_type]
+    if pooled.empty or col not in pooled.columns:
+        return
+    d = pooled[pooled["window"] == pooled["train_len"]].dropna(subset=[col]).copy()
+    if d.empty:
+        return
+
+    ref = (d[d["eval_len"] == d["train_len"]]
+           .drop_duplicates(subset=["run"]).set_index("run")[col])
+    d["id_corr"] = d["run"].map(ref)
+    missing = int(d["id_corr"].isna().sum())
+    # A near-zero in-distribution score makes the ratio explode and means the run failed
+    # at its own training length -- there is no generalization to measure from there.
+    tiny = int((d["id_corr"].abs() <= 0.05).sum())
+    d = d[d["id_corr"].notna() & (d["id_corr"].abs() > 0.05)]
+    if missing or tiny:
+        print(f"[lengen] relative generalization ({eval_type}): dropped {missing} rows with "
+              f"no in-distribution reference and {tiny} whose reference |corr| <= 0.05")
+    if d.empty:
+        return
+
+    d["ratio"] = d["eval_len"] / d["train_len"]
+    d["rel"] = (d[col] - d["id_corr"]) / d["id_corr"]
+    d = d[d["ratio"] >= 1]
+
+    g = d.groupby(["train_len", "ratio"])["rel"].agg(mean="mean", std="std", n="count").reset_index()
+    g["mean_pct"], g["std_pct"] = 100 * g["mean"], 100 * g["std"]
+    g.to_csv(Path(out_dir) / f"relative_generalization_{eval_type}.csv", index=False)
+
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    tls = sorted(g["train_len"].unique())
+    colors = dict(zip(tls, sns.color_palette("mako", len(tls))))
+    for tl in tls:
+        q = g[g["train_len"] == tl].sort_values("ratio")
+        ax.errorbar(q["ratio"], q["mean_pct"], yerr=q["std_pct"].fillna(0),
+                    marker="o", ms=6, capsize=3, lw=1.8, color=colors[tl],
+                    label=f"train len {tl}  (ID corr {d[d.train_len==tl]['id_corr'].mean():.2f})")
+    ax.axhline(0, color="k", lw=0.9, alpha=0.5)
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("eval length / training length")
+    ax.set_ylabel(f"{eval_type} corr, relative to in-distribution (%)")
+    ax.set_title("Does the drop track the length RATIO?\n"
+                 "overlapping curves = yes; separated = absolute length is what matters")
+    ax.legend(fontsize=10)
+    fig.tight_layout()
+    fig.savefig(Path(out_dir) / f"relative_generalization_{eval_type}.png", dpi=150)
+    plt.close(fig)
+    return g
+
+
 def main(exp_group="mlp_lengen", gate="off", expected_cells=None):
     out_dir = Path(f"{ROOT}/outputs/plots/{exp_group}")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -464,6 +540,8 @@ def main(exp_group="mlp_lengen", gate="off", expected_cells=None):
     plot_ceiling(b, out_dir)
     for et in ("interventional", "endogenous"):
         plot_variance_sources(b, out_dir, et)
+        if not pooled.empty:
+            plot_relative_generalization(pooled, out_dir, et)
     variance_decomposition(b, out_dir)
     print(f"\n[lengen] wrote plots to {out_dir}")
 
