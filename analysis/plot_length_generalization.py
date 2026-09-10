@@ -532,7 +532,7 @@ def plot_relative_generalization(pooled: pd.DataFrame, out_dir):
     allv = pd.concat(tables.values())
     lo = max(-110, float(np.nanmin(allv["mean_pct"] - allv["std_pct"].fillna(0))) - 5)
     hi = max(15, float(np.nanpercentile(allv["mean_pct"], 95)) + 10)
-    short = {"endogenous": "endo", "interventional": "interventional"}
+    short = {"endogenous": "endogenous", "interventional": "interventional"}
     for ax, et in zip(axes, ("endogenous", "interventional")):
         g = tables.get(et)
         ax.axhline(0, color="k", lw=0.9, alpha=0.5)
