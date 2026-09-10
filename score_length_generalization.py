@@ -109,9 +109,23 @@ def derive_config(base_config: ExperimentConfig, eval_len: int, config_dir: Path
     silently truncate a 128-token eval document down to nothing.
     """
     cfg = base_config.model_copy(deep=True)
+    # LENGTH FLOOR. max_seq_length only truncates; without a floor at least as large as
+    # eval_len the documents are not guaranteed to reach the nominal length and both the
+    # length and the distance axis collapse toward the short end. The run's own floor is
+    # kept when it is already large enough, so short eval lengths draw from exactly the
+    # training population.
+    #
+    # Above that floor the eval corpus IS a different population from the training one --
+    # on C4-en, 72% of documents clear 128 tokens but only 25% clear 512 and 9% clear
+    # 1024, so a 1024 eval samples the longest tenth of the corpus. That shift is real and
+    # belongs in any writeup; it is recorded in the derived config and in the cache's
+    # `realized` metadata rather than left implicit.
+    floor = max(int(base_config.test_dataset.min_seq_length or 0), int(eval_len))
+    n = n_test if n_test is not None else base_config.test_dataset.max_samples
     cfg.test_dataset = cfg.test_dataset.model_copy(update={
-        "max_samples": n_test if n_test is not None else base_config.test_dataset.max_samples,
+        "max_samples": n,
         "max_seq_length": eval_len,
+        "min_seq_length": floor,
     })
     # Sample positions across the entire document, expressed from the end so it is the
     # same quantity the training selector is written in. Always a range, whatever the
@@ -141,7 +155,7 @@ def derive_config(base_config: ExperimentConfig, eval_len: int, config_dir: Path
     # would do). Pinning these to fixed values makes the derived identity depend only on
     # what actually varies the test rows: corpus, min_seq_length, signals, selector, size.
     # NOT a change to dataset_identity itself -- training caches keep their names.
-    canon = {"max_samples": 64, "max_seq_length": eval_len}
+    canon = {"max_samples": 64, "max_seq_length": eval_len, "min_seq_length": floor}
     cfg.train_dataset = cfg.train_dataset.model_copy(update=canon)
     cfg.dev_dataset = cfg.dev_dataset.model_copy(update={
         **canon, "offset": 2000, "split": cfg.train_dataset.split})
@@ -186,20 +200,17 @@ def prepare_length_caches(base_config: ExperimentConfig,
 
     Returns {eval_len: config_path or None}; failures are recorded, not raised.
     """
-    floor = base_config.test_dataset.min_seq_length
+    base_floor = int(base_config.test_dataset.min_seq_length or 0)
     config_dir = Path("experiment_configs") / "_lengen"
     prepared, errors = {}, {}
     for eval_len in eval_lengths:
-        if floor and eval_len > floor:
-            # Not a hard failure, but the resulting cache would not mean what its name
-            # says: documents shorter than eval_len make the far distance bins empty
-            # and pull the whole distribution toward the short end.
-            msg = (f"eval length {eval_len} exceeds the cache min_seq_length floor "
-                   f"({floor}); documents are not guaranteed to reach it")
-            print(f"[lengen] SKIP len={eval_len}: {msg}")
-            errors[eval_len] = msg
-            prepared[eval_len] = None
-            continue
+        if base_floor and eval_len > base_floor:
+            # Not an error: derive_config raises the floor to eval_len so the documents
+            # really do reach it. But it means this eval draws from a longer-document
+            # subset than the run trained on, which has to be stated in any result.
+            print(f"[lengen] len={eval_len}: raising the length floor from {base_floor} "
+                  f"to {eval_len}; this eval samples a LONGER-DOCUMENT subset of the "
+                  f"corpus than training used")
         print(f"[lengen] preparing cache: len={eval_len}")
         try:
             cfg_path = derive_config(base_config, eval_len, config_dir, n_test)
@@ -253,6 +264,32 @@ def _bin_by_distance(df: pd.DataFrame, value_col: str, target_col: str,
             row.update({k: m[k] for k in ("corr", "l2_dist") if k in m})
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def _merge_existing(new: pd.DataFrame, path: Path, keys: list[str]) -> pd.DataFrame:
+    """Merge this pass's rows into whatever is already on disk, new rows winning.
+
+    So that evaluating a SUBSET of lengths tops the file up instead of replacing it --
+    `--eval-lengths 256,512,1024` on a run that already has 16/32/64/128 keeps all seven.
+    Without this the file is whatever the last invocation happened to cover, and the
+    aggregator silently sees a partial grid.
+    """
+    if not path.exists():
+        return new
+    try:
+        old = pd.read_csv(path)
+    except Exception:
+        return new
+    if new.empty:
+        return old
+    if not all(k in old.columns for k in keys):
+        return new                      # schema changed; the old file is not mergeable
+    merged = pd.concat([old, new], ignore_index=True)
+    kept = merged.drop_duplicates(subset=keys, keep="last").reset_index(drop=True)
+    dropped = len(merged) - len(kept)
+    print(f"[lengen] merged with {path.name}: {len(old)} existing + {len(new)} new "
+          f"-> {len(kept)} rows ({dropped} superseded)")
+    return kept.sort_values(keys).reset_index(drop=True)
 
 
 def evaluate_length_grid(model, base_config: ExperimentConfig, tokenizer, collator,
@@ -351,9 +388,12 @@ def evaluate_length_grid(model, base_config: ExperimentConfig, tokenizer, collat
             print(f"[lengen] len={eval_len} eval FAILED ({type(e).__name__}: {e}); continuing")
             summary_rows.append({"eval_len": eval_len, "error": f"{type(e).__name__}: {e}"})
 
-    summary = pd.DataFrame(summary_rows)
+    summary = _merge_existing(pd.DataFrame(summary_rows),
+                              output_dir / "length_generalization.csv", ["eval_len"])
     summary.to_csv(output_dir / "length_generalization.csv", index=False)
     bins = pd.concat(bin_frames, ignore_index=True) if bin_frames else pd.DataFrame()
+    bins = _merge_existing(bins, output_dir / "length_generalization_by_distance.csv",
+                           ["eval_len", "eval_type", "bin"])
     if not bins.empty:
         bins.to_csv(output_dir / "length_generalization_by_distance.csv", index=False)
     with open(output_dir / "length_generalization.json", "w") as f:

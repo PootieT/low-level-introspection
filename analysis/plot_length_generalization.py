@@ -172,6 +172,26 @@ def _agg(b: pd.DataFrame, by: list[str]) -> pd.DataFrame:
     return out
 
 
+def _draw(ax, s, color, label, train_len):
+    """One curve, with points BEYOND THE TRAINING LENGTH drawn as crosses.
+
+    Three regimes, and only two of them were previously distinguishable:
+      o  within the training window          -- trained reach
+      o  beyond the window, <= train_len     -- unseen reach, but sequences that long
+                                                were seen during training
+      X  beyond train_len                    -- unseen reach AND unseen sequence length
+    The middle case turns out to be the hard one, so collapsing it with the third (as a
+    single marker does) hides the actual result.
+    """
+    ax.errorbar(s["max_distance"], s["mean"], yerr=s["std"].fillna(0),
+                marker="", capsize=3, lw=1.8, color=color, label=label)
+    within = s["max_distance"] <= train_len
+    ax.scatter(s.loc[within, "max_distance"], s.loc[within, "mean"],
+               marker="o", s=34, color=color, zorder=3)
+    ax.scatter(s.loc[~within, "max_distance"], s.loc[~within, "mean"],
+               marker="X", s=80, color=color, zorder=3, linewidths=0.6, edgecolors="white")
+
+
 def plot_reach_curves(b: pd.DataFrame, out_dir, eval_type="interventional"):
     d = b[b["eval_type"] == eval_type]
     if d.empty:
@@ -191,9 +211,7 @@ def plot_reach_curves(b: pd.DataFrame, out_dir, eval_type="interventional"):
                 s = _agg(sub[sub["window"] == w], ["max_distance"]).sort_values("max_distance")
                 if s.empty:
                     continue
-                ax.errorbar(s["max_distance"], s["mean"], yerr=s["std"].fillna(0),
-                            marker="o", ms=5, capsize=3, lw=1.8,
-                            color=colors[w], label=f"win {w}")
+                _draw(ax, s, colors[w], f"win {w}", tl)
                 # the training window's own edge: everything right of it is unseen reach
                 ax.axvline(w - 1, color=colors[w], ls=":", lw=1, alpha=0.6)
             ax.set_xscale("log", base=2)
@@ -210,7 +228,8 @@ def plot_reach_curves(b: pd.DataFrame, out_dir, eval_type="interventional"):
     handles = [plt.Line2D([], [], color=colors[w], marker="o", lw=1.8, label=f"win {w}")
                for w in windows]
     axes[0][-1].legend(handles=handles, title="train window", fontsize=10)
-    fig.suptitle(f"{eval_type} readout vs reach — dotted line = edge of training window")
+    fig.suptitle(f"{eval_type} readout vs reach — dotted line = edge of training "
+             f"window; X = distance beyond the training LENGTH")
     fig.tight_layout()
     fig.savefig(Path(out_dir) / f"reach_curves_{eval_type}.png", dpi=150)
     plt.close(fig)
@@ -233,9 +252,7 @@ def plot_matched_reach(b: pd.DataFrame, out_dir, eval_type="interventional"):
         colors = dict(zip(tls, sns.color_palette("rocket", len(tls))))
         for tl in tls:
             s = _agg(sub[sub["train_len"] == tl], ["max_distance"]).sort_values("max_distance")
-            ax.errorbar(s["max_distance"], s["mean"], yerr=s["std"].fillna(0),
-                        marker="o", ms=5, capsize=3, lw=1.8, color=colors[tl],
-                        label=f"train len {tl}")
+            _draw(ax, s, colors[tl], f"train len {tl}", tl)
         ax.axvline(w - 1, color="k", ls=":", lw=1, alpha=0.6)
         ax.axhline(0, color="k", lw=0.8, alpha=0.4)
         ax.set_xscale("log", base=2)
@@ -305,9 +322,7 @@ def plot_ceiling(b: pd.DataFrame, out_dir):
         colors = dict(zip(tls, sns.color_palette("mako", len(tls))))
         for tl in tls:
             s = _agg(sub[sub["train_len"] == tl], ["max_distance"]).sort_values("max_distance")
-            ax.errorbar(s["max_distance"], s["mean"], yerr=s["std"].fillna(0),
-                        marker="s", ms=5, capsize=3, lw=1.8, color=colors[tl],
-                        label=f"len {tl}")
+            _draw(ax, s, colors[tl], f"len {tl}", tl)
         ax.set_xscale("log", base=2)
         ax.axhline(0, color="k", lw=0.8, alpha=0.4)
         ax.set_title(et)
@@ -317,6 +332,118 @@ def plot_ceiling(b: pd.DataFrame, out_dir):
     fig.suptitle("Ceiling: cells trained on the whole sequence (window = length)")
     fig.tight_layout()
     fig.savefig(Path(out_dir) / "ceiling_diagonal.png", dpi=150)
+    plt.close(fig)
+
+
+def variance_decomposition(b: pd.DataFrame, out_dir) -> pd.DataFrame:
+    """Which axis the spread in the aggregated curves actually comes from.
+
+    Every point in ceiling_diagonal and matched_reach averages over BOTH neurons and eval
+    lengths, so its error bar mixes two different things: how much neurons differ from
+    each other, and how much the same neuron differs across eval lengths (i.e. how much
+    context sits in front of the target). Those have opposite implications -- the first is
+    heterogeneity to report, the second is a systematic effect being hidden inside a
+    spread estimate.
+
+    Two-way sum-of-squares split within each (eval_type, train_len, window, distance) cell
+    over the balanced neuron x eval_len block:
+        SS_total = SS_neuron + SS_eval_len + SS_residual
+    Reported as shares. Cells with fewer than 2 neurons or 2 eval lengths are skipped --
+    the decomposition is undefined there, and the count of usable cells is reported so a
+    thin table is visible as thin.
+    """
+    rows = []
+    for (et, tl, w, md), g in b.groupby(["eval_type", "train_len", "window", "max_distance"]):
+        piv = g.pivot_table(index="neuron", columns="eval_len", values="corr")
+        piv = piv.dropna(axis=1, how="any").dropna(axis=0, how="any")
+        n_r, n_c = piv.shape
+        if n_r < 2 or n_c < 2:
+            continue
+        v = piv.to_numpy()
+        m = v.mean()
+        ss_total = ((v - m) ** 2).sum()
+        ss_neuron = n_c * ((v.mean(axis=1) - m) ** 2).sum()
+        ss_evallen = n_r * ((v.mean(axis=0) - m) ** 2).sum()
+        rows.append({
+            "eval_type": et, "train_len": tl, "window": w, "max_distance": md,
+            "n_neurons": n_r, "n_eval_lens": n_c,
+            "sd_total": float(np.sqrt(ss_total / max(1, v.size - 1))),
+            "ss_total": ss_total, "ss_neuron": ss_neuron, "ss_eval_len": ss_evallen,
+            "ss_residual": ss_total - ss_neuron - ss_evallen,
+        })
+    if not rows:
+        print("[lengen] variance decomposition: no cell has >=2 neurons AND >=2 eval "
+              "lengths; nothing to decompose")
+        return pd.DataFrame()
+
+    cells = pd.DataFrame(rows)
+    for c in ("neuron", "eval_len", "residual"):
+        cells[f"pct_{c}"] = 100 * cells[f"ss_{c}"] / cells["ss_total"].replace(0, np.nan)
+    cells.to_csv(Path(out_dir) / "variance_by_cell.csv", index=False)
+
+    def _roll(df, by):
+        g = df.groupby(by)[["ss_total", "ss_neuron", "ss_eval_len", "ss_residual"]].sum()
+        out = pd.DataFrame({
+            "pct_neuron": 100 * g["ss_neuron"] / g["ss_total"],
+            "pct_eval_len": 100 * g["ss_eval_len"] / g["ss_total"],
+            "pct_residual": 100 * g["ss_residual"] / g["ss_total"],
+        }).reset_index()
+        out["n_cells"] = df.groupby(by).size().values
+        out["mean_sd"] = df.groupby(by)["sd_total"].mean().values
+        return out
+
+    overall = _roll(cells, ["eval_type"])
+    by_dist = _roll(cells, ["eval_type", "max_distance"])
+    overall.to_csv(Path(out_dir) / "variance_overall.csv", index=False)
+    by_dist.to_csv(Path(out_dir) / "variance_by_distance.csv", index=False)
+
+    print("\n[lengen] where the spread comes from (share of SS, pooled over cells):")
+    print(overall.to_string(index=False, float_format=lambda x: f"{x:.1f}"))
+    print("\n[lengen] by distance:")
+    print(by_dist.to_string(index=False, float_format=lambda x: f"{x:.1f}"))
+    return cells
+
+
+def plot_variance_sources(b: pd.DataFrame, out_dir, eval_type="interventional"):
+    """The same diagonal curves, drawn once per neuron and once per eval length.
+
+    Companion to the table: whichever panel fans out more is the axis carrying the
+    spread. The aggregate is overlaid in black so the thin lines can be read against the
+    curve the other plots show.
+    """
+    d = b[(b["eval_type"] == eval_type) & (b["window"] == b["train_len"])]
+    if d.empty:
+        return
+    tls = sorted(d["train_len"].unique())
+    fig, axes = plt.subplots(len(tls), 2, figsize=(11, 3.3 * len(tls)),
+                             squeeze=False, sharex=True, sharey=True)
+    for r, tl in enumerate(tls):
+        sub = d[d["train_len"] == tl]
+        for c, (key, pal) in enumerate((("neuron", "husl"), ("eval_len", "crest"))):
+            ax = axes[r][c]
+            levels = sorted(sub[key].unique())
+            colors = dict(zip(levels, sns.color_palette(pal, len(levels))))
+            for lv in levels:
+                q = _agg(sub[sub[key] == lv], ["max_distance"]).sort_values("max_distance")
+                ax.plot(q["max_distance"], q["mean"], lw=1.0, alpha=0.75,
+                        color=colors[lv], marker="o", ms=3, label=str(lv))
+            agg = _agg(sub, ["max_distance"]).sort_values("max_distance")
+            ax.plot(agg["max_distance"], agg["mean"], lw=2.6, color="k", alpha=0.85,
+                    zorder=5, label="aggregate")
+            ax.set_xscale("log", base=2)
+            ax.axhline(0, color="k", lw=0.8, alpha=0.3)
+            ax.axvline(tl, color="grey", ls=":", lw=1)
+            if r == 0:
+                ax.set_title(f"one line per {key}")
+            if c == 0:
+                ax.set_ylabel(f"train len {tl}\ncorr")
+            if r == len(tls) - 1:
+                ax.set_xlabel("distance from readout")
+            ax.legend(fontsize=7, ncol=2)
+    fig.suptitle(f"{eval_type}: sources of spread on the diagonal cells "
+                 f"(dotted line = training length)")
+    fig.tight_layout()
+    fig.savefig(Path(out_dir) / f"variance_sources_{eval_type}.png", dpi=150)
     plt.close(fig)
 
 
@@ -335,6 +462,9 @@ def main(exp_group="mlp_lengen", gate="off", expected_cells=None):
         if agg is not None:
             agg.to_csv(out_dir / f"gap_by_cell_{et}.csv", index=False)
     plot_ceiling(b, out_dir)
+    for et in ("interventional", "endogenous"):
+        plot_variance_sources(b, out_dir, et)
+    variance_decomposition(b, out_dir)
     print(f"\n[lengen] wrote plots to {out_dir}")
 
 
