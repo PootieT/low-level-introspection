@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 2-6
+#$ -t 1-50
 
 # ============================================================================
 # LENGTH GENERALIZATION: does the readout reach tokens further back than it was
@@ -248,8 +248,15 @@ python train_introspector_joint.py \
     $OVERWRITE
 
 # Re-run ONLY the length eval on an existing checkpoint (no retraining):
- python train_introspector_joint.py \
- --config "$CONFIG" \
- --joint-loss-weight $W \
- --length-only \
- --eval-lengths $EVAL_LENGTHS
+# python train_introspector_joint.py \
+# --config "$CONFIG" \
+# --joint-loss-weight $W \
+# --length-only \
+# --eval-lengths $EVAL_LENGTHS
+
+python train_introspector_joint.py \
+    --config "$CONFIG" \
+    --joint-loss-weight $W \
+    --length-only \
+    --eval-lengths 256,512,1024 \
+    --eval-n-test 3000

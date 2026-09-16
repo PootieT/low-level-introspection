@@ -97,7 +97,7 @@ export WANDB_RUN_GROUP=mlp_neurongen
 set -e
 
 index=$(($SGE_TASK_ID-1))
-index=4
+#index=4
 LAYER=4                  # same layer as the length-gen experiment, and in the main
                          # layer/token grid's list, so the three are comparable
 TOKEN_POS=-1
@@ -257,5 +257,5 @@ python train_introspector_joint.py \
     $OVERWRITE
 
 # Re-run ONLY the neuron-generalization eval on an existing checkpoint:
-#   python train_introspector_joint.py --config "$CONFIG" --joint-loss-weight $W \
-#       --neuron-gen-only --neuron-gen-pool-config "$POOL_CONFIG"
+ python train_introspector_joint.py --config "$CONFIG" --joint-loss-weight $W \
+     --neuron-gen-only --neuron-gen-pool-config "$POOL_CONFIG"
