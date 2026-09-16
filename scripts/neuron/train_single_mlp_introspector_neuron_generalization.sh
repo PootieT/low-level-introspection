@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 19-21
+#$ -t 1-28
 
 # ============================================================================
 # NEURON GENERALIZATION: does the readout carry neurons it was never trained on,
@@ -70,6 +70,14 @@
 # WHICH NUMBER TO READ: interventional corr on the UNSEEN arm is the headline (the
 # injected value is independent per row, so a readout that ignores the named neuron
 # scores 0). Endogenous must be read MACRO-averaged over neurons, never pooled.
+
+
+# HOW TO RUN
+# either specify with task script in the file above, or
+# do this if you want to run particular runs
+# qsub -t 19-21 scripts/neuron/train_single_mlp_introspector_neuron_generalization.sh
+# or this if you want to run particular groups/runs
+# GROUP=epochs qsub -t 1-3 scripts/neuron/train_single_mlp_introspector_neuron_generalization.sh
 # ============================================================================
 
 ## SCC env setup
@@ -123,18 +131,18 @@ OVERWRITE=""
 # ---- the table ---------------------------------------------------------------
 #      name                               group      neurons offset rows/n  epochs lora_r
 RUNS=(
-  # legacy: arm A, total rows fixed at 300k (names match the runs already on disk)
+  # legacy: arm A, total rows fixed at 300k (names match the runs already on disk) (1-5)
   "armA_L4_n1_r300000_gateoff_w0.01     scaling      1      0    300000   1     16"
   "armA_L4_n3_r300000_gateoff_w0.01     scaling      3      0    100000   1     16"
   "armA_L4_n10_r300000_gateoff_w0.01    scaling     10      0     30000   1     16"
   "armA_L4_n30_r300000_gateoff_w0.01    scaling     30      0     10000   1     16"
   "armA_L4_n100_r300000_gateoff_w0.01   scaling    100      0      3000   1     16"
-  # legacy: arm B, one neuron at each per-neuron budget
+  # legacy: arm B, one neuron at each per-neuron budget (6-9)
   "armB_L4_n1_r100000_gateoff_w0.01     single       1      0    100000   1     16"
   "armB_L4_n1_r30000_gateoff_w0.01      single       1      0     30000   1     16"
   "armB_L4_n1_r10000_gateoff_w0.01      single       1      0     10000   1     16"
   "armB_L4_n1_r3000_gateoff_w0.01       single       1      0      3000   1     16"
-  # exp 1: the other nine neurons of the N=10 cell, each alone at 30k (offset 0 = legacy)
+  # exp 1: the other nine neurons of the N=10 cell, each alone at 30k (offset 0 = legacy) (10-18)
   "null10_o1_30k                        single_n10   1      1     30000   1     16"
   "null10_o2_30k                        single_n10   1      2     30000   1     16"
   "null10_o3_30k                        single_n10   1      3     30000   1     16"
@@ -144,14 +152,14 @@ RUNS=(
   "null10_o7_30k                        single_n10   1      7     30000   1     16"
   "null10_o8_30k                        single_n10   1      8     30000   1     16"
   "null10_o9_30k                        single_n10   1      9     30000   1     16"
-  # exp 2: equalise optimization steps
-  "steps_n1_o1_30k_ep10                 epochs       1      0     30000  10     16"
-  "steps_n1_o2_30k_ep10                 epochs       1      1     30000  10     16"
-  "steps_n1_o3_30k_ep10                 epochs       1      2     30000  10     16"
-  # exp 3: N=30 / N=100 above the data floor
+  # exp 2: equalise optimization steps (19-21)
+  "steps_n1_o0_30k_ep10                 epochs       1      0     30000  10     16"
+  "steps_n1_o1_30k_ep10                 epochs       1      1     30000  10     16"
+  "steps_n1_o2_30k_ep10                 epochs       1      2     30000  10     16"
+  # exp 3: N=30 / N=100 above the data floor (22-24)
   "data_n30_30k                         data30k     30      0     30000   1     16"
   "data_n100_30k                        data30k    100      0     30000   1     16"
-  # exp 4: rank, on the N=30 @ 30k cell
+  # exp 4: rank, on the N=30 @ 30k cell (25-28)
   "rank_n30_30k_r32                     rank        30      0     30000   1     32"
   "rank_n30_30k_r64                     rank        30      0     30000   1     64"
   "rank_n30_30k_r128                    rank        30      0     30000   1    128"
