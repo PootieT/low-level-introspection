@@ -408,11 +408,21 @@ def plot_endogenous_heatmaps(df: pd.DataFrame, out_dir: str):
     os.makedirs(out_dir, exist_ok=True)
     summary = summarize_endogenous_sweep(df)
     summary.to_csv(f"{out_dir}/sweep_summary.csv", index=False)
+    # One colour scale per metric, computed across BOTH eval types (endogenous +
+    # interventional), so e.g. the two l2_dist heatmaps share a colorbar and are
+    # comparable side by side. corr-like metrics keep the fixed [0, 1] scale.
+    scale = {}
+    for metric, msub in summary.groupby("metric"):
+        if metric in RANGE01:
+            scale[metric] = (0, 1)
+        else:
+            vals = msub["mean"].dropna()
+            scale[metric] = (float(vals.min()), float(vals.max())) if len(vals) else (None, None)
     for (eval_name, metric), sub in summary.groupby(["eval_type", "metric"]):
         mean_df = sub.pivot(index="layer", columns="position", values="mean")
         se_df = sub.pivot(index="layer", columns="position", values="se")
         annot = mean_df.round(3).astype(str) + "\n±" + se_df.round(3).astype(str)
-        vmin, vmax = (0, 1) if metric in RANGE01 else (None, None)
+        vmin, vmax = scale[metric]
 
         plt.figure(figsize=[16, 12])
         hm = sns.heatmap(mean_df, annot=annot, fmt="", vmin=vmin, vmax=vmax,
