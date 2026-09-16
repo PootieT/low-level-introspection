@@ -94,8 +94,17 @@ def plot_sweep_eval_metrics(exp_name: str, output_dir:str="single_neuron"):
 
     # TODO could annotate with mean+-std,
     df = pd.DataFrame(rows)
-    for metric in tqdm(["test_corr", "test_l2_dist", "test_pred_corr", "test_pred_l2_dist", "intervention_corr", "intervention_l2_dist"]):
+    metrics = ["test_corr", "test_l2_dist", "test_pred_corr", "test_pred_l2_dist", "intervention_corr", "intervention_l2_dist"]
+    for metric in metrics:
         df[metric] = df[metric] * 100
+    # shared color scale for all L2 metrics so the interventional and endogenous L2
+    # heatmaps use one colorbar -> cell colors are directly comparable across settings.
+    l2_metrics = [m for m in metrics if "l2_dist" in m]
+    l2_all = pd.concat([df[m] for m in l2_metrics]) if l2_metrics else pd.Series(dtype=float)
+    l2_vmin, l2_vmax = (float(l2_all.min()), float(l2_all.max())) if len(l2_all.dropna()) else (0, 100)
+    for metric in tqdm(metrics):
+        is_l2 = "l2_dist" in metric
+        vmin, vmax = (l2_vmin, l2_vmax) if is_l2 else (0, 100)
         pivot_df = df.pivot_table(index="layer", columns="token_pos", values=metric, aggfunc="mean")
         pivot_df_std = df.pivot_table(index="layer", columns="token_pos", values=metric, aggfunc="std")
 
@@ -109,7 +118,7 @@ def plot_sweep_eval_metrics(exp_name: str, output_dir:str="single_neuron"):
             pivot_df,
             annot=annot_df,  # Pass your custom annotation DataFrame here
             fmt="",
-            vmin=0, vmax=100,
+            vmin=vmin, vmax=vmax,
             annot_kws={"size": 14},
             cbar_kws={"label": metric},
         )
@@ -196,8 +205,17 @@ def plot_sweep_eval_metrics_intervention_train(exp_name: str, output_dir:str="si
             continue
 
     df = pd.DataFrame(rows)
-    for metric in tqdm(["test_corr", "test_l2_dist", "intervention_corr", "intervention_l2_dist"]):
+    metrics = ["test_corr", "test_l2_dist", "intervention_corr", "intervention_l2_dist"]
+    for metric in metrics:
         df[metric] = df[metric] * 100
+    # shared color scale for all L2 metrics so the interventional and endogenous L2
+    # heatmaps use one colorbar -> cell colors are directly comparable across settings.
+    l2_metrics = [m for m in metrics if "l2_dist" in m]
+    l2_all = pd.concat([df[m] for m in l2_metrics]) if l2_metrics else pd.Series(dtype=float)
+    l2_vmin, l2_vmax = (float(l2_all.min()), float(l2_all.max())) if len(l2_all.dropna()) else (0, 100)
+    for metric in tqdm(metrics):
+        is_l2 = "l2_dist" in metric
+        vmin, vmax = (l2_vmin, l2_vmax) if is_l2 else (0, 100)
         pivot_df = df.pivot_table(index="layer", columns="token_pos", values=metric, aggfunc="mean")
         pivot_df_std = df.pivot_table(index="layer", columns="token_pos", values=metric, aggfunc="std")
 
@@ -211,7 +229,7 @@ def plot_sweep_eval_metrics_intervention_train(exp_name: str, output_dir:str="si
             pivot_df,
             annot=annot_df,  # Pass your custom annotation DataFrame here
             fmt="",
-            vmin=0, vmax=100,
+            vmin=vmin, vmax=vmax,
             annot_kws={"size": 14},
             cbar_kws={"label": metric},
         )

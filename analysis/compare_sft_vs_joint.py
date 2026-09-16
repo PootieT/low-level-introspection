@@ -44,8 +44,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-plt.rcParams.update({"font.size": 13, "axes.titlesize": 15, "axes.labelsize": 14,
-                     "legend.fontsize": 11, "figure.titlesize": 17})
+# Poster-scale fonts: kept identical to plot_single_neuron_results.py so the two
+# scripts' figures share one look.
+plt.rcParams.update({
+    "font.size": 20,
+    "axes.titlesize": 26,
+    "axes.labelsize": 22,
+    "xtick.labelsize": 18,
+    "ytick.labelsize": 18,
+    "legend.fontsize": 18,
+    "legend.title_fontsize": 20,
+    "figure.titlesize": 28,
+})
 
 ROOT = Path(__file__).parents[1]
 NEURON_RE = re.compile(r"N(?P<layer>\d+)\.(?P<index>\d+)")
@@ -212,7 +222,8 @@ def paired_stats(merged, metric, label_a, label_b, min_activation_std=1e-6):
             "frac_a_higher": float((d > 0).mean())}
 
 
-def plot_ood_ladder(frames: dict, out_dir, readout="endogenous", common_only=True):
+def plot_ood_ladder(frames: dict, out_dir, readout="endogenous", common_only=True,
+                    arm_colors=None):
     """Every arm across the corpus ladder, mean ± SE over neurons.
 
     common_only restricts to runs present in ALL arms, so a line is not lifted by a
@@ -241,15 +252,23 @@ def plot_ood_ladder(frames: dict, out_dir, readout="endogenous", common_only=Tru
             rows.append({"corpus": corpus, "arm": arm, "n": len(vals), "mean": vals.mean(),
                          "se": vals.std(ddof=1) / np.sqrt(len(vals)) if len(vals) > 1 else np.nan})
     df = pd.DataFrame(rows)
-    fig, ax = plt.subplots(figsize=(8.5, 5))
+    fig, ax = plt.subplots(figsize=(13, 8))
     for arm, sub in df.groupby("arm"):
         sub = sub.set_index("corpus").reindex(order).reset_index()
+        # arm_colors keeps each arm the same color in BOTH the endogenous and
+        # interventional figures, so the two eval settings are read off one legend.
+        color = arm_colors.get(arm) if arm_colors else None
         ax.errorbar(np.arange(len(order)), sub["mean"], yerr=sub["se"], marker="o",
-                    capsize=3, label=f"{arm} (n={int(sub['n'].max())})")
-    ax.set_xticks(np.arange(len(order))); ax.set_xticklabels(order, rotation=20)
-    ax.set_ylabel(f"{readout} corr"); ax.set_ylim(-0.1, 1.05)
-    ax.axhline(0, color="grey", ls="--", lw=1); ax.grid(alpha=0.25); ax.legend()
-    ax.set_title(f"{readout} readout across the corpus ladder (mean ± SE over neurons)")
+                    markersize=10, linewidth=2.5, capsize=4, color=color,
+                    label=f"{arm} (n={int(sub['n'].max())})")
+    ax.set_xticks(np.arange(len(order)))
+    ax.set_xticklabels(order, rotation=20, fontsize=26)
+    ax.tick_params(axis="y", labelsize=26)
+    ax.set_ylabel(f"{readout} corr", fontsize=32); ax.set_ylim(-0.1, 1.05)
+    ax.axhline(0, color="grey", ls="--", lw=1); ax.grid(alpha=0.25)
+    ax.legend(fontsize=22)
+    ax.set_title(f"{readout} readout across the corpus ladder (mean ± SE over neurons)",
+                 fontsize=30)
     fig.tight_layout()
     path = Path(out_dir) / f"ood_ladder_{readout}.png"
     fig.savefig(path, dpi=150); plt.close(fig)
@@ -274,14 +293,18 @@ def plot_delta_heatmap(merged, metric, label_a, label_b, out_dir):
     annot = (pivot.round(2).astype(str) + "\n±" +
              std.round(2).fillna(0).astype(str))
     lim = float(np.nanmax(np.abs(pivot.to_numpy()))) or 1.0
-    plt.figure(figsize=(1.6 * pivot.shape[1] + 4, 0.9 * pivot.shape[0] + 3))
-    sns.heatmap(pivot, cmap="RdBu_r", center=0, vmin=-lim, vmax=lim, annot=annot, fmt="",
-                annot_kws={"size": 11},
+    plt.figure(figsize=(2.0 * pivot.shape[1] + 5, 1.1 * pivot.shape[0] + 4))
+    hm = sns.heatmap(pivot, cmap="RdBu_r", center=0, vmin=-lim, vmax=lim, annot=annot, fmt="",
+                annot_kws={"size": 14},
                 cbar_kws={"label": f"{metric}: {label_a} - {label_b}"})
-    plt.xlabel("token position"); plt.ylabel("layer")
+    hm.figure.axes[-1].yaxis.label.set_size(28)  # colorbar label
+    hm.figure.axes[-1].tick_params(labelsize=22)  # colorbar ticks
+    hm.tick_params(axis="x", labelsize=30)
+    hm.tick_params(axis="y", labelsize=30)
+    plt.xlabel("token position", fontsize=38); plt.ylabel("layer", fontsize=38)
     n_lo, n_hi = int(np.nanmin(cnt.to_numpy())), int(np.nanmax(cnt.to_numpy()))
     plt.title(f"{metric}: {label_a} minus {label_b} (paired by neuron; mean ± std, "
-              f"n={n_lo}-{n_hi} per cell)")
+              f"n={n_lo}-{n_hi} per cell)", fontsize=40)
     plt.tight_layout()
     path = Path(out_dir) / f"delta_{metric}_{label_a}_vs_{label_b}.png"
     plt.savefig(path, dpi=150); plt.close()
@@ -337,8 +360,10 @@ def main(arms: dict, out_dir, pairs=None):
     if tables:
         pd.concat(tables, ignore_index=True).to_csv(Path(out_dir) / "paired_summary.csv",
                                                     index=False)
-    plot_ood_ladder(frames, out_dir, readout="endogenous")
-    plot_ood_ladder(frames, out_dir, readout="interventional")
+    # one color per arm, shared by both readouts so their legends line up
+    arm_colors = {arm: c for arm, c in zip(frames, plt.get_cmap("tab10").colors)}
+    plot_ood_ladder(frames, out_dir, readout="endogenous", arm_colors=arm_colors)
+    plot_ood_ladder(frames, out_dir, readout="interventional", arm_colors=arm_colors)
     return frames, tables
 
 
