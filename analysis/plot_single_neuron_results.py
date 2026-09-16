@@ -513,6 +513,13 @@ def plot_gate_comparison(df_by_gate: dict, out_dir: str, expected_neurons: int =
                 ax.set_ylim(-0.1, 1.05)
                 ax.axhline(0, color="grey", ls="--", lw=1)
             ax.grid(alpha=0.25)
+        # Park the legend outside the right-hand panel. seaborn's default "best" placement
+        # sits inside the axes and lands on the data whenever the curves span the plot,
+        # which on these panels is always. bbox_inches="tight" at save time keeps it in.
+        last = axes.flat[-1]
+        if last.get_visible() and last.get_legend() is not None:
+            sns.move_legend(last, "center left", bbox_to_anchor=(1.02, 0.5),
+                            title="layer", frameon=False)
         fig.suptitle(f"{panel}: gate on vs off (mean ± SE over {expected_neurons} neurons)",
                      y=1.02)
         fig.tight_layout()
