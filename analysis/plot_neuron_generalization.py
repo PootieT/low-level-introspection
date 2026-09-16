@@ -38,6 +38,7 @@ n_undefined_corr is carried through and reported.
 import os
 import re
 import sys
+import json
 from pathlib import Path
 
 import numpy as np
@@ -54,11 +55,40 @@ plt.rcParams.update({
 })
 
 ROOT = Path(__file__).parents[1]
+# Legacy directory names from the arm-A/arm-B version of the sweep script. New runs carry a
+# run_spec.json sidecar with exact fields; these regexes are only the fallback for runs
+# that predate it.
 ARM_RE = re.compile(r"_arm(?P<arm>[AB])")
 N_RE = re.compile(r"_n(?P<n>\d+)")
 R_RE = re.compile(r"_r(?P<r>\d+)")
 LAYER_RE = re.compile(r"_L(?P<layer>\d+)")
 EVAL_TYPES = ("interventional", "endogenous")
+# "single", not "null": pandas reads the literal string "null" back from any CSV as NaN
+LEGACY_GROUP = {"A": "scaling", "B": "single"}
+
+
+def _run_meta(d: Path):
+    """Fields describing a run: from run_spec.json, else parsed from a legacy name."""
+    spec = d / "run_spec.json"
+    if spec.exists():
+        j = json.loads(spec.read_text())
+        return {
+            "run": d.name, "group": j["group"], "n_neurons": int(j["neurons"]),
+            "offset": int(j.get("offset", 0)), "rows_per_neuron": int(j["rows_per_neuron"]),
+            "n_rows": int(j.get("rows", j["rows_per_neuron"] * j["neurons"])),
+            "epochs": int(j.get("epochs", 1)), "lora_r": int(j.get("lora_r", 16)),
+            "layer": j.get("layer"),
+        }
+    m_arm, m_n, m_r = ARM_RE.search(d.name), N_RE.search(d.name), R_RE.search(d.name)
+    if not (m_arm and m_n and m_r):
+        return None
+    m_l = LAYER_RE.search(d.name)
+    n, rows = int(m_n["n"]), int(m_r["r"])
+    return {
+        "run": d.name, "group": LEGACY_GROUP[m_arm["arm"]], "n_neurons": n, "offset": 0,
+        "rows_per_neuron": rows // max(1, n), "n_rows": rows, "epochs": 1, "lora_r": 16,
+        "layer": int(m_l["layer"]) if m_l else None,
+    }
 
 
 def load_sweep(exp_group: str):
@@ -68,17 +98,9 @@ def load_sweep(exp_group: str):
         sys.exit(f"No such experiment group: {base}")
     per_signal, summary, skipped = [], [], []
     for d in sorted(p for p in base.iterdir() if p.is_dir()):
-        m_arm, m_n, m_r = ARM_RE.search(d.name), N_RE.search(d.name), R_RE.search(d.name)
-        if not (m_arm and m_n and m_r):
+        meta = _run_meta(d)
+        if meta is None:
             continue                       # the shared pool config dir, etc.
-        m_l = LAYER_RE.search(d.name)
-        n_neurons, n_rows = int(m_n["n"]), int(m_r["r"])
-        meta = {
-            "run": d.name, "arm": m_arm["arm"], "n_neurons": n_neurons, "n_rows": n_rows,
-            "layer": int(m_l["layer"]) if m_l else None,
-            # the budget axis that makes arm A and arm B comparable
-            "rows_per_neuron": n_rows // max(1, n_neurons),
-        }
 
         def find(fname):
             direct = d / fname
@@ -104,21 +126,24 @@ def load_sweep(exp_group: str):
         for name, why in skipped[:10]:
             print(f"    {name}: {why}")
     ps["arm_label"] = np.where(ps["is_trained"], "seen", "unseen")
+    # the reference configuration every sweep varies away from
+    ps["is_baseline_cfg"] = (ps["epochs"] == 1) & (ps["lora_r"] == 16)
     return ps, sm
 
 
 def report(ps: pd.DataFrame):
-    runs = ps[["run", "arm", "n_neurons", "n_rows", "rows_per_neuron"]].drop_duplicates()
+    runs = ps[["run", "group", "n_neurons", "offset", "rows_per_neuron", "epochs", "lora_r"]
+              ].drop_duplicates()
     print(f"\n[neurongen] {len(runs)} runs")
-    print(runs.sort_values(["arm", "n_neurons", "n_rows"]).to_string(index=False))
+    print(runs.sort_values(["group", "n_neurons", "rows_per_neuron", "offset"]).to_string(index=False))
     dead = ps[ps.get("activation_std", pd.Series(1, index=ps.index)).fillna(1) <= 1e-6]
     if len(dead):
         print(f"[neurongen] {dead['signal'].nunique()} neuron(s) have near-zero activation "
               f"variance; their correlations are undefined, not poor, and are excluded "
               f"from every macro average below")
-    a = runs[runs["arm"] == "A"]
+    a = ps[ps["group"] == "scaling"].drop_duplicates("run")
     if len(a) and a["n_rows"].nunique() > 1:
-        print(f"[neurongen] WARNING: arm A rows are not constant across cells "
+        print(f"[neurongen] WARNING: scaling rows are not constant across cells "
               f"({sorted(a['n_rows'].unique())}); the fixed-budget comparison assumes they are")
 
 
@@ -134,7 +159,7 @@ def _macro(ps: pd.DataFrame, by: list[str]) -> pd.DataFrame:
 
 def plot_scaling(ps: pd.DataFrame, out_dir):
     """Q1+Q3: seen and unseen fidelity as the number of trained neurons grows (arm A)."""
-    d = ps[ps["arm"] == "A"]
+    d = ps[(ps["group"] == "scaling") & ps["is_baseline_cfg"]]
     if d.empty:
         return
     m = _macro(d, ["eval_type", "arm_label", "n_neurons"])
@@ -162,53 +187,159 @@ def plot_scaling(ps: pd.DataFrame, out_dir):
 
 
 def plot_sharing(ps: pd.DataFrame, out_dir):
-    """Q2: arm A against the data-matched null, on rows-per-neuron.
+    """Q2: the scaling curve against the single-neuron null, on rows-per-neuron.
 
-    Arm A at N=k and arm B at the same rows-per-neuron give each neuron the same amount
-    of data; they differ only in whether other neurons were trained alongside. Curves
-    coinciding means the data did not transfer -- neurons were learned privately.
+    A scaling cell at N=k and a single-neuron run at the same rows-per-neuron give each
+    neuron the same amount of data; they differ only in whether other neurons were
+    trained alongside. Curves coinciding means the data did not transfer -- neurons were
+    learned privately.
+
+    The null at a given budget pools EVERY 1-neuron baseline-config run at that budget,
+    whatever its group: the legacy single row and the single_n10 offsets 1-9 are the same
+    kind of observation, and together they give the null an across-neuron spread where
+    it previously had a single point.
     """
-    d = ps[ps["arm_label"] == "seen"]
-    if d.empty or d["arm"].nunique() < 2:
+    d = ps[(ps["arm_label"] == "seen") & ps["is_baseline_cfg"]]
+    scal = d[d["group"] == "scaling"]
+    null = d[d["n_neurons"] == 1]
+    if scal.empty or null.empty:
         return
-    # Arm A's N=1 cell IS arm B's full-data point (one neuron, the whole budget) and the
-    # sweep runs it once. Count it in both series so the two curves are anchored at the
-    # same left-hand point instead of arm B appearing to stop short.
-    anchor = d[(d["arm"] == "A") & (d["n_neurons"] == 1)]
-    if len(anchor):
-        d = pd.concat([d, anchor.assign(arm="B")], ignore_index=True)
-    m = _macro(d, ["eval_type", "arm", "rows_per_neuron", "n_neurons"])
-    m.to_csv(Path(out_dir) / "sharing_arm_a_vs_b.csv", index=False)
+    a = _macro(scal, ["eval_type", "rows_per_neuron", "n_neurons"]).assign(series="scaling")
+    b = _macro(null, ["eval_type", "rows_per_neuron"]).assign(series="single-neuron", n_neurons=1)
+    b["n_runs"] = null.groupby(["eval_type", "rows_per_neuron"])["run"].nunique().values
+    m = pd.concat([a, b], ignore_index=True)
+    m.to_csv(Path(out_dir) / "sharing_scaling_vs_null.csv", index=False)
+
     fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
     for ax, et in zip(axes, EVAL_TYPES):
-        for arm, colour, style, lab in (("A", "#1f77b4", "-", "arm A (N neurons)"),
-                                        ("B", "#7f7f7f", "--", "arm B (1 neuron, matched data)")):
-            q = m[(m["eval_type"] == et) & (m["arm"] == arm)].sort_values("rows_per_neuron")
-            if q.empty:
-                continue
-            ax.errorbar(q["rows_per_neuron"], q["corr_macro"], yerr=q["corr_std"].fillna(0),
-                        marker="o" if arm == "A" else "s", ms=6, capsize=3, lw=1.8,
-                        ls=style, color=colour, label=lab)
-            if arm == "A":
-                for _, r in q.iterrows():
-                    ax.annotate(f"N={int(r['n_neurons'])}",
-                                (r["rows_per_neuron"], r["corr_macro"]),
-                                textcoords="offset points", xytext=(0, 9),
-                                ha="center", fontsize=9, color=colour)
+        qa = a[a["eval_type"] == et].sort_values("rows_per_neuron")
+        qb = b[b["eval_type"] == et].sort_values("rows_per_neuron")
+        ax.errorbar(qa["rows_per_neuron"], qa["corr_macro"], yerr=qa["corr_std"].fillna(0),
+                    marker="o", ms=6, capsize=3, lw=1.8, color="#1f77b4", label="scaling (N neurons)")
+        for _, r in qa.iterrows():
+            ax.annotate(f"N={int(r['n_neurons'])}", (r["rows_per_neuron"], r["corr_macro"]),
+                        textcoords="offset points", xytext=(0, 9), ha="center",
+                        fontsize=9, color="#1f77b4")
+        ax.errorbar(qb["rows_per_neuron"], qb["corr_macro"], yerr=qb["corr_std"].fillna(0),
+                    marker="s", ms=6, capsize=3, lw=1.8, ls="--", color="#7f7f7f",
+                    label="single-neuron (matched data)")
+        # how many single-neuron runs stand behind each null point -- the spread is only
+        # real where this exceeds 1
+        for _, r in qb.iterrows():
+            ax.annotate(f"n={int(r['n_runs'])}", (r["rows_per_neuron"], r["corr_macro"]),
+                        textcoords="offset points", xytext=(0, -14), ha="center",
+                        fontsize=8, color="#7f7f7f")
         ax.set_xscale("log", base=10)
         ax.set_xlabel("training rows per neuron")
         ax.set_title(et)
         ax.legend(fontsize=10)
     axes[0].set_ylabel("macro corr, trained neurons")
-    # Arm B is ONE neuron per point, so it has no spread to show -- its wiggle is a single
-    # run's noise, not a measured error bar. Arm A's bars are across its N neurons. Saying
-    # so on the figure keeps the two from being read as comparable uncertainty.
-    axes[0].text(0.02, 0.02, "arm B = 1 neuron per point (no spread to show)",
-                 transform=axes[0].transAxes, fontsize=9, color="dimgrey")
+    axes[1].text(0.98, 0.02, "n = single-neuron runs behind each point; "
+                 "spread is real only where n > 1",
+                 transform=axes[1].transAxes, fontsize=9, color="dimgrey", ha="right")
     fig.suptitle("Sharing: does training other neurons help, at matched data per neuron?\n"
                  "curves coinciding = no transfer between neurons")
     fig.tight_layout()
-    fig.savefig(Path(out_dir) / "sharing_arm_a_vs_b.png", dpi=150)
+    fig.savefig(Path(out_dir) / "sharing_scaling_vs_null.png", dpi=150)
+    plt.close(fig)
+    return m
+
+
+def plot_paired_null(ps: pd.DataFrame, out_dir, n_cell: int = 10):
+    """The N=10 cell against its own neurons trained alone -- neuron for neuron.
+
+    Stronger than comparing two means: each of the 10 neurons has a fidelity when
+    trained with 9 others and a fidelity when trained by itself on the same data, so
+    the per-neuron DIFFERENCE cancels neuron heterogeneity entirely. The sign and
+    consistency of those ten differences is the sharing result at this budget.
+    """
+    d = ps[ps["is_baseline_cfg"] & ps["is_trained"]]
+    cell = d[(d["group"] == "scaling") & (d["n_neurons"] == n_cell)]
+    if cell.empty:
+        return
+    rpn = int(cell["rows_per_neuron"].iloc[0])
+    alone = d[(d["n_neurons"] == 1) & (d["rows_per_neuron"] == rpn)]
+    if alone.empty:
+        return
+    # a single-neuron run's trained neuron is the one it was trained on
+    alone = alone[alone["signal"].isin(cell["signal"].unique())]
+    merged = cell.merge(alone[["eval_type", "signal", "corr"]], on=["eval_type", "signal"],
+                        suffixes=("_together", "_alone"))
+    if merged.empty:
+        print(f"[neurongen] paired null: no single-neuron runs match the N={n_cell} "
+              f"cell's neurons at {rpn} rows/neuron")
+        return
+    merged["delta"] = merged["corr_together"] - merged["corr_alone"]
+    merged.to_csv(Path(out_dir) / f"paired_null_n{n_cell}.csv", index=False)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    for ax, et in zip(axes, EVAL_TYPES):
+        q = merged[merged["eval_type"] == et].sort_values("corr_alone")
+        if q.empty:
+            continue
+        x = np.arange(len(q))
+        ax.scatter(x, q["corr_alone"], marker="s", s=55, color="#7f7f7f", label="trained alone", zorder=3)
+        ax.scatter(x, q["corr_together"], marker="o", s=55, color="#1f77b4",
+                   label=f"trained with {n_cell - 1} others", zorder=3)
+        for xi, (_, r) in zip(x, q.iterrows()):
+            ax.plot([xi, xi], [r["corr_alone"], r["corr_together"]], color="k", lw=0.8, alpha=0.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(q["signal"], rotation=45, ha="right", fontsize=8)
+        md, sd = q["delta"].mean(), q["delta"].std()
+        n_pos = int((q["delta"] > 0).sum())
+        ax.set_title(f"{et}\nΔ(together − alone) = {md:+.3f} ± {sd:.3f};  "
+                     f"{n_pos}/{len(q)} improved", fontsize=13)
+        ax.axhline(0, color="k", lw=0.8, alpha=0.3)
+        ax.legend(fontsize=9)
+    axes[0].set_ylabel("corr (this neuron)")
+    fig.suptitle(f"Paired null at {rpn:,} rows/neuron: the same {n_cell} neurons, together vs alone")
+    fig.tight_layout()
+    fig.savefig(Path(out_dir) / f"paired_null_n{n_cell}.png", dpi=150)
+    plt.close(fig)
+    return merged
+
+
+def plot_sweep(ps: pd.DataFrame, out_dir, group: str, x: str, xlabel: str, fname: str,
+               xlog: bool = True):
+    """Generic one-factor sweep: seen and unseen macro corr against `x` within a group,
+    with the matching baseline-config run (same neurons and budget) drawn as a reference
+    point so the sweep is read as a change FROM something."""
+    d = ps[ps["group"] == group]
+    if d.empty:
+        return
+    m = _macro(d, ["eval_type", "arm_label", "n_neurons", "rows_per_neuron", x])
+    m.to_csv(Path(out_dir) / f"{fname}.csv", index=False)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
+    cells = sorted(d[["n_neurons", "rows_per_neuron"]].drop_duplicates().itertuples(index=False))
+    palette = dict(zip(cells, sns.color_palette("tab10", len(cells))))
+    for ax, et in zip(axes, EVAL_TYPES):
+        for cell in cells:
+            n, rpn = cell
+            for lbl, style in (("seen", "-"), ("unseen", "--")):
+                q = m[(m["eval_type"] == et) & (m["arm_label"] == lbl) &
+                      (m["n_neurons"] == n) & (m["rows_per_neuron"] == rpn)].sort_values(x)
+                if q.empty:
+                    continue
+                ax.errorbar(q[x], q["corr_macro"], yerr=q["corr_std"].fillna(0), marker="o",
+                            ms=6, capsize=3, lw=1.8, ls=style, color=palette[cell],
+                            label=f"N={n} @ {rpn//1000}k/neuron, {lbl}")
+            # the baseline-config run for this cell, as a reference
+            ref = ps[ps["is_baseline_cfg"] & (ps["n_neurons"] == n) & (ps["rows_per_neuron"] == rpn)
+                     & (ps["group"] != group) & (ps["eval_type"] == et) & ps["is_trained"]]
+            if len(ref):
+                base_x = {"epochs": 1, "lora_r": 16}[x]
+                ax.scatter([base_x], [ref["corr"].mean()], marker="*", s=180, color=palette[cell],
+                           edgecolors="k", zorder=5, label=f"N={n} baseline (seen)")
+        if xlog:
+            ax.set_xscale("log", base=2 if x == "lora_r" else 10)
+        ax.axhline(0, color="k", lw=0.9, alpha=0.4)
+        ax.set_xlabel(xlabel)
+        ax.set_title(et)
+        ax.legend(fontsize=8)
+    axes[0].set_ylabel("macro corr over neurons")
+    fig.suptitle(f"{group}: {xlabel}")
+    fig.tight_layout()
+    fig.savefig(Path(out_dir) / f"{fname}.png", dpi=150)
     plt.close(fig)
     return m
 
@@ -220,7 +351,7 @@ def plot_interference(ps: pd.DataFrame, out_dir, n_track: int = 6):
     every larger N. Following those specific neurons separates the cost of adding
     neighbours from neuron-to-neuron heterogeneity, which the macro average blends in.
     """
-    d = ps[(ps["arm"] == "A") & ps["is_trained"]]
+    d = ps[(ps["group"] == "scaling") & ps["is_baseline_cfg"] & ps["is_trained"]]
     if d.empty:
         return
     counts = d.groupby("signal")["n_neurons"].nunique()
@@ -257,7 +388,7 @@ def plot_distribution(ps: pd.DataFrame, out_dir):
     A macro mean of 0.5 built from neurons at 0.9 and 0.1 is a different result from one
     built from neurons all near 0.5, and the mean alone cannot tell them apart.
     """
-    d = ps[ps["arm"] == "A"].dropna(subset=["corr"])
+    d = ps[(ps["group"] == "scaling") & ps["is_baseline_cfg"]].dropna(subset=["corr"])
     if d.empty:
         return
     fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
@@ -281,6 +412,45 @@ def plot_distribution(ps: pd.DataFrame, out_dir):
     plt.close(fig)
 
 
+def plot_data30k(ps: pd.DataFrame, out_dir):
+    """N=30 and N=100 at 30k rows/neuron next to the fixed-budget scaling cells.
+
+    Answers whether the fall in the scaling curve past N=10 was starvation: at a fixed
+    300k budget those cells had 10k and 3k rows/neuron, below the floor the null
+    located. Same N, ten times the data -- if fidelity recovers, it was the data.
+    """
+    scal = ps[(ps["group"] == "scaling") & ps["is_baseline_cfg"]]
+    more = ps[ps["group"] == "data30k"]
+    if more.empty or scal.empty:
+        return
+    a = _macro(scal, ["eval_type", "arm_label", "n_neurons"]).assign(series="300k total (scaling)")
+    b = _macro(more, ["eval_type", "arm_label", "n_neurons"]).assign(series="30k per neuron")
+    m = pd.concat([a, b], ignore_index=True)
+    m.to_csv(Path(out_dir) / "data30k_vs_scaling.csv", index=False)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
+    for ax, et in zip(axes, EVAL_TYPES):
+        for series, colour in (("300k total (scaling)", "#1f77b4"), ("30k per neuron", "#d62728")):
+            for lbl, style in (("seen", "-"), ("unseen", "--")):
+                q = m[(m["eval_type"] == et) & (m["series"] == series) &
+                      (m["arm_label"] == lbl)].sort_values("n_neurons")
+                if q.empty:
+                    continue
+                ax.errorbar(q["n_neurons"], q["corr_macro"], yerr=q["corr_std"].fillna(0),
+                            marker="o", ms=6, capsize=3, lw=1.8, ls=style, color=colour,
+                            label=f"{series}, {lbl}")
+        ax.set_xscale("log", base=10)
+        ax.axhline(0, color="k", lw=0.9, alpha=0.4)
+        ax.set_xlabel("neurons trained")
+        ax.set_title(et)
+        ax.legend(fontsize=8)
+    axes[0].set_ylabel("macro corr over neurons")
+    fig.suptitle("Was the fall past N=10 starvation? same N, 30k rows/neuron instead of 300k total")
+    fig.tight_layout()
+    fig.savefig(Path(out_dir) / "data30k_vs_scaling.png", dpi=150)
+    plt.close(fig)
+    return m
+
+
 def main(exp_group="mlp_neurongen"):
     out_dir = Path(f"{ROOT}/outputs/plots/{exp_group}")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -291,8 +461,15 @@ def main(exp_group="mlp_neurongen"):
         sm.to_csv(out_dir / "neuron_generalization_summary.csv", index=False)
     m = plot_scaling(ps, out_dir)
     plot_sharing(ps, out_dir)
+    plot_paired_null(ps, out_dir, n_cell=10)
     plot_interference(ps, out_dir)
     plot_distribution(ps, out_dir)
+    # data30k joins the scaling picture on the same axes as a second budget
+    plot_sweep(ps, out_dir, "epochs", "epochs", "training epochs (same 30k rows/neuron)",
+               "sweep_epochs")
+    plot_sweep(ps, out_dir, "rank", "lora_r", "LoRA rank (N=30 @ 30k rows/neuron)",
+               "sweep_rank")
+    plot_data30k(ps, out_dir)
     if m is not None:
         print("\n[neurongen] macro corr by (eval_type, arm, N):")
         print(m.sort_values(["eval_type", "arm_label", "n_neurons"]).to_string(index=False))

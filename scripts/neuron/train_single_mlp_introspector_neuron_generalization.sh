@@ -5,75 +5,71 @@
 #$ -l gpus=1
 #$ -l gpu_c=8.5
 #$ -l gpu_memory=47G
-#$ -l h_rt=8:00:00
+#$ -l h_rt=12:00:00
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1-9
+#$ -t 19-21
 
 # ============================================================================
 # NEURON GENERALIZATION: does the readout carry neurons it was never trained on,
 # and what does adding neurons cost the ones already there?
 #
-# TWO caches, and the split between them is the whole trick:
+# ONE TABLE, ONE ROW PER RUN. Every quantity that varies is an explicit column; nothing
+# is derived from a row's position. To add a run, add a row and bump #$ -t.
 #
-#   POOL cache (shared, built once)   N_POOL_TEST texts x N_CACHE neurons, TEST SPLIT ONLY. Its train
-#       split is stubbed to 64 texts because nothing trains on it. This is what the
-#       unseen arm reads: it holds every neuron, trained or not.
-#   PER-CELL train cache              (TARGET_ROWS / N) texts x N neurons. Sized so every
-#       cell costs the SAME number of rows, which is what "fixed total budget" means.
+#   name      unique, human-readable; becomes the run directory (neurongen_<name>)
+#   group     what the plotter selects on (scaling / single / single_n10 / epochs / ...)
+#             NOTE: never name a group "null" -- pandas reads that literal string back
+#             from any CSV as NaN, and the row silently vanishes from every plot.
+#   neurons   how many neurons this run trains on
+#   offset    which slice of the POOL: neurons [offset, offset+neurons). offset=k with
+#             neurons=1 trains the k-th pool neuron ALONE -- how the paired null works
+#   rows/n    training rows PER NEURON. This is the variable the sharing question is
+#             about, so matched-data configs read the same number in the same column.
+#             Since rows = texts x neurons, this is also the text count directly.
+#   epochs    passes over those rows
+#   lora_r    adapter rank (alpha = 2r, the convention everywhere else)
 #
-# Why not one shared cache for both. A row is one (text, neuron) pair, and max_samples
-# counts TEXTS, so rows = texts x neurons. Sizing a single cache to serve the N=1 cell
-# (300k texts, so that 1 neuron reaches the budget) while also holding 200 neurons gives
-# 300k x 200 = 60 MILLION rows -- roughly 15 GB with text_input_ids duplicated per row --
-# of which each run would use 300k. Splitting it costs 443k forward passes across the
-# five cells against 300k for one, since a forward serves every neuron of a text at once,
-# and drops the cache from 60M rows to about 2M.
+# SELECTING RUNS -- three ways, so a one-off never means editing the table:
+#   qsub -t 1-26 <script>                     every row, by index
+#   GROUP=rank qsub -t 1-4 <script>           only rows in that group, indexed within it
+#   RUN=steps_n1_30k_ep10 bash <script>       one row by name (interactive)
 #
-# ARM A -- scaling (tasks 1-5): N = 1, 3, 10, 30, 100 neurons, TOTAL ROWS fixed.
-#   Prefixes are NESTED, so neuron #1 is in every run and its fidelity can be tracked
-#   as N grows. That is the interference measurement: does training neuron 100 damage
-#   neuron 1? Non-nested sets would confound it with neuron heterogeneity. The prefix is
-#   cut from the POOL's neuron list explicitly rather than by re-sampling at a smaller
-#   signals_per_layer -- random.sample gives no guarantee that sample(pool, 10) is a
-#   prefix of sample(pool, 200), so re-sampling could silently break the nesting.
+# CACHES. The POOL cache (all 200 neurons, test split) is built once. Each run's own
+# train cache is keyed on its content -- neuron set and text count -- NOT on epochs or
+# rank, so the epoch and rank rows reuse caches that already exist and cost only the
+# training. Rows with identical (neurons, offset, rows/n) share one cache.
 #
-# ARM B -- data-matched null (tasks 6-9; arm A's N=1 cell serves as its full-data point): N = 1 neuron, examples = TOTAL/{1,3,10,30,100}.
-#   Arm A holds total data fixed, so per-neuron data falls as 1/N. That is deliberate --
-#   it is the sharing measurement, not a confound -- but it means a falling curve in
-#   arm A has two possible causes, and only this arm tells them apart:
-#       arm A at N=k  ~=  arm B at TOTAL/k   -> each neuron trained privately; data is
-#                                               NOT shared across neurons, so no reason
-#                                               to expect unseen neurons to work
-#       arm A at N=k  >>  arm B at TOTAL/k   -> examples for one neuron help the others,
-#                                               i.e. a shared code
-#   Without arm B a fall in arm A reads as "capacity limit" when it may be plain
-#   starvation. Arm B is cheap: less data per run, and only 1 neuron.
+# LEGACY ROWS. The first nine reproduce the exact directory names of runs already on
+# disk from the earlier arm-A/arm-B version of this script, so resubmitting them is a
+# no-op (the trainer skips a completed run). They stay in the table so it is the single
+# source of truth, and so they gain the run_spec.json sidecar the plotter reads.
 #
-# WHICH NUMBER TO READ
-#   interventional corr on the UNSEEN arm is the headline. The injected value is drawn
-#   independently per row, so a readout that ignores which neuron the prompt names
-#   cannot report it -- it scores 0 by construction.
-#   Endogenous corr must be read MACRO-AVERAGED over neurons (corr_macro), never
-#   pooled: pooling neurons with different activation scales counts between-neuron
-#   variance as signal and inflates the number badly at 100 neurons. And even macro,
-#   a positive unseen endogenous score can just mean "unseen neurons behave like seen
-#   ones, so predict a typical activation" -- which is why the interventional metric,
-#   not this one, decides whether addressing generalized.
+# WHAT THE GROUPS ANSWER
+#   scaling    seen-neuron fidelity as N grows at a FIXED total budget (300k rows). Per-
+#              neuron data falls as 1/N by design -- that is the sharing measurement.
+#   single     1 neuron at each of scaling's per-neuron budgets. scaling ~= single means
+#              data does not transfer between neurons.
+#              FOUND: single is at CHANCE at 10k and 3k rows/neuron, so the N=30 and N=100
+#              scaling cells were starved, not capacity-limited. Hence the groups below.
+#   single_n10 the 10 neurons of the N=10 cell, each trained ALONE at the same 30k
+#              rows/neuron. Paired with the N=10 run neuron-for-neuron, it gives the
+#              null a real across-neuron spread at the one budget where a gap exists.
+#              Offset 0 is the legacy single row at 30k; only offsets 1-9 are new.
+#   epochs     the N=10 run gets 10x the optimization STEPS of the 30k single (300k row-
+#              passes vs 30k). 10 epochs on one neuron at 30k equalises steps while
+#              holding distinct data at 30k -- if that closes the gap, it was steps, not
+#              sharing. The N=10 variant costs 10x and answers a weaker question.
+#   data30k    N=30 and N=100 at 30k rows/neuron, i.e. above the data floor the single
+#              located (between 10k and 30k). 900k and 3M rows: 3x and 10x the longest
+#              run so far. Run N=30 first; N=100 only if N=30 recovers.
+#   rank       LoRA rank on the N=30 @ 30k cell -- the capacity hypothesis, after data.
+#              Shares data30k's cache, so each row is training only.
 #
-# EXPECTATION: unseen neurons are named by INDEX in the prompt ("neuron 5676"), so a
-#   held-out neuron requires generalizing over a number never seen in training. A
-#   failure here is therefore not clean evidence about introspection -- it may be plain
-#   numeric generalization. The scaling curve and the interference readout are
-#   interpretable regardless, which is why they are arm A rather than an afterthought.
-#   If unseen fails, the follow-ups are head-only transfer (freeze LoRA, retrain only
-#   the regression head on held-out neurons: separates "no channel" from "channel the
-#   decoder cannot address") and the read-direction predictability probe.
-#
-# POSITION: pos=-1, the easiest cell, deliberately. This experiment varies the NEURON
-#   axis; using a hard position would confound a neuron-generalization failure with a
-#   position-generalization failure.
+# WHICH NUMBER TO READ: interventional corr on the UNSEEN arm is the headline (the
+# injected value is independent per row, so a readout that ignores the named neuron
+# scores 0). Endogenous must be read MACRO-averaged over neurons, never pooled.
 # ============================================================================
 
 ## SCC env setup
@@ -96,72 +92,120 @@ export WANDB_RUN_GROUP=mlp_neurongen
 # through to training on a stale config from a previous run
 set -e
 
-index=$(($SGE_TASK_ID-1))
-#index=4
-LAYER=4                  # same layer as the length-gen experiment, and in the main
-                         # layer/token grid's list, so the three are comparable
-TOKEN_POS=-1
+# ---- fixed settings ---------------------------------------------------------
+LAYER=4                  # same layer as the length-gen experiment and the main grid
+TOKEN_POS=-1             # the easiest cell: this experiment varies the NEURON axis
 N_CACHE=200              # neurons in the POOL cache: trainable prefix + held-out rest
-TARGET_ROWS=300000       # (text, neuron) pairs per run -- the fixed budget for arm A
-N_POOL_TEST=3000          # texts in the pool cache's test split (rows = this x 200)
+N_POOL_TEST=3000         # texts in the pool cache's test split (rows = this x 200)
 SEED=21                  # same sampler seed as the layer/token grid
 
 GATE=off
 W=0.01
 SCALE=10
 LR=5e-5
-LORA_R=16
-LORA_ALPHA=$((LORA_R * 2))
 LORA_DO=0.0
 BS=32
 N_TEST=3000              # texts in each run's OWN test split
-# Dev is sized in ROWS, like the train budget. rows = texts x neurons, so a flat text
-# count made dev 100x more expensive at N=100 than at N=1. The 50-text FLOOR keeps enough
-# distinct contexts once N is large (the row target alone would give 20 texts at N=100).
-# The in-training dev metric is POOLED over all rows -- not macro-averaged per neuron --
-# so what stabilises it is TOTAL rows, not rows per neuron.
+# Dev is sized in ROWS. rows = texts x neurons, so a flat text count made dev 100x
+# more expensive at N=100 than at N=1. The 50-text FLOOR keeps enough distinct contexts
+# once N is large. The in-training dev metric is POOLED over rows, not per-neuron, so
+# what stabilises it is total rows.
 DEV_ROWS=2000
 DEV_MIN_TEXTS=50
-MIN_LEN=""               # no length floor: pos=-1 needs no length guarantee, and a
-                         # floor would make this cache incomparable to the pos=-1 runs
-PROMPT_TYPE=prompt_no_token_index   # neuron is named by index either way; the token
-                                    # index clause is irrelevant at pos=-1
+MIN_LEN=""               # no length floor at pos=-1; a floor would make this cache
+                         # incomparable to the other pos=-1 runs
+PROMPT_TYPE=prompt_no_token_index
 
-# ---- arms -----------------------------------------------------------------
-# "n_neurons:n_train_examples"
-# Arm A's N=1 cell IS arm B's full-data cell (1 neuron, the whole budget), so it is
-# listed once and shared: with a fixed seed a second copy would be bit-identical, not a
-# noise estimate. Arm B therefore has 4 tasks, not 5.
-CELLS=(
-  # arm A: scaling, total ROWS fixed
-  "1:$TARGET_ROWS"  "3:$TARGET_ROWS"  "10:$TARGET_ROWS"  "30:$TARGET_ROWS"  "100:$TARGET_ROWS"
-  # arm B: data-matched null, 1 neuron at arm A's per-neuron budget
-  "1:$((TARGET_ROWS/3))"  "1:$((TARGET_ROWS/10))"  "1:$((TARGET_ROWS/30))"  "1:$((TARGET_ROWS/100))"
+# set to --overwrite-cache to force config/dataset/run regeneration.
+# LEAVE EMPTY for a table submission: it would retrain every completed row.
+OVERWRITE=""
+
+# ---- the table ---------------------------------------------------------------
+#      name                               group      neurons offset rows/n  epochs lora_r
+RUNS=(
+  # legacy: arm A, total rows fixed at 300k (names match the runs already on disk)
+  "armA_L4_n1_r300000_gateoff_w0.01     scaling      1      0    300000   1     16"
+  "armA_L4_n3_r300000_gateoff_w0.01     scaling      3      0    100000   1     16"
+  "armA_L4_n10_r300000_gateoff_w0.01    scaling     10      0     30000   1     16"
+  "armA_L4_n30_r300000_gateoff_w0.01    scaling     30      0     10000   1     16"
+  "armA_L4_n100_r300000_gateoff_w0.01   scaling    100      0      3000   1     16"
+  # legacy: arm B, one neuron at each per-neuron budget
+  "armB_L4_n1_r100000_gateoff_w0.01     single       1      0    100000   1     16"
+  "armB_L4_n1_r30000_gateoff_w0.01      single       1      0     30000   1     16"
+  "armB_L4_n1_r10000_gateoff_w0.01      single       1      0     10000   1     16"
+  "armB_L4_n1_r3000_gateoff_w0.01       single       1      0      3000   1     16"
+  # exp 1: the other nine neurons of the N=10 cell, each alone at 30k (offset 0 = legacy)
+  "null10_o1_30k                        single_n10   1      1     30000   1     16"
+  "null10_o2_30k                        single_n10   1      2     30000   1     16"
+  "null10_o3_30k                        single_n10   1      3     30000   1     16"
+  "null10_o4_30k                        single_n10   1      4     30000   1     16"
+  "null10_o5_30k                        single_n10   1      5     30000   1     16"
+  "null10_o6_30k                        single_n10   1      6     30000   1     16"
+  "null10_o7_30k                        single_n10   1      7     30000   1     16"
+  "null10_o8_30k                        single_n10   1      8     30000   1     16"
+  "null10_o9_30k                        single_n10   1      9     30000   1     16"
+  # exp 2: equalise optimization steps
+  "steps_n1_o1_30k_ep10                 epochs       1      0     30000  10     16"
+  "steps_n1_o2_30k_ep10                 epochs       1      1     30000  10     16"
+  "steps_n1_o3_30k_ep10                 epochs       1      2     30000  10     16"
+  # exp 3: N=30 / N=100 above the data floor
+  "data_n30_30k                         data30k     30      0     30000   1     16"
+  "data_n100_30k                        data30k    100      0     30000   1     16"
+  # exp 4: rank, on the N=30 @ 30k cell
+  "rank_n30_30k_r32                     rank        30      0     30000   1     32"
+  "rank_n30_30k_r64                     rank        30      0     30000   1     64"
+  "rank_n30_30k_r128                    rank        30      0     30000   1    128"
+  "rank_n30_30k_r256                    rank        30      0     30000   1    256"
 )
-ARMS=(A A A A A B B B B)
 
-CELL=${CELLS[$index]}
-ARM=${ARMS[$index]}
-N_NEURONS=${CELL%%:*}
-N_ROWS=${CELL##*:}
-# rows = texts x neurons, and --train-max-samples counts TEXTS
-N_TEXTS=$((N_ROWS / N_NEURONS))
+# ---- pick this task's row ------------------------------------------------------
+# GROUP filters the table first; RUN selects by name; otherwise SGE_TASK_ID indexes.
+SELECTED=()
+for row in "${RUNS[@]}"; do
+  read -r r_name r_group _ <<< "$row"
+  if [ -n "$GROUP" ] && [ "$r_group" != "$GROUP" ]; then continue; fi
+  if [ -n "$RUN" ]   && [ "$r_name"  != "$RUN"   ]; then continue; fi
+  SELECTED+=("$row")
+done
+if [ ${#SELECTED[@]} -eq 0 ]; then
+  echo "ERROR: no rows match GROUP='${GROUP:-}' RUN='${RUN:-}'" >&2; exit 1
+fi
+if [ -n "$RUN" ]; then
+  ROW=${SELECTED[0]}
+else
+  if [ -z "$SGE_TASK_ID" ] || [ "$SGE_TASK_ID" = "undefined" ]; then
+    echo "ERROR: SGE_TASK_ID unset; use 'qsub -t 1-${#SELECTED[@]}', or RUN=<name> for one row" >&2
+    exit 1
+  fi
+  index=$(($SGE_TASK_ID-1))
+  if [ "$index" -ge ${#SELECTED[@]} ]; then
+    echo "ERROR: task $SGE_TASK_ID exceeds the ${#SELECTED[@]} rows selected" >&2; exit 1
+  fi
+  ROW=${SELECTED[$index]}
+fi
+read -r NAME R_GROUP N_NEURONS OFFSET RPN EPOCHS LORA_R <<< "$ROW"
+LORA_ALPHA=$((LORA_R * 2))
+
+# rows = texts x neurons, so rows-per-neuron IS the text count
+N_TEXTS=$RPN
+N_ROWS=$((RPN * N_NEURONS))
 DEV_TEXTS=$((DEV_ROWS / N_NEURONS))
 if [ "$DEV_TEXTS" -lt "$DEV_MIN_TEXTS" ]; then DEV_TEXTS=$DEV_MIN_TEXTS; fi
-
-# set to --overwrite-cache to force config/dataset/run regeneration
-OVERWRITE="--overwrite-cache"
 
 if [ "$GATE" = "on" ]; then GATE_FLAG="--disable-adapter-in-input"; else GATE_FLAG=""; fi
 if [ -n "$MIN_LEN" ]; then MIN_FLAG="--min-seq-length $MIN_LEN"; else MIN_FLAG=""; fi
 
 EXP_GROUP=mlp_neurongen
+EXP_NAME="neurongen_${NAME}"
+CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
+echo "row: name=$NAME group=$R_GROUP neurons=$N_NEURONS offset=$OFFSET rows/n=$RPN" \
+     "epochs=$EPOCHS lora_r=$LORA_R -> texts=$N_TEXTS rows=$N_ROWS dev_texts=$DEV_TEXTS"
 
 # ---- step 1: the shared POOL cache (test split only) -----------------------
 # All 200 neurons over N_POOL_TEST texts. Every task generates the identical config, so
 # it resolves to ONE canonical dataset name and is built once; the rest no-op.
-# Train/dev are stubbed to 64 texts -- nothing trains here, and at 200 neurons every
-# extra text costs 200 rows.
+# Train/dev are stubbed to 64 texts -- nothing trains here, but the neuron-gen eval
+# reads them to fit the injection distribution for held-out neurons.
 SAMPLER="{\"type\":\"uniform_layer_sampler\",\"signal_type\":\"mlp\",\"layers\":[${LAYER}],\"signals_per_layer\":${N_CACHE},\"seed\":${SEED}}"
 POOL_CONFIG=experiment_configs/$EXP_GROUP/_pool_L${LAYER}_POS${TOKEN_POS}.json
 
@@ -186,8 +230,8 @@ python generate_experiment_config.py \
     --cache-dir data --output-dir outputs/runs/$EXP_GROUP \
     --output "$POOL_CONFIG"
 
-# the full cached neuron list, in sampler order -- the prefix structure below depends
-# on this order being stable, which the per-(seed,layer) sampler guarantees
+# the cached neuron list, in sampler order. The slice below depends on this order being
+# stable, which the per-(seed,layer) sampler guarantees.
 ALL_NEURONS=($(python -c "
 import json
 cfg = json.load(open('$POOL_CONFIG'))
@@ -196,18 +240,17 @@ print(' '.join(f\"N{s['layer']}.{s['index']}\" for s in cfg['train_signals']))
 
 python cache_signals.py --config "$POOL_CONFIG" $OVERWRITE
 
-# ---- step 2: this task's run ----------------------------------------------
-# NESTED prefix of the train pool: run with N neurons trains on the first N, so every
-# run shares neuron #1 and the interference readout is meaningful.
-TRAIN_NEURONS=$(IFS=,; echo "${ALL_NEURONS[*]:0:$N_NEURONS}")
+# ---- step 2: this row's run ------------------------------------------------
+# Slice [OFFSET, OFFSET+N_NEURONS) of the pool. offset=0 gives the nested prefixes the
+# scaling/interference readouts rely on; offset=k with one neuron isolates pool neuron k.
+if [ $((OFFSET + N_NEURONS)) -gt ${#ALL_NEURONS[@]} ]; then
+  echo "ERROR: offset $OFFSET + neurons $N_NEURONS exceeds the pool (${#ALL_NEURONS[@]})" >&2
+  exit 1
+fi
+TRAIN_NEURONS=$(IFS=,; echo "${ALL_NEURONS[*]:$OFFSET:$N_NEURONS}")
 
-EXP_NAME="neurongen_arm${ARM}_L${LAYER}_n${N_NEURONS}_r${N_ROWS}_gate${GATE}_w${W}"
-CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
-echo "task=$SGE_TASK_ID arm=$ARM neurons=$N_NEURONS rows=$N_ROWS texts=$N_TEXTS dev_texts=$DEV_TEXTS -> $EXP_NAME"
-
-# This run's OWN cache holds exactly its N neurons over N_TEXTS texts, so it is already
-# the right size and needs no --signal-filter and no row cap. The held-out neurons come
-# from the pool cache at eval time (--neuron-gen-pool-config).
+# This run's OWN cache holds exactly its neurons over N_TEXTS texts. The held-out
+# neurons come from the pool cache at eval time (--neuron-gen-pool-config).
 python generate_experiment_config.py \
     --experiment-name "$EXP_NAME" \
     --model meta-llama/Llama-3.2-1B \
@@ -229,7 +272,7 @@ python generate_experiment_config.py \
     --precision 3 \
     --train-batch-size $BS \
     --eval-batch-size 128 \
-    --num-epochs 1 \
+    --num-epochs $EPOCHS \
     --lora-r $LORA_R --lora-alpha $LORA_ALPHA --lora-dropout $LORA_DO \
     $GATE_FLAG \
     --bf16 \
@@ -242,10 +285,20 @@ python generate_experiment_config.py \
     --output "$CONFIG" \
     $OVERWRITE
 
-### cache this run's OWN dataset
-# Required since each cell now has its own cache (its N neurons over N_TEXTS texts).
-# In the previous design every run shared the pool cache via --signal-filter, so caching
-# the pool alone was enough; it no longer is.
+# The row, as data, next to the results. The plotter reads this rather than parsing
+# directory names, so the naming can stay readable and legacy runs get the same fields.
+RUN_DIR=outputs/runs/$EXP_GROUP/$EXP_NAME
+mkdir -p "$RUN_DIR"
+python - <<PY
+import json
+json.dump({"name": "$NAME", "group": "$R_GROUP", "neurons": $N_NEURONS, "offset": $OFFSET,
+           "rows_per_neuron": $RPN, "rows": $N_ROWS, "epochs": $EPOCHS, "lora_r": $LORA_R,
+           "layer": $LAYER, "token_pos": $TOKEN_POS, "pool_size": $N_CACHE,
+           "train_neurons": "$TRAIN_NEURONS".split(",")},
+          open("$RUN_DIR/run_spec.json", "w"), indent=2)
+PY
+
+### cache this run's OWN dataset (no-op when a row with the same content built it)
 python cache_signals.py --config "$CONFIG" $OVERWRITE
 
 python train_introspector_joint.py \
@@ -257,5 +310,5 @@ python train_introspector_joint.py \
     $OVERWRITE
 
 # Re-run ONLY the neuron-generalization eval on an existing checkpoint:
- python train_introspector_joint.py --config "$CONFIG" --joint-loss-weight $W \
-     --neuron-gen-only --neuron-gen-pool-config "$POOL_CONFIG"
+#   python train_introspector_joint.py --config "$CONFIG" --joint-loss-weight $W \
+#       --neuron-gen-only --neuron-gen-pool-config "$POOL_CONFIG"
