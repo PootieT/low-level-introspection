@@ -40,7 +40,9 @@ class TrainingConfig(BaseModel):
     learning_rate: float = 1e-5
     train_batch_size: int = 8
     eval_batch_size: int = 16
-    num_epochs: int = 3
+    # float, not int: a fractional epoch (0.333 on a 900k-row cache) is how a large
+    # multi-neuron run is held to the SAME optimizer-update count as a small one
+    num_epochs: float = 3
     max_seq_length: int = 256
     lora_r: int = 16
     lora_alpha: int = 32

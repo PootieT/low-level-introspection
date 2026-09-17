@@ -405,7 +405,9 @@ def _eval_steps(n_train_rows: int, config, evals_per_run: int) -> int:
     whatever the dataset size.
     """
     steps_per_epoch = math.ceil(n_train_rows / config.training_config.train_batch_size)
-    total = max(1, steps_per_epoch * max(1, config.training_config.num_epochs))
+    # ceil, and no max(1, epochs): 0.333 epochs is a legitimate run length, and
+    # clamping it to 1 would space the evals for a run 3x longer than the real one
+    total = max(1, math.ceil(steps_per_epoch * float(config.training_config.num_epochs)))
     return max(1, total // max(1, evals_per_run))
 
 
@@ -1295,6 +1297,18 @@ def main():
     # checkpoint frequency: 0 => per epoch; >0 => every save_steps (float <1 = ratio of total steps)
     save_kwargs = ({"save_strategy": "epoch"} if config.training_config.save_steps <= 0
                    else {"save_strategy": "steps", "save_steps": config.training_config.save_steps})
+    epoch_kwargs = {"num_train_epochs": config.training_config.num_epochs}
+    if float(config.training_config.num_epochs) < 1:
+        # A fractional epoch never reaches an epoch boundary, so save_strategy="epoch"
+        # would end training with NO checkpoint. Pin the length in steps (HF gives
+        # max_steps precedence) and save exactly at that step, so the run ends with a
+        # checkpoint-<max_steps> that _checkpoint_is_complete recognises as finished.
+        steps_per_epoch = math.ceil(len(train_dataset) / config.training_config.train_batch_size)
+        max_steps = max(1, math.ceil(steps_per_epoch * float(config.training_config.num_epochs)))
+        epoch_kwargs = {"max_steps": max_steps}
+        save_kwargs = {"save_strategy": "steps", "save_steps": max_steps}
+        print(f"[joint] fractional epochs ({config.training_config.num_epochs}): "
+              f"max_steps={max_steps}, checkpoint saved at that step")
     training_args = TrainingArguments(
         output_dir=str(output_dir), run_name=config.experiment_name,
         learning_rate=config.training_config.learning_rate,
@@ -1302,11 +1316,10 @@ def main():
         lr_scheduler_type=config.training_config.lr_scheduler_type,
         per_device_train_batch_size=config.training_config.train_batch_size,
         per_device_eval_batch_size=config.training_config.eval_batch_size,
-        num_train_epochs=config.training_config.num_epochs,
         logging_steps=math.ceil(100 / config.training_config.train_batch_size),
         eval_strategy="steps", eval_steps=_eval_steps(len(train_dataset), config, args.evals_per_run),
         bf16=config.training_config.bf16,
-        remove_unused_columns=False, report_to="wandb", **save_kwargs)
+        remove_unused_columns=False, report_to="wandb", **save_kwargs, **epoch_kwargs)
 
     # PEFT stores the whole resized embed_tokens/lm_head (~1.0 GB, 98% of the file)
     # because the vocab grew by one; drop them as each checkpoint is written, keeping

@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 24-29
+#$ -t 30-32
 
 # ============================================================================
 # NEURON GENERALIZATION: does the readout carry neurons it was never trained on,
@@ -163,7 +163,14 @@ RUNS=(
   "data_n3_o0_30k_ep3                      data30k      3      0     30000   3     16"
   "data_n3_o1_30k_ep3                      data30k      3      1     30000   3     16"
   "data_n3_o2_30k_ep3                      data30k      3      2     30000   3     16"
-  # exp 4: rank, on the N=30 @ 30k cell (30-33)
+  # exp 3c: N=30 @30k held to the N=10 run's update count. 900k rows x 0.333 epochs =
+  # 9,375 updates (the ep1 row above gets 3x that). Two trials on DIFFERENT neuron sets
+  # -- a fixed seed makes a repeated config bit-identical, not a second sample. Offset 0
+  # reuses data_n30_30k's cache; offset 30 (pool neurons 30-59) builds its own 900k rows. (30-32)
+  "data_n30_o0_30k_ep033                   data30k     30      0     30000   0.333 16"
+  "data_n30_o30_30k_ep033                  data30k     30     30     30000   0.333 16"
+  "data_n30_o60_30k_ep033                  data30k     30     60     30000   0.333 16"
+  # exp 4: rank, on the N=30 @ 30k cell (33-36)
   "rank_n30_30k_r32                     rank        30      0     30000   1     32"
   "rank_n30_30k_r64                     rank        30      0     30000   1     64"
   "rank_n30_30k_r128                    rank        30      0     30000   1    128"

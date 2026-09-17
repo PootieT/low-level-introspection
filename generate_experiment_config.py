@@ -116,7 +116,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--train-batch-size", type=int, default=8)
     parser.add_argument("--eval-batch-size", type=int, default=16)
-    parser.add_argument("--num-epochs", type=int, default=3)
+    parser.add_argument("--num-epochs", type=float, default=3,
+                        help="May be fractional (e.g. 0.333) to cap total updates.")
     parser.add_argument("--warmup-ratio", type=float, default=0.0)
     parser.add_argument("--lr-scheduler-type", type=str, default="linear",
                         help="LR schedule: linear | cosine | constant | ...")

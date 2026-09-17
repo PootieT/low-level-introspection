@@ -80,7 +80,7 @@ def _run_meta(d: Path):
             "run": d.name, "group": j["group"], "n_neurons": int(j["neurons"]),
             "offset": int(j.get("offset", 0)), "rows_per_neuron": int(j["rows_per_neuron"]),
             "n_rows": int(j.get("rows", j["rows_per_neuron"] * j["neurons"])),
-            "epochs": int(j.get("epochs", 1)), "lora_r": int(j.get("lora_r", 16)),
+            "epochs": float(j.get("epochs", 1)), "lora_r": int(j.get("lora_r", 16)),
             "layer": j.get("layer"),
         }
     m_arm, m_n, m_r = ARM_RE.search(d.name), N_RE.search(d.name), R_RE.search(d.name)
@@ -458,7 +458,7 @@ def plot_updates(ps: pd.DataFrame, out_dir):
         ax.errorbar(q["updates"], q["corr_macro"], yerr=q["corr_std"].fillna(0), fmt="none",
                     ecolor="grey", elinewidth=0.8, capsize=2, zorder=2)
         for _, r in q.iterrows():
-            ep = f" x{int(r['epochs'])}ep" if r["epochs"] > 1 else ""
+            ep = f" x{r['epochs']:g}ep" if r["epochs"] != 1 else ""
             ax.annotate(f"N={int(r['n_neurons'])} @{int(r['rows_per_neuron'])//1000}k{ep}",
                         (r["updates"], r["corr_macro"]), textcoords="offset points",
                         xytext=(6, 4), fontsize=8)
@@ -521,8 +521,9 @@ def plot_data30k(ps: pd.DataFrame, out_dir, rpn: int = 30_000):
                             ms=7, capsize=3, lw=1.8, color=colour, **STYLE[lbl],
                             label=f"{series}, {lbl}")
                 if lbl == "seen" and "epochs" in q and series != "300k total (scaling)":
-                    for _, r in q[q["epochs"] > 1].iterrows():
-                        ax.annotate(f"x{int(r['epochs'])} ep", (r["n_neurons"], r["corr_macro"]),
+                    for _, r in q[q["epochs"] != 1].iterrows():
+                        ep_txt = f"{r['epochs']:g}"
+                        ax.annotate(f"x{ep_txt} ep", (r["n_neurons"], r["corr_macro"]),
                                     textcoords="offset points", xytext=(7, 6), fontsize=9,
                                     color=colour)
         ax.set_xscale("log", base=10)
