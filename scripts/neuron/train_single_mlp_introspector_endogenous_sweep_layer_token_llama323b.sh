@@ -104,7 +104,7 @@ OVERWRITE=""             # set to --overwrite-cache to force regeneration
 
 if [ "$GATE" = "on" ]; then GATE_FLAG="--disable-adapter-in-input"; else GATE_FLAG=""; fi
 
-EXP_GROUP=mlp_endo_sweep_layer_token
+EXP_GROUP=mlp_endo_sweep_layer_token_llama323b
 CELL="l${LAYER}_pos${TOKEN_POS}"
 SAMPLER="{\"type\":\"uniform_layer_sampler\",\"signal_type\":\"mlp\",\"layers\":[${LAYER}],\"signals_per_layer\":${N_NEURONS_CACHE},\"seed\":${SEED}}"
 

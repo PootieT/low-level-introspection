@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1-28
+#$ -t 24-27
 
 # ============================================================================
 # NEURON GENERALIZATION: does the readout carry neurons it was never trained on,
@@ -72,12 +72,6 @@
 # scores 0). Endogenous must be read MACRO-averaged over neurons, never pooled.
 
 
-# HOW TO RUN
-# either specify with task script in the file above, or
-# do this if you want to run particular runs
-# qsub -t 19-21 scripts/neuron/train_single_mlp_introspector_neuron_generalization.sh
-# or this if you want to run particular groups/runs
-# GROUP=epochs qsub -t 1-3 scripts/neuron/train_single_mlp_introspector_neuron_generalization.sh
 # ============================================================================
 
 ## SCC env setup
@@ -156,10 +150,10 @@ RUNS=(
   "steps_n1_o0_30k_ep10                 epochs       1      0     30000  10     16"
   "steps_n1_o1_30k_ep10                 epochs       1      1     30000  10     16"
   "steps_n1_o2_30k_ep10                 epochs       1      2     30000  10     16"
-  # exp 3: N=30 / N=100 above the data floor (22-24)
+  # exp 3: N=30 / N=100 above the data floor (22-23)
   "data_n30_30k                         data30k     30      0     30000   1     16"
   "data_n100_30k                        data30k    100      0     30000   1     16"
-  # exp 4: rank, on the N=30 @ 30k cell (25-28)
+  # exp 4: rank, on the N=30 @ 30k cell (24-27)
   "rank_n30_30k_r32                     rank        30      0     30000   1     32"
   "rank_n30_30k_r64                     rank        30      0     30000   1     64"
   "rank_n30_30k_r128                    rank        30      0     30000   1    128"
