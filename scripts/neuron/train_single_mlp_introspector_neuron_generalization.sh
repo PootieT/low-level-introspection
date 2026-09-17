@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 24-27
+#$ -t 24-29
 
 # ============================================================================
 # NEURON GENERALIZATION: does the readout carry neurons it was never trained on,
@@ -153,7 +153,17 @@ RUNS=(
   # exp 3: N=30 / N=100 above the data floor (22-23)
   "data_n30_30k                         data30k     30      0     30000   1     16"
   "data_n100_30k                        data30k    100      0     30000   1     16"
-  # exp 4: rank, on the N=30 @ 30k cell (24-27)
+  # exp 3b: complete the 30k/neuron series at small N. At 1 epoch these are UPDATE-
+  # starved (N=1 @30k ep1 already exists and sits at chance with 937 updates), so a flat
+  # line needs updates matched too: epochs = 10/N puts every point near the N=10 run's
+  # 9,375 updates. The ep1 row is kept for the updates-vs-fidelity plot. (24-29)
+  "data_n3_o0_30k                          data30k      3      0     30000   1     16"
+  "data_n3_o1_30k                          data30k      3      1     30000   1     16"
+  "data_n3_o2_30k                          data30k      3      2     30000   1     16"
+  "data_n3_o0_30k_ep3                      data30k      3      0     30000   3     16"
+  "data_n3_o1_30k_ep3                      data30k      3      1     30000   3     16"
+  "data_n3_o2_30k_ep3                      data30k      3      2     30000   3     16"
+  # exp 4: rank, on the N=30 @ 30k cell (30-33)
   "rank_n30_30k_r32                     rank        30      0     30000   1     32"
   "rank_n30_30k_r64                     rank        30      0     30000   1     64"
   "rank_n30_30k_r128                    rank        30      0     30000   1    128"

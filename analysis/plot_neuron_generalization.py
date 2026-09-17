@@ -62,7 +62,11 @@ ARM_RE = re.compile(r"_arm(?P<arm>[AB])")
 N_RE = re.compile(r"_n(?P<n>\d+)")
 R_RE = re.compile(r"_r(?P<r>\d+)")
 LAYER_RE = re.compile(r"_L(?P<layer>\d+)")
-EVAL_TYPES = ("interventional", "endogenous")
+EVAL_TYPES = ("endogenous", "interventional")
+# seen = filled circle, solid; unseen = HOLLOW circle, dotted. A hollow glyph survives
+# in a legend where a cross or a dash pattern does not.
+STYLE = {"seen":   dict(marker="o", ls="-"),
+         "unseen": dict(marker="o", ls=":", mfc="none", mew=1.8)}
 # "single", not "null": pandas reads the literal string "null" back from any CSV as NaN
 LEGACY_GROUP = {"A": "scaling", "B": "single"}
 
@@ -95,6 +99,15 @@ def load_sweep(exp_group: str):
     """One frame of per-neuron rows and one of per-arm summaries, across all runs."""
     base = Path(f"{ROOT}/outputs/runs/{exp_group}")
     if not base.exists():
+        # Plots get rsynced more often than runs. The all-signals CSV this script writes
+        # is the complete per-neuron frame, so re-plotting from it loses nothing.
+        csv = Path(f"{ROOT}/outputs/plots/{exp_group}/neuron_generalization_all_signals.csv")
+        if csv.exists():
+            print(f"[neurongen] no run directories under {base}; re-plotting from {csv.name}")
+            ps = pd.read_csv(csv)
+            ps["arm_label"] = np.where(ps["is_trained"], "seen", "unseen")
+            ps["is_baseline_cfg"] = (ps["epochs"] == 1) & (ps["lora_r"] == 16)
+            return ps, pd.DataFrame()
         sys.exit(f"No such experiment group: {base}")
     per_signal, summary, skipped = [], [], []
     for d in sorted(p for p in base.iterdir() if p.is_dir()):
@@ -166,12 +179,12 @@ def plot_scaling(ps: pd.DataFrame, out_dir):
     m.to_csv(Path(out_dir) / "scaling_by_n.csv", index=False)
     fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
     for ax, et in zip(axes, EVAL_TYPES):
-        for lbl, colour, style in (("seen", "#1f77b4", "-"), ("unseen", "#d62728", "--")):
+        for lbl, colour in (("seen", "#1f77b4"), ("unseen", "#d62728")):
             q = m[(m["eval_type"] == et) & (m["arm_label"] == lbl)].sort_values("n_neurons")
             if q.empty:
                 continue
             ax.errorbar(q["n_neurons"], q["corr_macro"], yerr=q["corr_std"].fillna(0),
-                        marker="o", ms=6, capsize=3, lw=1.8, ls=style, color=colour,
+                        ms=7, capsize=3, lw=1.8, color=colour, **STYLE[lbl],
                         label=f"{lbl} (n={q['n_defined'].iloc[0]} neurons)")
         ax.set_xscale("log", base=10)
         ax.axhline(0, color="k", lw=0.9, alpha=0.4)
@@ -179,7 +192,6 @@ def plot_scaling(ps: pd.DataFrame, out_dir):
         ax.set_title(et)
         ax.legend(fontsize=10)
     axes[0].set_ylabel("macro corr over neurons")
-    fig.suptitle("Scaling: fidelity as neurons are added at a fixed row budget")
     fig.tight_layout()
     fig.savefig(Path(out_dir) / "scaling_by_n.png", dpi=150)
     plt.close(fig)
@@ -234,11 +246,6 @@ def plot_sharing(ps: pd.DataFrame, out_dir):
         ax.set_title(et)
         ax.legend(fontsize=10)
     axes[0].set_ylabel("macro corr, trained neurons")
-    axes[1].text(0.98, 0.02, "n = single-neuron runs behind each point; "
-                 "spread is real only where n > 1",
-                 transform=axes[1].transAxes, fontsize=9, color="dimgrey", ha="right")
-    fig.suptitle("Sharing: does training other neurons help, at matched data per neuron?\n"
-                 "curves coinciding = no transfer between neurons")
     fig.tight_layout()
     fig.savefig(Path(out_dir) / "sharing_scaling_vs_null.png", dpi=150)
     plt.close(fig)
@@ -292,7 +299,6 @@ def plot_paired_null(ps: pd.DataFrame, out_dir, n_cell: int = 10):
         ax.axhline(0, color="k", lw=0.8, alpha=0.3)
         ax.legend(fontsize=9)
     axes[0].set_ylabel("corr (this neuron)")
-    fig.suptitle(f"Paired null at {rpn:,} rows/neuron: the same {n_cell} neurons, together vs alone")
     fig.tight_layout()
     fig.savefig(Path(out_dir) / f"paired_null_n{n_cell}.png", dpi=150)
     plt.close(fig)
@@ -315,21 +321,26 @@ def plot_sweep(ps: pd.DataFrame, out_dir, group: str, x: str, xlabel: str, fname
     for ax, et in zip(axes, EVAL_TYPES):
         for cell in cells:
             n, rpn = cell
-            for lbl, style in (("seen", "-"), ("unseen", "--")):
+            for lbl in ("seen", "unseen"):
                 q = m[(m["eval_type"] == et) & (m["arm_label"] == lbl) &
                       (m["n_neurons"] == n) & (m["rows_per_neuron"] == rpn)].sort_values(x)
                 if q.empty:
                     continue
-                ax.errorbar(q[x], q["corr_macro"], yerr=q["corr_std"].fillna(0), marker="o",
-                            ms=6, capsize=3, lw=1.8, ls=style, color=palette[cell],
+                ax.errorbar(q[x], q["corr_macro"], yerr=q["corr_std"].fillna(0),
+                            ms=7, capsize=3, lw=1.8, color=palette[cell], **STYLE[lbl],
                             label=f"N={n} @ {rpn//1000}k/neuron, {lbl}")
             # the baseline-config run for this cell, as a reference
             ref = ps[ps["is_baseline_cfg"] & (ps["n_neurons"] == n) & (ps["rows_per_neuron"] == rpn)
                      & (ps["group"] != group) & (ps["eval_type"] == et) & ps["is_trained"]]
             if len(ref):
                 base_x = {"epochs": 1, "lora_r": 16}[x]
+                # Say WHICH baseline: the same N exists at more than one budget (N=30 at
+                # 10k/neuron in the scaling sweep, at 30k/neuron in data30k), and the star
+                # is the one matching THIS sweep's budget, not the scaling cell.
                 ax.scatter([base_x], [ref["corr"].mean()], marker="*", s=180, color=palette[cell],
-                           edgecolors="k", zorder=5, label=f"N={n} baseline (seen)")
+                           edgecolors="k", zorder=5,
+                           label=f"baseline: N={n} @ {rpn//1000}k/neuron, "
+                                 f"{ {'epochs': 1, 'lora_r': 16}[x] } {x} (seen)")
         if xlog:
             ax.set_xscale("log", base=2 if x == "lora_r" else 10)
         ax.axhline(0, color="k", lw=0.9, alpha=0.4)
@@ -337,7 +348,6 @@ def plot_sweep(ps: pd.DataFrame, out_dir, group: str, x: str, xlabel: str, fname
         ax.set_title(et)
         ax.legend(fontsize=8)
     axes[0].set_ylabel("macro corr over neurons")
-    fig.suptitle(f"{group}: {xlabel}")
     fig.tight_layout()
     fig.savefig(Path(out_dir) / f"{fname}.png", dpi=150)
     plt.close(fig)
@@ -376,7 +386,6 @@ def plot_interference(ps: pd.DataFrame, out_dir, n_track: int = 6):
         ax.set_title(et)
         ax.legend(fontsize=8, ncol=2)
     axes[0].set_ylabel("corr (single neuron)")
-    fig.suptitle("Interference: the SAME neurons followed as neighbours are added")
     fig.tight_layout()
     fig.savefig(Path(out_dir) / "interference.png", dpi=150)
     plt.close(fig)
@@ -406,45 +415,122 @@ def plot_distribution(ps: pd.DataFrame, out_dir):
         ax.set_title(et)
         ax.set_xlabel("neurons trained")
         ax.set_ylabel("corr (one point per neuron)" if ax is axes[0] else "")
-    fig.suptitle("Per-neuron spread behind each macro average")
     fig.tight_layout()
     fig.savefig(Path(out_dir) / "per_neuron_distribution.png", dpi=150)
     plt.close(fig)
 
 
-def plot_data30k(ps: pd.DataFrame, out_dir):
-    """N=30 and N=100 at 30k rows/neuron next to the fixed-budget scaling cells.
+TRAIN_BATCH = 32     # every run in these sweeps; updates = rows x epochs / batch
 
-    Answers whether the fall in the scaling curve past N=10 was starvation: at a fixed
-    300k budget those cells had 10k and 3k rows/neuron, below the floor the null
-    located. Same N, ten times the data -- if fidelity recovers, it was the data.
+
+def plot_updates(ps: pd.DataFrame, out_dir):
+    """Seen-neuron fidelity against TOTAL optimizer updates, coloured by rows per neuron.
+
+    Every update trains the same shared adapter and head -- there is no per-neuron
+    parameter, the neuron only enters through the prompt -- so "how many updates" and
+    "how much distinct data per neuron" are separable axes, and the sweeps happen to
+    populate both. This plot puts every baseline-config run on those two axes at once,
+    so the question "is it updates, or is it data per neuron?" is answered by whether
+    the points line up on x (updates) or on colour (rows/neuron).
+
+    Rank rows are excluded (they change neither axis); the ten 30k single-neuron runs
+    and the three 10-epoch runs are each pooled into one point.
+    """
+    d = ps[ps["is_trained"] & (ps["lora_r"] == 16)].copy()
+    if d.empty:
+        return
+    d["updates"] = d["rows_per_neuron"] * d["n_neurons"] * d["epochs"] / TRAIN_BATCH
+    key = ["eval_type", "n_neurons", "rows_per_neuron", "epochs"]
+    m = (d.groupby(key)["corr"].agg(corr_macro="mean", corr_std="std", n_neurons_eval="count")
+           .reset_index())
+    m["updates"] = m["rows_per_neuron"] * m["n_neurons"] * m["epochs"] / TRAIN_BATCH
+    m["n_runs"] = d.groupby(key)["run"].nunique().values
+    m.to_csv(Path(out_dir) / "updates_vs_fidelity.csv", index=False)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.6), sharey=True)
+    rpns = sorted(m["rows_per_neuron"].unique())
+    norm = matplotlib.colors.LogNorm(vmin=min(rpns), vmax=max(rpns))
+    cmap = plt.get_cmap("viridis")
+    for ax, et in zip(axes, EVAL_TYPES):
+        q = m[m["eval_type"] == et]
+        sc = ax.scatter(q["updates"], q["corr_macro"], c=q["rows_per_neuron"], cmap=cmap, norm=norm,
+                        s=60 + 18 * np.log2(q["n_neurons"]), edgecolors="k", linewidths=0.7, zorder=3)
+        ax.errorbar(q["updates"], q["corr_macro"], yerr=q["corr_std"].fillna(0), fmt="none",
+                    ecolor="grey", elinewidth=0.8, capsize=2, zorder=2)
+        for _, r in q.iterrows():
+            ep = f" x{int(r['epochs'])}ep" if r["epochs"] > 1 else ""
+            ax.annotate(f"N={int(r['n_neurons'])} @{int(r['rows_per_neuron'])//1000}k{ep}",
+                        (r["updates"], r["corr_macro"]), textcoords="offset points",
+                        xytext=(6, 4), fontsize=8)
+        ax.set_xscale("log", base=10)
+        ax.axhline(0, color="k", lw=0.9, alpha=0.4)
+        ax.set_xlabel(f"total optimizer updates  (rows x epochs / {TRAIN_BATCH})")
+        ax.set_title(et)
+    axes[0].set_ylabel("macro corr, trained neurons")
+    cb = fig.colorbar(sc, ax=axes, shrink=0.85, pad=0.02)
+    cb.set_label("distinct rows per neuron")
+    fig.savefig(Path(out_dir) / "updates_vs_fidelity.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return m
+
+
+REF_UPDATES = 300_000 / TRAIN_BATCH     # the N=10 cell: 9,375 optimizer updates
+
+
+def plot_data30k(ps: pd.DataFrame, out_dir, rpn: int = 30_000):
+    """The fixed-budget scaling curve against a series that holds rows/neuron fixed.
+
+    The second series is assembled from EVERY r=16 run at `rpn` rows/neuron, whatever
+    group it came from -- the N=10 scaling cell, the data30k rows, the 10-epoch singles.
+    Where a given N exists at several epoch settings, the one whose total updates are
+    closest to the N=10 cell's is used, and points that needed epochs > 1 to get there
+    are annotated. That matters because at 30k rows/neuron and one epoch, N=1 gets 937
+    updates and sits at chance: without matching updates the series would RISE with N,
+    which reads as "more neurons helps" when it is "more updates helps".
+
+    A flat series then says the fixed-budget fall was data starvation, full stop.
     """
     scal = ps[(ps["group"] == "scaling") & ps["is_baseline_cfg"]]
-    more = ps[ps["group"] == "data30k"]
-    if more.empty or scal.empty:
+    pool = ps[(ps["rows_per_neuron"] == rpn) & (ps["lora_r"] == 16)].copy()
+    if pool.empty or scal.empty:
         return
+    pool["updates"] = pool["rows_per_neuron"] * pool["n_neurons"] * pool["epochs"] / TRAIN_BATCH
+    # per N, the epoch setting closest to the reference update count
+    pick = (pool.drop_duplicates(["n_neurons", "epochs"])
+                .assign(gap=lambda d: (d["updates"] - REF_UPDATES).abs())
+                .sort_values("gap").drop_duplicates("n_neurons")[["n_neurons", "epochs"]])
+    matched = pool.merge(pick, on=["n_neurons", "epochs"])
+
     a = _macro(scal, ["eval_type", "arm_label", "n_neurons"]).assign(series="300k total (scaling)")
-    b = _macro(more, ["eval_type", "arm_label", "n_neurons"]).assign(series="30k per neuron")
+    b = _macro(matched, ["eval_type", "arm_label", "n_neurons"]).assign(series=f"{rpn // 1000}k per neuron")
+    ep = matched.drop_duplicates("n_neurons").set_index("n_neurons")["epochs"]
+    b["epochs"] = b["n_neurons"].map(ep)
+    b["updates"] = b["rows_per_neuron"] if "rows_per_neuron" in b else rpn * b["n_neurons"] * b["epochs"] / TRAIN_BATCH
     m = pd.concat([a, b], ignore_index=True)
     m.to_csv(Path(out_dir) / "data30k_vs_scaling.csv", index=False)
+
     fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
     for ax, et in zip(axes, EVAL_TYPES):
-        for series, colour in (("300k total (scaling)", "#1f77b4"), ("30k per neuron", "#d62728")):
-            for lbl, style in (("seen", "-"), ("unseen", "--")):
+        for series, colour in (("300k total (scaling)", "#1f77b4"), (f"{rpn // 1000}k per neuron", "#d62728")):
+            for lbl in ("seen", "unseen"):
                 q = m[(m["eval_type"] == et) & (m["series"] == series) &
                       (m["arm_label"] == lbl)].sort_values("n_neurons")
                 if q.empty:
                     continue
                 ax.errorbar(q["n_neurons"], q["corr_macro"], yerr=q["corr_std"].fillna(0),
-                            marker="o", ms=6, capsize=3, lw=1.8, ls=style, color=colour,
+                            ms=7, capsize=3, lw=1.8, color=colour, **STYLE[lbl],
                             label=f"{series}, {lbl}")
+                if lbl == "seen" and "epochs" in q and series != "300k total (scaling)":
+                    for _, r in q[q["epochs"] > 1].iterrows():
+                        ax.annotate(f"x{int(r['epochs'])} ep", (r["n_neurons"], r["corr_macro"]),
+                                    textcoords="offset points", xytext=(7, 6), fontsize=9,
+                                    color=colour)
         ax.set_xscale("log", base=10)
         ax.axhline(0, color="k", lw=0.9, alpha=0.4)
         ax.set_xlabel("neurons trained")
         ax.set_title(et)
         ax.legend(fontsize=8)
     axes[0].set_ylabel("macro corr over neurons")
-    fig.suptitle("Was the fall past N=10 starvation? same N, 30k rows/neuron instead of 300k total")
     fig.tight_layout()
     fig.savefig(Path(out_dir) / "data30k_vs_scaling.png", dpi=150)
     plt.close(fig)
@@ -470,6 +556,7 @@ def main(exp_group="mlp_neurongen"):
     plot_sweep(ps, out_dir, "rank", "lora_r", "LoRA rank (N=30 @ 30k rows/neuron)",
                "sweep_rank")
     plot_data30k(ps, out_dir)
+    plot_updates(ps, out_dir)
     if m is not None:
         print("\n[neurongen] macro corr by (eval_type, arm, N):")
         print(m.sort_values(["eval_type", "arm_label", "n_neurons"]).to_string(index=False))

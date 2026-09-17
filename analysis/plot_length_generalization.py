@@ -76,6 +76,15 @@ def load_sweep(exp_group: str, gate: str | None = "off") -> tuple[pd.DataFrame, 
     """
     base = Path(f"{ROOT}/outputs/runs/{exp_group}")
     if not base.exists():
+        # Plots get rsynced more often than runs; the two frames this script writes are
+        # complete, so re-plotting from them loses nothing.
+        pdir = Path(f"{ROOT}/outputs/plots/{exp_group}")
+        fb, fp = pdir / "length_generalization_bins.csv", pdir / "length_generalization_pooled.csv"
+        if fb.exists():
+            print(f"[lengen] no run directories under {base}; re-plotting from {fb.name}")
+            b = pd.read_csv(fb)
+            p = pd.read_csv(fp) if fp.exists() else pd.DataFrame()
+            return b, p
         sys.exit(f"No such experiment group: {base}")
     bins, pooled, skipped = [], [], []
     for d in sorted(p for p in base.iterdir() if p.is_dir()):
@@ -228,8 +237,6 @@ def plot_reach_curves(b: pd.DataFrame, out_dir, eval_type="interventional"):
     handles = [plt.Line2D([], [], color=colors[w], marker="o", lw=1.8, label=f"win {w}")
                for w in windows]
     axes[0][-1].legend(handles=handles, title="train window", fontsize=10)
-    fig.suptitle(f"{eval_type} readout vs reach — dotted line = edge of training "
-             f"window; X = distance beyond the training LENGTH")
     fig.tight_layout()
     fig.savefig(Path(out_dir) / f"reach_curves_{eval_type}.png", dpi=150)
     plt.close(fig)
@@ -261,7 +268,6 @@ def plot_matched_reach(b: pd.DataFrame, out_dir, eval_type="interventional"):
         if i == 0:
             ax.set_ylabel(f"{eval_type} corr")
         ax.legend(fontsize=10)
-    fig.suptitle("Matched reach across training lengths (pooled over eval lengths)")
     fig.tight_layout()
     fig.savefig(Path(out_dir) / f"matched_reach_{eval_type}.png", dpi=150)
     plt.close(fig)
@@ -297,8 +303,6 @@ def plot_gap_heatmap(b: pd.DataFrame, out_dir, eval_type="interventional"):
         ax.set_title(f"{title}")
         ax.set_xlabel("training window")
         ax.set_ylabel("training length")
-    fig.suptitle(f"{eval_type} readout: generalization gap by cell "
-                 f"(blank = no bins of that kind)")
     fig.tight_layout()
     fig.savefig(Path(out_dir) / f"gap_heatmap_{eval_type}.png", dpi=150)
     plt.close(fig)
@@ -316,7 +320,7 @@ def plot_ceiling(b: pd.DataFrame, out_dir):
     if d.empty:
         return
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4), sharey=True)
-    for ax, et in zip(axes, ("interventional", "endogenous")):
+    for ax, et in zip(axes, ("endogenous", "interventional")):
         sub = d[d["eval_type"] == et]
         tls = sorted(sub["train_len"].unique())
         colors = dict(zip(tls, sns.color_palette("mako", len(tls))))
@@ -329,7 +333,6 @@ def plot_ceiling(b: pd.DataFrame, out_dir):
         ax.set_xlabel("distance from readout")
         ax.legend(fontsize=10)
     axes[0].set_ylabel("corr")
-    fig.suptitle("Ceiling: cells trained on the whole sequence (window = length)")
     fig.tight_layout()
     fig.savefig(Path(out_dir) / "ceiling_diagonal.png", dpi=150)
     plt.close(fig)
@@ -443,8 +446,6 @@ def plot_variance_sources(b: pd.DataFrame, out_dir, eval_type="interventional"):
             if r == len(tls) - 1:
                 ax.set_xlabel("distance from readout")
             ax.legend(fontsize=7, ncol=2)
-    fig.suptitle(f"{eval_type}: sources of spread on the diagonal cells "
-                 f"(dotted line = training length)")
     fig.tight_layout()
     fig.savefig(Path(out_dir) / f"variance_sources_{eval_type}.png", dpi=150)
     plt.close(fig)
@@ -555,10 +556,8 @@ def plot_relative_generalization(pooled: pd.DataFrame, out_dir):
     outside = int(((allv["mean_pct"] < lo) | (allv["mean_pct"] > hi)).sum())
     axes[0].set_ylim(lo, hi)
     if outside:
-        axes[0].text(0.02, 0.02, f"{outside} point(s) outside the view; see the CSVs",
-                     transform=axes[0].transAxes, fontsize=9, color="firebrick")
-    fig.suptitle("Does the drop track the length RATIO? "
-                 "overlapping curves = yes; separated = absolute length matters")
+        print(f"[lengen] relative generalization: {outside} point(s) outside the shared "
+              f"y-range; values are in the CSVs")
     fig.tight_layout()
     fig.savefig(Path(out_dir) / "relative_generalization.png", dpi=150)
     plt.close(fig)
@@ -573,14 +572,14 @@ def main(exp_group="mlp_lengen", gate="off", expected_cells=None):
     b.to_csv(out_dir / "length_generalization_bins.csv", index=False)
     if not pooled.empty:
         pooled.to_csv(out_dir / "length_generalization_pooled.csv", index=False)
-    for et in ("interventional", "endogenous"):
+    for et in ("endogenous", "interventional"):
         plot_reach_curves(b, out_dir, et)
         plot_matched_reach(b, out_dir, et)
         agg = plot_gap_heatmap(b, out_dir, et)
         if agg is not None:
             agg.to_csv(out_dir / f"gap_by_cell_{et}.csv", index=False)
     plot_ceiling(b, out_dir)
-    for et in ("interventional", "endogenous"):
+    for et in ("endogenous", "interventional"):
         plot_variance_sources(b, out_dir, et)
     if not pooled.empty:
         plot_relative_generalization(pooled, out_dir)
