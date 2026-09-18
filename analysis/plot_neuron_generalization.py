@@ -474,38 +474,28 @@ def plot_updates(ps: pd.DataFrame, out_dir):
     return m
 
 
-REF_UPDATES = 300_000 / TRAIN_BATCH     # the N=10 cell: 9,375 optimizer updates
-
-
 def plot_data30k(ps: pd.DataFrame, out_dir, rpn: int = 30_000):
-    """The fixed-budget scaling curve against a series that holds rows/neuron fixed.
+    """The fixed-budget scaling curve, plus the starved cells re-run at `rpn` rows/neuron.
 
-    The second series is assembled from EVERY r=16 run at `rpn` rows/neuron, whatever
-    group it came from -- the N=10 scaling cell, the data30k rows, the 10-epoch singles.
-    Where a given N exists at several epoch settings, the one whose total updates are
-    closest to the N=10 cell's is used, and points that needed epochs > 1 to get there
-    are annotated. That matters because at 30k rows/neuron and one epoch, N=1 gets 937
-    updates and sits at chance: without matching updates the series would RISE with N,
-    which reads as "more neurons helps" when it is "more updates helps".
+    The second series is deliberately ONLY the cells the fixed budget starved (N > 10,
+    where 300k total left under 30k per neuron), re-run at one epoch with 30k/neuron.
+    Its claim is narrow -- "the fall past N=10 was data, not capacity" -- and the plot
+    shows just that.
 
-    A flat series then says the fixed-budget fall was data starvation, full stop.
+    An earlier version tried to complete this series at every N with optimizer updates
+    matched to the N=10 cell (epochs = 10/N). It slopes DOWN: N=30 at 0.333 epochs lands
+    at 0.21 with most neurons unlearned, while the same cell at one epoch (3x the
+    updates) reaches 0.79. Neither total updates nor updates-per-neuron explains the
+    curve on its own, so there is no clean scaling variable to plot and the matched
+    series is not shown here. Those runs remain in updates_vs_fidelity.
     """
     scal = ps[(ps["group"] == "scaling") & ps["is_baseline_cfg"]]
-    pool = ps[(ps["rows_per_neuron"] == rpn) & (ps["lora_r"] == 16)].copy()
-    if pool.empty or scal.empty:
+    more = ps[(ps["group"] == "data30k") & ps["is_baseline_cfg"]
+              & (ps["rows_per_neuron"] == rpn) & (ps["n_neurons"] > 10)]
+    if more.empty or scal.empty:
         return
-    pool["updates"] = pool["rows_per_neuron"] * pool["n_neurons"] * pool["epochs"] / TRAIN_BATCH
-    # per N, the epoch setting closest to the reference update count
-    pick = (pool.drop_duplicates(["n_neurons", "epochs"])
-                .assign(gap=lambda d: (d["updates"] - REF_UPDATES).abs())
-                .sort_values("gap").drop_duplicates("n_neurons")[["n_neurons", "epochs"]])
-    matched = pool.merge(pick, on=["n_neurons", "epochs"])
-
     a = _macro(scal, ["eval_type", "arm_label", "n_neurons"]).assign(series="300k total (scaling)")
-    b = _macro(matched, ["eval_type", "arm_label", "n_neurons"]).assign(series=f"{rpn // 1000}k per neuron")
-    ep = matched.drop_duplicates("n_neurons").set_index("n_neurons")["epochs"]
-    b["epochs"] = b["n_neurons"].map(ep)
-    b["updates"] = b["rows_per_neuron"] if "rows_per_neuron" in b else rpn * b["n_neurons"] * b["epochs"] / TRAIN_BATCH
+    b = _macro(more, ["eval_type", "arm_label", "n_neurons"]).assign(series=f"{rpn // 1000}k per neuron")
     m = pd.concat([a, b], ignore_index=True)
     m.to_csv(Path(out_dir) / "data30k_vs_scaling.csv", index=False)
 
@@ -520,12 +510,6 @@ def plot_data30k(ps: pd.DataFrame, out_dir, rpn: int = 30_000):
                 ax.errorbar(q["n_neurons"], q["corr_macro"], yerr=q["corr_std"].fillna(0),
                             ms=7, capsize=3, lw=1.8, color=colour, **STYLE[lbl],
                             label=f"{series}, {lbl}")
-                if lbl == "seen" and "epochs" in q and series != "300k total (scaling)":
-                    for _, r in q[q["epochs"] != 1].iterrows():
-                        ep_txt = f"{r['epochs']:g}"
-                        ax.annotate(f"x{ep_txt} ep", (r["n_neurons"], r["corr_macro"]),
-                                    textcoords="offset points", xytext=(7, 6), fontsize=9,
-                                    color=colour)
         ax.set_xscale("log", base=10)
         ax.axhline(0, color="k", lw=0.9, alpha=0.4)
         ax.set_xlabel("neurons trained")

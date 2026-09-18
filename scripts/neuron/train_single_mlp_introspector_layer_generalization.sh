@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1-18
+#$ -t 1-19
 
 # ============================================================================
 # LAYER GENERALIZATION: does the readout carry a layer it was never trained on?
@@ -126,6 +126,11 @@ RUNS=(
   "lg_ceil300k_L9     ceil300k  9                          300000       1      16"
   "lg_ceil300k_L11    ceil300k  11                         300000       1      16"
   "lg_ceil300k_L13    ceil300k  13                         300000       1      16"
+  # raising the ceiling: the N=4 cell at 300k rows PER LAYER (1.2M total, 4x the scaling
+  # budget). Same layers as lg_scale_n4, so the two differ only in data. Shows how much
+  # of the seen-layer fidelity was budget-limited, and whether more data moves the
+  # unseen layers at all.
+  "lg_data300k_n4     data300k  0,4,8,12                   300000       1      16"
 )
 
 # ---- pick this task's row --------------------------------------------------------

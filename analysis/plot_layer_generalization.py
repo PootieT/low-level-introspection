@@ -63,6 +63,18 @@ CEILINGS = ("ceil37k", "ceil300k")
 def load_sweep(exp_group: str):
     base = Path(f"{ROOT}/outputs/runs/{exp_group}")
     if not base.exists():
+        # Plots get rsynced more often than runs; the all-signals CSV is the complete
+        # frame. train_layers is not stored in it, but it is exactly the set of layers
+        # marked is_trained for that run, so it is rebuilt from the rows.
+        csv = Path(f"{ROOT}/outputs/plots/{exp_group}/layer_generalization_all.csv")
+        if csv.exists():
+            print(f"[layergen] no run directories under {base}; re-plotting from {csv.name}")
+            ps = pd.read_csv(csv)
+            tl = (ps[ps["is_trained"]].groupby("run")["signal_layer"]
+                    .apply(lambda v: tuple(sorted(int(x) for x in v.unique()))))
+            ps["train_layers"] = ps["run"].map(tl)
+            ps["arm_label"] = np.where(ps["is_trained"], "seen", "unseen")
+            return ps
         sys.exit(f"No such experiment group: {base}")
     frames, skipped = [], []
     for d in sorted(p for p in base.iterdir() if p.is_dir()):
@@ -129,7 +141,7 @@ def plot_layer_heatmap(ps: pd.DataFrame, out_dir):
     """Every run x every layer. Trained cells are outlined, so the eye can separate
     'trained here' from 'generalized here' without a second panel."""
     order = (ps.drop_duplicates("run")
-               .assign(_g=lambda d: d["group"].map({"scaling": 0, "ceil37k": 1, "ceil300k": 2}))
+               .assign(_g=lambda d: d["group"].map({"scaling": 0, "data300k": 1, "ceil37k": 2, "ceil300k": 3}))
                .sort_values(["_g", "n_layers", "train_layers"])["run"].tolist())
     fig, axes = plt.subplots(1, 2, figsize=(17, 0.42 * len(order) + 2.5), sharey=True)
     for ax, et in zip(axes, EVAL_TYPES):
@@ -157,17 +169,32 @@ def plot_unseen_by_n(ps: pd.DataFrame, out_dir):
     d = ps[ps["group"] == "scaling"]
     if d.empty:
         return
-    m = (d.groupby(["eval_type", "arm_label", "n_layers"])["corr"]
-           .agg(corr_macro="mean", corr_std="std", n_layers_in="count").reset_index())
+    STYLE = {"seen": dict(marker="o", ls="-"), "unseen": dict(marker="o", ls=":", mfc="none", mew=1.8)}
+    def agg(sub, series):
+        return (sub.groupby(["eval_type", "arm_label", "n_layers"])["corr"]
+                   .agg(corr_macro="mean", corr_std="std", n_layers_in="count")
+                   .reset_index().assign(series=series))
+    m = agg(d, "300k total (scaling)")
+    # the same N re-run at 300k rows PER LAYER: same layers as the scaling cell, so the
+    # only difference is data. Drawn as a separate point, not joined to the curve.
+    more = ps[ps["group"] == "data300k"]
+    if not more.empty:
+        rpl = int(more["rows_per_locale"].iloc[0]) // 1000
+        m = pd.concat([m, agg(more, f"{rpl}k per layer")], ignore_index=True)
     m.to_csv(Path(out_dir) / "unseen_by_n.csv", index=False)
     fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
+    colours = {"300k total (scaling)": "#1f77b4"}
     for ax, et in zip(axes, EVAL_TYPES):
-        for lbl, colour, style in (("seen", "#1f77b4", "-"), ("unseen", "#d62728", "--")):
-            q = m[(m["eval_type"] == et) & (m["arm_label"] == lbl)].sort_values("n_layers")
-            if q.empty:
-                continue
-            ax.errorbar(q["n_layers"], q["corr_macro"], yerr=q["corr_std"].fillna(0),
-                        marker="o", ms=6, capsize=3, lw=1.8, ls=style, color=colour, label=lbl)
+        for series in m["series"].unique():
+            colour = colours.get(series, "#d62728")
+            for lbl in ("seen", "unseen"):
+                q = m[(m["eval_type"] == et) & (m["series"] == series) &
+                      (m["arm_label"] == lbl)].sort_values("n_layers")
+                if q.empty:
+                    continue
+                ax.errorbar(q["n_layers"], q["corr_macro"], yerr=q["corr_std"].fillna(0),
+                            ms=7, capsize=3, lw=1.8, color=colour, **STYLE[lbl],
+                            label=f"{series}, {lbl}")
         ax.set_xscale("log", base=2)
         ax.axhline(0, color="k", lw=0.9, alpha=0.4)
         ax.set_xlabel("layers trained (300k rows total)")
@@ -186,7 +213,10 @@ def plot_fraction_of_ceiling(ps: pd.DataFrame, out_dir):
     if ceil.empty:
         print("[layergen] no ceiling runs yet; fraction-of-ceiling plots skipped")
         return
-    d = ps[(ps["group"] == "scaling") & ~ps["is_trained"]]
+    d = ps[ps["group"].isin(["scaling", "data300k"]) & ~ps["is_trained"]].copy()
+    # label the high-data cell so its line is not confused with the scaling N=4 line
+    d["n_layers"] = np.where(d["group"] == "data300k", d["n_layers"].astype(str) + " @300k/layer",
+                             d["n_layers"].astype(str))
     m = d.merge(ceil, on=["eval_type", "signal_layer"], how="inner", suffixes=("", "_c"))
     m = m.rename(columns={"group_c": "ceiling_group"}) if "group_c" in m else m
     # merge brought in the ceiling's `group` under a suffix; keep it explicit
@@ -202,7 +232,7 @@ def plot_fraction_of_ceiling(ps: pd.DataFrame, out_dir):
         if mm.empty:
             continue
         fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
-        ns = sorted(mm["n_layers"].unique())
+        ns = sorted(mm["n_layers"].unique(), key=lambda v: (int(str(v).split()[0]), str(v)))
         colours = dict(zip(ns, sns.color_palette("mako", len(ns))))
         for ax, et in zip(axes, EVAL_TYPES):
             for n in ns:
