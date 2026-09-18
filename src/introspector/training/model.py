@@ -148,12 +148,23 @@ def replace_model_with_gated_version(model: PeftModelForCausalLM):
 # ============================================================
 class InterventionHook:
     # TODO extend to other types of signals
-    def __init__(self, token_positions, signal_indices, intervention_values):
+    def __init__(self, token_positions, signal_indices, intervention_values, row_indices=None):
         """
-        token_positions: [bs]
-        signal_indices: [bs]
-        intervention_values: [bs]
+        row_indices:         [k]  WHICH rows of the batch this hook injects into
+        token_positions:     [k]
+        signal_indices:      [k]
+        intervention_values: [k]
+
+        k need not equal the batch size. The forward registers one hook per layer
+        present in the batch and hands each hook only ITS rows' positions/indices/values,
+        so a batch mixing layers gives every hook a strict subset. The hook used to index
+        rows with arange(batch_size) regardless -- correct only when every row targets
+        the same layer, which every run before the layer sweep happened to satisfy. The
+        first multi-layer batch failed with a [32] vs [k] broadcast error at this line.
+
+        row_indices=None keeps the old all-rows behaviour for any single-layer caller.
         """
+        self.row_indices = row_indices
         self.token_positions = token_positions
         self.neuron_indices = signal_indices
         self.intervention_values = intervention_values
@@ -162,8 +173,17 @@ class InterventionHook:
         # outputs shape:
         # [bs, seq, hidden]
         outputs = outputs.clone()
-        bs = outputs.shape[0]
-        batch_idx = torch.arange(bs, device=outputs.device)
+        if self.row_indices is None:
+            batch_idx = torch.arange(outputs.shape[0], device=outputs.device)
+        else:
+            batch_idx = self.row_indices.to(outputs.device)
+        if not (batch_idx.shape[0] == self.token_positions.shape[0]
+                == self.neuron_indices.shape[0] == self.intervention_values.shape[0]):
+            raise ValueError(
+                f"InterventionHook: rows {tuple(batch_idx.shape)}, positions "
+                f"{tuple(self.token_positions.shape)}, indices {tuple(self.neuron_indices.shape)}, "
+                f"values {tuple(self.intervention_values.shape)} must all have the same length "
+                f"-- a multi-layer batch needs row_indices for the rows at THIS layer")
 
         outputs[
             batch_idx,
@@ -330,7 +350,10 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
                 unique_layers = torch.unique(signal_layer)
                 for layer in unique_layers.tolist():
                     mask = signal_layer == layer
+                    # the hook must know WHICH rows it owns, not just how many: with
+                    # several layers in one batch, each hook gets a subset of the rows
                     hook = InterventionHook(
+                        row_indices=mask.nonzero(as_tuple=True)[0],
                         token_positions=token_position[mask],
                         signal_indices=signal_index[mask],
                         intervention_values=intervention_values[mask],
