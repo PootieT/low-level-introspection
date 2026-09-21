@@ -77,19 +77,24 @@ def plot_grid_heatmaps(g: pd.DataFrame, out_dir: Path, L: int):
 
 
 def plot_grid_kl_vs_fidelity(g: pd.DataFrame, out_dir: Path, L: int):
+    """Does spending KL buy fidelity? Endogenous left, interventional right, one point
+    per run, coloured by layer, marker size by distance from the end of the text."""
     col = f"kl@{L}"
     if col not in g.columns:
         return
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-    for ax, hue, pal in ((axes[0], "layer", "viridis"), (axes[1], "position", "rocket")):
-        sc = ax.scatter(g[col], g["interventional_corr"], c=g[hue], cmap=pal, s=30,
-                        edgecolors="k", linewidths=0.4)
-        cb = fig.colorbar(sc, ax=ax, pad=0.02); cb.set_label(hue)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharex=True)
+    size = 18 + 3 * g["position"].abs()
+    for ax, ycol, ylab in ((axes[0], "endogenous_corr", "endogenous corr"),
+                           (axes[1], "interventional_corr", "interventional corr")):
+        sc = ax.scatter(g[col], g[ycol], c=g["layer"], cmap="viridis", s=size,
+                        edgecolors="k", linewidths=0.4, alpha=0.85)
         ax.set_xscale("log")
         ax.set_xlabel(f"KL(base‖tuned) nats/token @{L}")
-        ax.set_ylabel("interventional corr")
-    fig.tight_layout()
-    fig.savefig(out_dir / f"grid_kl_vs_fidelity_L{L}.png", dpi=150)
+        ax.set_ylabel(ylab)
+    cb = fig.colorbar(sc, ax=axes, shrink=0.85, pad=0.02); cb.set_label("layer")
+    axes[1].text(0.98, 0.02, "marker size = |position| (distance from the end)",
+                 transform=axes[1].transAxes, ha="right", fontsize=9, color="dimgrey")
+    fig.savefig(out_dir / f"grid_kl_vs_fidelity_L{L}.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -153,7 +158,7 @@ def plot_length_profile(m: pd.DataFrame, ref: pd.DataFrame, out_dir: Path):
     plt.close(fig)
 
 
-def main(out_dir=None, grid_group=GRID_GROUP):
+def main(out_dir=None, grid_group=GRID_GROUP, active_family=None):
     out_dir = Path(out_dir or ROOT / "outputs" / "plots" / "kl_capacity")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -184,9 +189,21 @@ def main(out_dir=None, grid_group=GRID_GROUP):
         print(f"[kl] multi-locale: {len(m)} selected runs, {len(have)} with KL")
         cmds = missing_kl_commands(m)
         if cmds:
-            (out_dir / "score_kl_missing.sh").write_text("#!/bin/bash\nset -e\n" + "\n".join(cmds) + "\n")
-            print(f"[kl] {len(cmds)} selected runs have no lm_degradation.json; commands written to "
-                  f"{out_dir / 'score_kl_missing.sh'}")
+            lines = ["#!/bin/bash", "set -e",
+                     "# runs selected for the KL-capacity comparison that have no lm_degradation.json",
+                     "# families other than the active one are left in but commented out"]
+            n_active = 0
+            for fam in ("neuron", "length", "layer"):
+                fam_cmds = [c for f, c in cmds if f == fam]
+                if not fam_cmds:
+                    continue
+                on = (active_family is None) or (fam == active_family)
+                lines.append(f"\n# ---- {fam} ({len(fam_cmds)} runs){'' if on else '  [inactive]'} ----")
+                lines += [c if on else f"# {c}" for c in fam_cmds]
+                n_active += len(fam_cmds) if on else 0
+            (out_dir / "score_kl_missing.sh").write_text("\n".join(lines) + "\n")
+            print(f"[kl] {len(cmds)} selected runs have no lm_degradation.json ({n_active} active); "
+                  f"commands written to {out_dir / 'score_kl_missing.sh'}")
         if len(have):
             for L in LENGTHS:
                 plot_multi_locale(have, ref, out_dir, L)
@@ -200,5 +217,11 @@ def main(out_dir=None, grid_group=GRID_GROUP):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else None,
-         grid_group=sys.argv[2] if len(sys.argv) > 2 else GRID_GROUP)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("out_dir", nargs="?", default=None)
+    ap.add_argument("--grid-group", default=GRID_GROUP)
+    ap.add_argument("--active-family", default=None, choices=["neuron", "length", "layer"],
+                    help="In score_kl_missing.sh, leave only this family's commands uncommented.")
+    a = ap.parse_args()
+    main(a.out_dir, grid_group=a.grid_group, active_family=a.active_family)

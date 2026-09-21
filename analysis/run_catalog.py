@@ -117,7 +117,17 @@ def length_runs(exp_group: str = "mlp_lengen", diagonal_only: bool = True) -> pd
     rows = []
     root = RUNS / exp_group
     if not root.exists():
-        return pd.DataFrame()
+        c = _synced_csv_runs("length")
+        if c.empty:
+            return pd.DataFrame()
+        if diagonal_only:
+            c = c[c["train_len"] == c["window"]]
+        return pd.DataFrame({"family": "length", "group": exp_group, "run": c["run"].values,
+                             "config_hint": c["run"].values, "neuron": c["neuron"].values,
+                             "train_len": c["train_len"].values, "window": c["window"].values,
+                             "n_locales": c["window"].values,
+                             "label": [f"positions={w}" for w in c["window"]],
+                             "has_kl": False, "has_drift": False})
     for d in sorted(p for p in root.iterdir() if p.is_dir()):
         m, n = LEN_RE.search(d.name), NEURON_RE.search(d.name)
         if not (m and n):
@@ -135,21 +145,83 @@ def length_runs(exp_group: str = "mlp_lengen", diagonal_only: bool = True) -> pd
     return pd.DataFrame(rows)
 
 
-def _sidecar_runs(exp_group: str, family: str, keep) -> pd.DataFrame:
+def _sidecar_runs(exp_group: str, family: str, keep, legacy=None) -> pd.DataFrame:
     rows = []
     root = RUNS / exp_group
-    if not root.exists():
+    if root.exists():
+        for d in sorted(p for p in root.iterdir() if p.is_dir()):
+            spec = d / "run_spec.json"
+            j = json.loads(spec.read_text()) if spec.exists() else (legacy(d.name) if legacy else None)
+            if j is None or not keep(j):
+                continue
+            rows.append({"family": family, "group": exp_group, "run": d.name,
+                         "config_hint": d.name, "spec": j, **read_metrics(d)})
+        return pd.DataFrame(rows)
+    # no run directories: names from the synced plot frames, no metrics
+    c = _synced_csv_runs(family)
+    if c.empty:
         return pd.DataFrame()
-    for d in sorted(p for p in root.iterdir() if p.is_dir()):
-        spec = d / "run_spec.json"
-        if not spec.exists():
-            continue
-        j = json.loads(spec.read_text())
-        if not keep(j):
-            continue
-        rows.append({"family": family, "group": exp_group, "run": d.name,
-                     "config_hint": d.name, "spec": j, **read_metrics(d)})
-    return pd.DataFrame(rows)
+    c = c[c["spec"].map(keep)]
+    if c.empty:
+        return pd.DataFrame()
+    return pd.DataFrame({"family": family, "group": c["group_dir"].values, "run": c["run"].values,
+                         "config_hint": c["run"].values, "spec": c["spec"].values,
+                         "has_kl": False, "has_drift": False})
+
+
+ARM_RE = re.compile(r"_arm(?P<arm>[AB])")
+N_RE = re.compile(r"_n(?P<n>\d+)")
+R_RE = re.compile(r"_r(?P<r>\d+)")
+PLOTS = ROOT / "outputs" / "plots"
+
+
+def _legacy_neuron_spec(name: str):
+    """The arm-A/arm-B naming the neuron sweep used before run_spec.json existed. Those
+    runs are the N=1/3/10 scaling cells -- exactly the ones a capacity comparison needs
+    -- and they carry no sidecar unless resubmitted, so the name is parsed instead."""
+    a, n, r = ARM_RE.search(name), N_RE.search(name), R_RE.search(name)
+    if not (a and n and r):
+        return None
+    nn, rows = int(n["n"]), int(r["r"])
+    return {"group": {"A": "scaling", "B": "single"}[a["arm"]], "neurons": nn, "offset": 0,
+            "rows_per_neuron": rows // max(1, nn), "epochs": 1, "lora_r": 16, "layer": 4}
+
+
+def _synced_csv_runs(family: str) -> pd.DataFrame:
+    """Run NAMES (and config fields) from the frames the plotters write, for when the
+    run directories are not local. Metrics are absent, so has_kl is False for all --
+    which is exactly what is needed to write the list of runs still to be scored."""
+    if family == "neuron":
+        f = PLOTS / "mlp_neurongen" / "neuron_generalization_all_signals.csv"
+        if not f.exists():
+            return pd.DataFrame()
+        r = pd.read_csv(f).drop_duplicates("run")
+        specs = [{"group": g, "neurons": int(n), "offset": int(o), "rows_per_neuron": int(rp),
+                  "epochs": float(e), "lora_r": int(lr), "layer": 4}
+                 for g, n, o, rp, e, lr in zip(r["group"], r["n_neurons"], r["offset"],
+                                               r["rows_per_neuron"], r["epochs"], r["lora_r"])]
+        return pd.DataFrame({"run": r["run"].values, "group_dir": "mlp_neurongen", "spec": specs})
+    if family == "layer":
+        f = PLOTS / "mlp_layergen" / "layer_generalization_all.csv"
+        if not f.exists():
+            return pd.DataFrame()
+        r = pd.read_csv(f)
+        tl = r[r["is_trained"]].groupby("run")["signal_layer"].apply(lambda v: sorted(int(x) for x in v.unique()))
+        r = r.drop_duplicates("run")
+        specs = [{"group": g, "n_layers": int(n), "train_layers": tl.get(run, []),
+                  "rows_per_locale": int(rp), "index": int(i)}
+                 for run, g, n, rp, i in zip(r["run"], r["group"], r["n_layers"],
+                                             r["rows_per_locale"], r["index"])]
+        return pd.DataFrame({"run": r["run"].values, "group_dir": "mlp_layergen", "spec": specs})
+    if family == "length":
+        f = PLOTS / "mlp_lengen" / "length_generalization_bins.csv"
+        if not f.exists():
+            return pd.DataFrame()
+        r = pd.read_csv(f).drop_duplicates("run")
+        return pd.DataFrame({"run": r["run"].values, "group_dir": "mlp_lengen",
+                             "train_len": r["train_len"].values, "window": r["window"].values,
+                             "neuron": r["neuron"].values})
+    return pd.DataFrame()
 
 
 def neuron_runs(exp_group: str = "mlp_neurongen") -> pd.DataFrame:
@@ -164,7 +236,7 @@ def neuron_runs(exp_group: str = "mlp_neurongen") -> pd.DataFrame:
         g, n, ep = j["group"], int(j["neurons"]), float(j.get("epochs", 1))
         return ((g == "scaling" and n in (1, 3, 10))
                 or (g == "data30k" and n == 30 and ep == 1 and int(j.get("offset", 0)) == 0))
-    df = _sidecar_runs(exp_group, "neuron", keep)
+    df = _sidecar_runs(exp_group, "neuron", keep, legacy=_legacy_neuron_spec)
     if df.empty:
         return df
     df["n_locales"] = df["spec"].map(lambda j: int(j["neurons"]))
@@ -194,11 +266,12 @@ def multi_locale_runs() -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def missing_kl_commands(df: pd.DataFrame, config_root: str = "experiment_configs") -> list[str]:
-    """Shell lines to score the runs that have no lm_degradation.json yet."""
+def missing_kl_commands(df: pd.DataFrame, config_root: str = "experiment_configs") -> list[tuple[str, str]]:
+    """(family, shell line) for every run that has no lm_degradation.json yet."""
     if df.empty or "has_kl" not in df:
         return []
-    cmds = []
+    out = []
     for _, r in df[~df["has_kl"].fillna(False)].iterrows():
-        cmds.append(f"python score_lm_degradation.py --config {config_root}/{r['group']}/{r['run']}.json")
-    return cmds
+        out.append((r["family"],
+                    f"python score_lm_degradation.py --config {config_root}/{r['group']}/{r['run']}.json"))
+    return out
