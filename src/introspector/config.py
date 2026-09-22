@@ -39,6 +39,10 @@ class DatasetConfig(BaseModel):
 class TrainingConfig(BaseModel):
     learning_rate: float = 1e-5
     train_batch_size: int = 8
+    # micro-batches accumulated per optimizer step. The EFFECTIVE batch is
+    # train_batch_size * gradient_accumulation_steps -- halve one and double the
+    # other to cut activation memory without changing the optimization.
+    gradient_accumulation_steps: int = 1
     eval_batch_size: int = 16
     # float, not int: a fractional epoch (0.333 on a 900k-row cache) is how a large
     # multi-neuron run is held to the SAME optimizer-update count as a small one

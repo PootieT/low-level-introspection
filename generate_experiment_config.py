@@ -114,7 +114,13 @@ def parse_args() -> argparse.Namespace:
 
     # ---- training ----
     parser.add_argument("--learning-rate", type=float, default=1e-5)
-    parser.add_argument("--train-batch-size", type=int, default=8)
+    parser.add_argument("--train-batch-size", type=int, default=8,
+                        help="PER-DEVICE micro-batch. Effective batch is this times "
+                             "--gradient-accumulation-steps.")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                        help="Micro-batches per optimizer step. Use with a smaller "
+                             "--train-batch-size to fit a larger model at the same "
+                             "effective batch size.")
     parser.add_argument("--eval-batch-size", type=int, default=16)
     parser.add_argument("--num-epochs", type=float, default=3,
                         help="May be fractional (e.g. 0.333) to cap total updates.")
@@ -300,6 +306,7 @@ def main() -> None:
             lr_scheduler_type=args.lr_scheduler_type,
             save_steps=args.save_steps,
             train_batch_size=args.train_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
             eval_batch_size=args.eval_batch_size,
             num_epochs=args.num_epochs,
             max_seq_length=args.max_seq_length + 30, # input + introspection prefill

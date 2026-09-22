@@ -66,31 +66,69 @@ KL_RE = re.compile(r"_kl(?P<kl>[0-9.a-z]+)")
 KEY = ["layer", "position", "neuron"]
 
 
-# the sweeps' grid, and the neuron sampler from src/introspector/signals/resolution.py
-GRID_LAYERS = [0, 2, 4, 6, 8, 10, 12, 14]
-GRID_POSITIONS = [-1, -4, -8, -12, -16, -20, -24, -28]
+# The sweeps' grid, and the neuron sampler from src/introspector/signals/resolution.py.
+#
+# EVERY FIELD IS PER MODEL. The three sweeps differ in all three: the layer list (a
+# 16-layer model cannot use layer 28), the position list, and -- the one that bites
+# silently -- the intermediate size, which is the pool the neuron indices are SAMPLED
+# FROM. Llama-3.1-8B's pool is 14336, so seed 21 draws entirely different indices there
+# than at 8192; an expected grid built with the wrong pool names neurons that do not
+# exist and reports every real run as missing while missing nothing real.
+#
+# Verified against the synced configs: these reproduce the actual trained indices
+# exactly for all four layers of both the 3B and 8B sweeps.
+MODELS = {
+    "llama321b": dict(layers=[0, 2, 4, 6, 8, 10, 12, 14],
+                      positions=[-1, -4, -8, -12, -16, -20, -24, -28],
+                      pool=8192, n_layers=16),
+    "llama323b": dict(layers=[6, 12, 18, 24],
+                      positions=[-1, -8, -20, -28],
+                      pool=8192, n_layers=28),
+    "llama318b": dict(layers=[4, 12, 20, 28],
+                      positions=[-1, -8, -20, -28],
+                      pool=14336, n_layers=32),
+}
+DEFAULT_MODEL = "llama321b"
 N_TRAINED = 5
 SAMPLER_SEED = 21
-INTERMEDIATE_SIZE = 8192      # Llama-3.2-1B
+
+# kept for callers that still read them; the model registry is the source of truth
+GRID_LAYERS = MODELS[DEFAULT_MODEL]["layers"]
+GRID_POSITIONS = MODELS[DEFAULT_MODEL]["positions"]
+INTERMEDIATE_SIZE = MODELS[DEFAULT_MODEL]["pool"]
+
+
+def model_for_group(group: str) -> str:
+    """Which model a run group belongs to, from its name suffix.
+
+    Group names carry the model (mlp_endo_sweep_layer_token_llama318b); anything with no
+    suffix is the original 1B sweep.
+    """
+    for key in MODELS:
+        if group.endswith(key):
+            return key
+    return DEFAULT_MODEL
 
 
 def expected_grid(layers=None, positions=None, n_neurons=None,
-                  seed=None, pool=None):
-    """Every (layer, position, neuron) the sweeps should contain.
+                  seed=None, pool=None, model=None):
+    """Every (layer, position, neuron) the sweeps should contain, for one MODEL.
 
     Mirrors resolve_signal_source: a per-(seed, layer) RNG draws the layer's signal
     list, and the scripts train its first n_neurons. Deriving it rather than inferring
     it from what exists is the point -- a cell missing from BOTH arms is invisible to
-    any inference from the data."""
+    any inference from the data.
+
+    `model` selects layers/positions/pool from MODELS; explicit arguments override it.
+    """
     import hashlib
     import random as _random
-    # read the module globals at CALL time, so changing GRID_LAYERS/GRID_POSITIONS for
-    # a different sweep actually takes effect
-    layers = GRID_LAYERS if layers is None else layers
-    positions = GRID_POSITIONS if positions is None else positions
+    spec = MODELS[model or DEFAULT_MODEL]
+    layers = spec["layers"] if layers is None else layers
+    positions = spec["positions"] if positions is None else positions
+    pool = spec["pool"] if pool is None else pool
     n_neurons = N_TRAINED if n_neurons is None else n_neurons
     seed = SAMPLER_SEED if seed is None else seed
-    pool = INTERMEDIATE_SIZE if pool is None else pool
     out = []
     for layer in layers:
         layer_seed = int(hashlib.sha256(f"{seed}:{layer}".encode()).hexdigest()[:8], 16)
@@ -101,13 +139,30 @@ def expected_grid(layers=None, positions=None, n_neurons=None,
     return out
 
 
-def report_missing(df: pd.DataFrame, label: str, expected=None):
-    """Which runs of the grid are absent from this arm? Printed as resubmittable
-    (layer, position) cells with the neurons that are missing from each."""
-    expected = expected or expected_grid()
+def report_missing(df: pd.DataFrame, label: str, expected=None, model=None):
+    """Which runs of the grid are absent from this arm, and which present runs are not
+    in the grid at all.
+
+    UNEXPECTED matters as much as missing: a sweep whose layer list was edited between
+    submissions leaves partially-finished runs at the old layers, and those inflate the
+    run count while contributing nothing to the grid. The 8B endo directory has exactly
+    that -- layers 6 and 18 from an earlier grid, 4 and 2 neurons deep.
+    """
+    expected = expected or expected_grid(model=model)
+    exp_set = set(expected)
     have = set(zip(df["layer"], df["position"], df["neuron"]))
     missing = [e for e in expected if e not in have]
-    print(f"[cmp] {label}: {len(have)}/{len(expected)} expected runs present")
+    unexpected = sorted(have - exp_set)
+    print(f"[cmp] {label}: {len(have & exp_set)}/{len(expected)} expected runs present"
+          + (f", plus {len(unexpected)} not in the grid" if unexpected else ""))
+    if unexpected:
+        by_cell = {}
+        for layer, pos, neuron in unexpected:
+            by_cell.setdefault((layer, pos), []).append(neuron)
+        print(f"[cmp] {label}: UNEXPECTED {len(unexpected)} run(s) across {len(by_cell)} cell(s) "
+              f"(not in this model's grid -- leftovers from an earlier layer/position list?):")
+        for (layer, pos), neurons in sorted(by_cell.items()):
+            print(f"        layer {layer:2d} pos {pos:4d}: {sorted(neurons)}")
     if not missing:
         return []
     by_cell = {}
@@ -311,19 +366,20 @@ def plot_delta_heatmap(merged, metric, label_a, label_b, out_dir):
     print(f"[cmp] wrote {path}")
 
 
-def main(arms: dict, out_dir, pairs=None):
+def main(arms: dict, out_dir, pairs=None, model=None):
     """
     arms:  {label: {"group": ..., "filters": {...}}}
     pairs: [(a, b), ...] to compare as a-minus-b. Default: every joint arm against
            every sft arm.
+    model: key into MODELS. None infers it per arm from the group name suffix, so a
+           mixed call still measures each arm against ITS OWN grid.
 
     Pairwise rather than one joint table: a join across all arms would drop any cell
     missing from any one of them, which is exactly the cell the missing-run report
     exists to surface.
     """
     os.makedirs(out_dir, exist_ok=True)
-    expected = expected_grid()
-    frames, missing = {}, {}
+    frames, missing, models = {}, {}, {}
     for label, spec in arms.items():
         print(f"\n[cmp] ===== {label} =====")
         try:
@@ -331,9 +387,15 @@ def main(arms: dict, out_dir, pairs=None):
         except SystemExit as e:
             print(f"[cmp] {label}: no runs ({e}); skipping this arm")
             continue
-        missing[label] = report_missing(frames[label], label, expected)
+        m = model or model_for_group(spec["group"])
+        models[label] = m
+        spec_m = MODELS[m]
+        print(f"[cmp] {label}: grid for {m} -- layers {spec_m['layers']}, "
+              f"positions {spec_m['positions']}, neuron pool {spec_m['pool']}")
+        missing[label] = report_missing(frames[label], label, expected_grid(model=m), model=m)
     with open(Path(out_dir) / "missing_runs.json", "w") as f:
-        json.dump({k: [list(m) for m in v] for k, v in missing.items()}, f, indent=2)
+        json.dump({"models": models,
+                   "missing": {k: [list(m) for m in v] for k, v in missing.items()}}, f, indent=2)
 
     if pairs is None:
         pairs = [(a, b) for a in frames if a.startswith("joint")
@@ -384,5 +446,17 @@ if __name__ == "__main__":
         "joint_free":  dict(group="mlp_joint_grid_layer_token",
                             filters=dict(gate="off", w=0.01, kl="none")),
     }
+    # --model-suffix runs the same four arms for another model: the group names gain the
+    # suffix and the expected grid follows from it, so nothing else changes.
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model-suffix", default="",
+                    help="e.g. _llama318b or _llama323b; appended to every group name")
+    ap.add_argument("--out-dir", default=None)
+    a = ap.parse_args()
+    if a.model_suffix:
+        for spec in ARMS.values():
+            spec["group"] = spec["group"] + a.model_suffix
+    out = a.out_dir or f"{ROOT}/outputs/plots/sft_vs_joint{a.model_suffix}"
     # default pairs = every joint arm against every sft arm (4 comparisons)
-    main(ARMS, out_dir=f"{ROOT}/outputs/plots/sft_vs_joint")
+    main(ARMS, out_dir=out)

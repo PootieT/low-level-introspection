@@ -311,6 +311,7 @@ class JointInterventionTrainer(InterventionTrainer):
         # anchor: adaptive to a KL budget if a target is set, else a fixed weight
         self.kl_anchor_target = kl_anchor_target
         self.kl_anchor_positions = kl_anchor_positions
+        self._last_kl_update_step = -1   # see compute_loss: one controller update per optimizer step
         self.kl_anchor_range = kl_anchor_coef_range
         self.kl_anchor_coef = (kl_anchor_coef_init if kl_anchor_target is not None
                                else kl_anchor_weight)
@@ -382,7 +383,16 @@ class JointInterventionTrainer(InterventionTrainer):
                                   region_mask, self.kl_anchor_positions)
             if L_kl is not None:
                 loss = loss + self.kl_anchor_coef * L_kl
-                self._update_kl_coef(float(L_kl.detach()))
+                # ONCE PER OPTIMIZER STEP, not once per micro-batch. compute_loss runs
+                # per micro-batch, so under gradient accumulation the controller would
+                # apply its multiplicative update N times between parameter updates --
+                # the same measured KL driving the coefficient N-fold, which changes the
+                # loop gain and can oscillate. global_step is constant within an
+                # accumulation group, so this fires on the group's first micro-batch and
+                # reduces to the previous behaviour when accumulation is 1.
+                if self._last_kl_update_step != self.state.global_step:
+                    self._update_kl_coef(float(L_kl.detach()))
+                    self._last_kl_update_step = self.state.global_step
 
         if self.state.global_step % max(1, self.args.logging_steps) == 0:
             log = {k: float(v.detach()) for k, v in
@@ -392,6 +402,27 @@ class JointInterventionTrainer(InterventionTrainer):
             self.log(log)
         out = interv_out if interv_out is not None else endo_out
         return (loss, out) if return_outputs else loss
+
+
+def _eff_batch(config) -> int:
+    """Rows consumed per optimizer step."""
+    tc = config.training_config
+    return max(1, tc.train_batch_size) * max(1, getattr(tc, "gradient_accumulation_steps", 1))
+
+
+def _opt_steps_per_epoch(n_train_rows: int, config) -> int:
+    """Optimizer steps in one epoch.
+
+    Not rows/batch: with gradient accumulation an optimizer step consumes
+    train_batch_size * gradient_accumulation_steps rows, and HF counts global_step,
+    max_steps, eval_steps, save_steps and logging_steps in OPTIMIZER steps. Dividing by
+    the micro-batch alone overstates the run length by the accumulation factor, which
+    silently multiplies the eval count and, for a fractional-epoch run, the length of
+    training itself.
+    """
+    tc = config.training_config
+    eff = max(1, tc.train_batch_size) * max(1, getattr(tc, "gradient_accumulation_steps", 1))
+    return max(1, math.ceil(n_train_rows / eff))
 
 
 def _eval_steps(n_train_rows: int, config, evals_per_run: int) -> int:
@@ -404,7 +435,7 @@ def _eval_steps(n_train_rows: int, config, evals_per_run: int) -> int:
     longer in dev than in training. Tying the cadence to run length keeps it bounded
     whatever the dataset size.
     """
-    steps_per_epoch = math.ceil(n_train_rows / config.training_config.train_batch_size)
+    steps_per_epoch = _opt_steps_per_epoch(n_train_rows, config)
     # ceil, and no max(1, epochs): 0.333 epochs is a legitimate run length, and
     # clamping it to 1 would space the evals for a run 3x longer than the real one
     total = max(1, math.ceil(steps_per_epoch * float(config.training_config.num_epochs)))
@@ -1303,7 +1334,7 @@ def main():
         # would end training with NO checkpoint. Pin the length in steps (HF gives
         # max_steps precedence) and save exactly at that step, so the run ends with a
         # checkpoint-<max_steps> that _checkpoint_is_complete recognises as finished.
-        steps_per_epoch = math.ceil(len(train_dataset) / config.training_config.train_batch_size)
+        steps_per_epoch = _opt_steps_per_epoch(len(train_dataset), config)
         max_steps = max(1, math.ceil(steps_per_epoch * float(config.training_config.num_epochs)))
         epoch_kwargs = {"max_steps": max_steps}
         save_kwargs = {"save_strategy": "steps", "save_steps": max_steps}
@@ -1315,8 +1346,9 @@ def main():
         warmup_ratio=config.training_config.warmup_ratio,
         lr_scheduler_type=config.training_config.lr_scheduler_type,
         per_device_train_batch_size=config.training_config.train_batch_size,
+        gradient_accumulation_steps=config.training_config.gradient_accumulation_steps,
         per_device_eval_batch_size=config.training_config.eval_batch_size,
-        logging_steps=math.ceil(100 / config.training_config.train_batch_size),
+        logging_steps=max(1, math.ceil(100 / _eff_batch(config))),
         eval_strategy="steps", eval_steps=_eval_steps(len(train_dataset), config, args.evals_per_run),
         bf16=config.training_config.bf16,
         remove_unused_columns=False, report_to="wandb", **save_kwargs, **epoch_kwargs)
@@ -1335,7 +1367,7 @@ def main():
             schedule=config.training_config.intervention_anneal_schedule,
             start_frac=config.training_config.intervention_anneal_start_frac,
             end_frac=config.training_config.intervention_anneal_end_frac,
-            log_every=math.ceil(400 / config.training_config.train_batch_size)))
+            log_every=max(1, math.ceil(400 / _eff_batch(config)))))
 
     trainer = JointInterventionTrainer(
         model=model, tokenizer=tokenizer, signal_ranges=signal_ranges, args=training_args,
