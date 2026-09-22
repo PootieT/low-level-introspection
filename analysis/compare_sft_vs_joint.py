@@ -331,6 +331,36 @@ def plot_ood_ladder(frames: dict, out_dir, readout="endogenous", common_only=Tru
     print(f"[cmp] wrote {path}")
 
 
+def pretty_arm(label: str) -> str:
+    """Short, poster-friendly arm name, e.g. joint_free -> 'Joint Loss (KL=None)',
+    sft_gateoff -> 'SFT (Gate-off)'."""
+    if label.startswith("joint"):
+        if "free" in label:
+            kl = "None"
+        else:
+            m = KL_RE.search(label)
+            kl = m["kl"] if m else "?"
+        return f"Joint Loss (KL={kl})"
+    if label.startswith("sft"):
+        gate = "on" if "gateon" in label else "off" if "gateoff" in label else "?"
+        return f"SFT (Gate-{gate})"
+    return label
+
+
+def pretty_metric(metric: str) -> str:
+    """Short metric name for the colorbar, e.g. interventional_corr ->
+    'Interventional Corr.', ood_<corpus>_endogenous -> 'Endogenous Corr. (<corpus>)'."""
+    readout_names = {"interventional": "Interventional Corr.",
+                     "endogenous": "Endogenous Corr."}
+    if metric in ("interventional_corr", "endogenous_corr"):
+        return readout_names[metric.split("_")[0]]
+    if metric.startswith("ood_"):
+        parts = metric.split("_")
+        readout, corpus = parts[-1], "_".join(parts[1:-1])
+        return f"{readout_names.get(readout, readout.title() + ' Corr.')} ({corpus})"
+    return metric.replace("_", " ").title()
+
+
 def plot_delta_heatmap(merged, metric, label_a, label_b, out_dir):
     """Within-neuron delta by (layer, position) -- where does one arm win?"""
     ca, cb = f"{metric}_{label_a}", f"{metric}_{label_b}"
@@ -344,22 +374,20 @@ def plot_delta_heatmap(merged, metric, label_a, label_b, out_dir):
     # spread across the cell's neurons: a +0.3 mean built from neurons at +0.9 and -0.3
     # is a different claim from one where every neuron moved +0.3
     std = sub.pivot_table(index="layer", columns="position", values="delta", aggfunc="std")
-    cnt = sub.pivot_table(index="layer", columns="position", values="delta", aggfunc="count")
     annot = (pivot.round(2).astype(str) + "\n±" +
              std.round(2).fillna(0).astype(str))
     lim = float(np.nanmax(np.abs(pivot.to_numpy()))) or 1.0
     plt.figure(figsize=(2.0 * pivot.shape[1] + 5, 1.1 * pivot.shape[0] + 4))
+    # cells are annotated mean ± std (std over the cell's neurons, aggfunc="std")
     hm = sns.heatmap(pivot, cmap="RdBu_r", center=0, vmin=-lim, vmax=lim, annot=annot, fmt="",
-                annot_kws={"size": 14},
-                cbar_kws={"label": f"{metric}: {label_a} - {label_b}"})
-    hm.figure.axes[-1].yaxis.label.set_size(28)  # colorbar label
+                annot_kws={"size": 20},
+                cbar_kws={"label": f"Paired Diff. {pretty_metric(metric)} (Mean ± Std)"})
+    hm.figure.axes[-1].yaxis.label.set_size(24)  # colorbar label
     hm.figure.axes[-1].tick_params(labelsize=22)  # colorbar ticks
     hm.tick_params(axis="x", labelsize=30)
     hm.tick_params(axis="y", labelsize=30)
     plt.xlabel("token position", fontsize=38); plt.ylabel("layer", fontsize=38)
-    n_lo, n_hi = int(np.nanmin(cnt.to_numpy())), int(np.nanmax(cnt.to_numpy()))
-    plt.title(f"{metric}: {label_a} minus {label_b} (paired by neuron; mean ± std, "
-              f"n={n_lo}-{n_hi} per cell)", fontsize=40)
+    plt.title(f"{pretty_arm(label_a)} vs {pretty_arm(label_b)}", fontsize=36)
     plt.tight_layout()
     path = Path(out_dir) / f"delta_{metric}_{label_a}_vs_{label_b}.png"
     plt.savefig(path, dpi=150); plt.close()
