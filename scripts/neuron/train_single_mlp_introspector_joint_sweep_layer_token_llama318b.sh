@@ -5,7 +5,7 @@
 #$ -l gpus=1
 #$ -l gpu_c=8.5
 #$ -l gpu_memory=47G
-#$ -l h_rt=12:00:00
+#$ -l h_rt=36:00:00
 #$ -o log
 #$ -j y
 ###$ -m ea
@@ -68,7 +68,7 @@ set -e
 # DIFFERENT cell. (For a hard guarantee, run a cache-only pass first and submit the
 # training array with -hold_jid.)
 index=$(($SGE_TASK_ID-1))
-#index=11
+index=0
 LAYERS=(4 12 20 28)
 # N2.2566,N2.1886,N2.5949,N2.6998,N2.1447,N2.868,N2.1134,N2.1027,N2.8085,N2.1583
 POSS=(-1 -8 -20 -28)
@@ -102,7 +102,8 @@ LR=5e-5
 LORA_R=16
 LORA_ALPHA=$((LORA_R * 2))
 LORA_DO=0.0
-BS=32
+BS=16  # 32 is without accumulation
+ACCUM=2
 # the unanchored arm's achieved KL IS the cost map, so score more than one neuron
 # there to get an error bar on it; the anchored arm only needs a spot check
 if [ "$REGIME" = "unanchored" ]; then LM_SCORE_N=2; else LM_SCORE_N=1; fi
@@ -110,7 +111,7 @@ if [ "$REGIME" = "unanchored" ]; then LM_SCORE_N=2; else LM_SCORE_N=1; fi
 # minutes each, and the per-(cell, corpus) activation cache is built once and
 # shared by the cell's 5 neurons (and by both regimes).
 OOD_FLAG="--ood-eval"
-OVERWRITE=""
+OVERWRITE="--overwrite-cache"  # --overwrite-cache
 
 if [ "$GATE" = "on" ]; then GATE_FLAG="--disable-adapter-in-input"; else GATE_FLAG=""; fi
 
@@ -175,6 +176,7 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
       --test-token-selector $TOKEN_POS \
       --precision 3 \
       --train-batch-size $BS \
+      --gradient-accumulation-steps $ACCUM \
       --eval-batch-size 128 \
       --num-epochs 1 \
       --lora-r $LORA_R \
@@ -194,7 +196,7 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
 
   # builds the cell's 5-neuron dataset on first use, no-ops afterwards (shared by
   # both regimes, so the second array task for this cell never re-caches)
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python cache_signals.py --config "$CONFIG" #$OVERWRITE
 
   python train_introspector_joint.py \
       --config "$CONFIG" \
