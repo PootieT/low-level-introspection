@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1-19
+#$ -t 19
 
 # ============================================================================
 # LAYER GENERALIZATION: does the readout carry a layer it was never trained on?
@@ -157,6 +157,7 @@ else
   fi
   ROW=${SELECTED[$index]}
 fi
+
 read -r NAME R_GROUP LAYERS RPL EPOCHS LORA_R <<< "$ROW"
 LORA_ALPHA=$((LORA_R * 2))
 N_LAYERS=$(echo "$LAYERS" | tr ',' '\n' | wc -l | tr -d ' ')

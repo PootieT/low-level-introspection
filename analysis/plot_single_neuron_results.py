@@ -576,7 +576,7 @@ if __name__ == "__main__":
 
 
     # ---- endogenous (W=1.0) layer x token sweep -------------------------
-    EXP_GROUP = "mlp_endo_sweep_layer_token"
+    EXP_GROUP = "mlp_endo_sweep_layer_token_llama323b" # "mlp_endo_sweep_layer_token"
     OUT_DIR = f"{ROOT}/outputs/plots/{EXP_GROUP}"
 
     os.makedirs(OUT_DIR, exist_ok=True)

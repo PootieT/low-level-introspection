@@ -5,7 +5,7 @@
 #$ -l gpus=1
 #$ -l gpu_c=8.5
 #$ -l gpu_memory=47G
-#$ -l h_rt=24:00:00
+#$ -l h_rt=16:00:00
 #$ -o log
 #$ -j y
 ###$ -m ea
