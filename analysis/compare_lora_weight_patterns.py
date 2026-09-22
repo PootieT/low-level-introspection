@@ -269,24 +269,45 @@ def aggregate_targeted(t: pd.DataFrame, out_dir: Path):
 
 
 def plot_targeted_heatmaps(cell: pd.DataFrame, out_dir: Path):
-    """(signal layer x token position) maps of how far the target column stands out."""
-    for value, label, kw in (
-        ("percentile_mean", "target percentile among all columns", dict(vmin=0, vmax=100, cmap="viridis")),
-        ("rel_norm_ratio_mean", "||dW_target|| / ||dW_random|| (mean)", dict(cmap="magma")),
+    """(signal layer x token position) maps of how far the target column stands out.
+
+    Module panels share one colour scale and one colorbar (far right), so a colour
+    means the same thing across down/up/gate_proj and the panels stay comparable."""
+    for value, cbar_label, title, kw in (
+        ("percentile_mean", "Percentile",
+         "Neuron Index Relative Norm Percentile (Across Other Neurons)",
+         dict(vmin=0, vmax=100, cmap="viridis")),
+        ("rel_norm_ratio_mean", "Rel. Norm Ratio",
+         "Neuron Index Relative Norm Ratio (Target / Random)",
+         dict(cmap="magma")),
     ):
         modules = [m for m in ("down_proj", "up_proj", "gate_proj") if m in set(cell["module"])]
         if not modules or cell["position"].isna().all():
             continue
-        fig, axes = plt.subplots(1, len(modules), figsize=(5.2 * len(modules), 4.4), squeeze=False)
-        for ax, module in zip(axes.flat, modules):
+        kw = dict(kw)
+        if "vmin" not in kw:                       # shared scale across the module panels
+            vals = cell.loc[cell["module"].isin(modules), value].to_numpy(dtype=float)
+            kw["vmin"], kw["vmax"] = float(np.nanmin(vals)), float(np.nanmax(vals))
+
+        fig, axes = plt.subplots(1, len(modules), figsize=(5.2 * len(modules) + 1.4, 5.2),
+                                 squeeze=False, sharey=True, constrained_layout=True)
+        for i, (ax, module) in enumerate(zip(axes.flat, modules)):
             piv = (cell[cell["module"] == module]
                    .pivot(index="layer", columns="position", values=value).sort_index())
             annot = piv.round(1) if value == "percentile_mean" else piv.round(0)
-            sns.heatmap(piv, ax=ax, annot=annot, fmt="g", annot_kws={"size": 7},
-                        cbar_kws={"label": label}, **kw)
-            ax.set_title(module); ax.set_xlabel("token position"); ax.set_ylabel("signal layer")
-        fig.suptitle(f"Targeted-column test across the sweep: {label}", y=1.02)
-        fig.tight_layout()
+            sns.heatmap(piv, ax=ax, annot=annot, fmt="g", annot_kws={"size": 10},
+                        cbar=False, yticklabels=(i == 0), **kw)
+            ax.set_title(module, fontsize=14)
+            ax.set_xlabel("token position", fontsize=13)
+            ax.set_ylabel("signal layer" if i == 0 else "", fontsize=13)
+            ax.tick_params(axis="y", rotation=0, labelsize=11)   # horizontal -> no overlap
+            ax.tick_params(axis="x", labelsize=11)
+        # one shared colorbar to the right of the last panel
+        cbar = fig.colorbar(axes.flat[len(modules) - 1].collections[0],
+                            ax=axes.ravel().tolist(), fraction=0.046, pad=0.02)
+        cbar.set_label(cbar_label, fontsize=13)
+        cbar.ax.tick_params(labelsize=11)
+        fig.suptitle(title, fontsize=16)
         path = out_dir / f"lora_targeted_{value}.png"
         fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
         print(f"[lora] wrote {path}")
