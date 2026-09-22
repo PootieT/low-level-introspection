@@ -216,9 +216,22 @@ def plot_profiles_grouped(df, out_dir, group_col="signal_layer", x="rel_depth",
         else:
             ax.set_ylabel("||dW||_F (absolute)"); ax.set_yscale("log")
         ax.grid(alpha=0.25)
-    for ax in axes.flat[len(modules):]:
-        ax.set_visible(False)
-    axes.flat[0].legend(fontsize=8)
+    # Park the legend in the first empty grid slot (7 modules -> the 8th cell is free),
+    # so it never covers a panel; fall back to the first panel if the grid is full.
+    empties = list(axes.flat[len(modules):])
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    if empties and handles:
+        leg_ax, *rest = empties
+        leg_ax.axis("off")
+        leg_ax.legend(handles, labels, loc="center", fontsize=13, title=group_col,
+                      frameon=False)
+        for ax in rest:
+            ax.set_visible(False)
+    else:
+        for ax in empties:
+            ax.set_visible(False)
+        if handles:
+            axes.flat[0].legend(fontsize=8)
     fig.suptitle(f"LoRA update magnitude by module, mean over sweep (grouped by {group_col})", y=1.01)
     fig.tight_layout()
     suffix = "" if value == "frob_norm" else "_abs"
@@ -380,9 +393,21 @@ def plot_profiles(df, out_dir, x="rel_depth", value="frob_norm"):
             ax.set_ylabel("||dW||_F (absolute)")
             ax.set_yscale("log")
         ax.grid(alpha=0.25)
-    for ax in axes.flat[len(modules):]:
-        ax.set_visible(False)
-    axes.flat[0].legend(fontsize=8)
+    # Legend in the first empty grid slot (see plot_profiles_grouped), not over a panel.
+    empties = list(axes.flat[len(modules):])
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    if empties and handles:
+        leg_ax, *rest = empties
+        leg_ax.axis("off")
+        leg_ax.legend(handles, labels, loc="center", fontsize=12, title="condition",
+                      frameon=False)
+        for ax in rest:
+            ax.set_visible(False)
+    else:
+        for ax in empties:
+            ax.set_visible(False)
+        if handles:
+            axes.flat[0].legend(fontsize=8)
     scale = "per-condition normalized" if value == "frob_norm" else "ABSOLUTE (log)"
     fig.suptitle(f"LoRA update magnitude by module [{scale}]"
                  + (", aligned on the signal layer (0 = where the signal is read)"
