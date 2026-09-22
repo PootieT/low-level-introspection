@@ -5,7 +5,7 @@
 #$ -l gpus=1
 #$ -l gpu_c=8.5
 #$ -l gpu_memory=47G
-#$ -l h_rt=12:00:00
+#$ -l h_rt=18:00:00
 #$ -o log
 #$ -j y
 ###$ -m ea
@@ -110,7 +110,7 @@ if [ "$REGIME" = "unanchored" ]; then LM_SCORE_N=2; else LM_SCORE_N=1; fi
 # minutes each, and the per-(cell, corpus) activation cache is built once and
 # shared by the cell's 5 neurons (and by both regimes).
 OOD_FLAG="--ood-eval"
-OVERWRITE=""
+OVERWRITE=""  # --overwrite-cache
 
 if [ "$GATE" = "on" ]; then GATE_FLAG="--disable-adapter-in-input"; else GATE_FLAG=""; fi
 
