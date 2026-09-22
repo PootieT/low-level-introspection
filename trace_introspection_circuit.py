@@ -14,20 +14,40 @@ Two analyses (both leverage that the source is a known scalar injected at
      components whose contribution moves with `v` carry the signal. Attention is
      refined per-head to localize the cross-position "mover".
 
-  2. DECODABILITY MAP over (layer, position).
-     Fit a linear probe resid -> v at every layer x {token_position, last_token};
-     the correlation map shows where the injected value is present and where it
-     arrives at the last token.
+  2. DECODABILITY MAP over (layer, probe position).
+     Fit a linear probe resid -> v at every layer x probe position; the map shows
+     where the injected value is present and where it arrives at the readout.
+
+     THE PROBE POSITIONS ARE THE CONTROL. "The value is decodable at the
+     introspected token" is not evidence of anything on its own -- a probe with 2048
+     free parameters and a few hundred rows can find structure in noise, and every
+     position downstream of the injection is contaminated by construction. So the
+     map is read as a CONTRAST between positions with different causal status
+     (see PROBE_SPECS):
+       t-1        the causal null. Strictly BEFORE the injection, so it cannot carry
+                  v under causal attention. Whatever decodability appears here is
+                  the probe's own floor, and every other number is only interesting
+                  above it.
+       t          the origin.
+       t+1..t+3   downstream of the origin. NOT a null: these say whether the
+                  private channel is broadcast to every later token (high) or only
+                  pulled at the readout (low) -- which is exactly the question the
+                  position-generalization result raises.
+       last-3..last  the readout end. `last` is where the regression head reads.
 
 Everything is config-driven (model / dataset / signal / checkpoint all come from
 the experiment config) so future runs only swap the --config (+ optional CLI
-overrides).
+overrides), and --group runs the whole sweep, writing per-run results under each
+run directory for later aggregation.
 
 Example
 -------
 python trace_introspection_circuit.py \
     --config experiment_configs/.../intervention_train_reg_N10.24_3K_fixedPaddingBug.json \
     --n-examples 200 --grid-points 10 --start-layer 10
+
+python trace_introspection_circuit.py \
+    --group mlp_joint_grid_layer_token --run-glob 'joint_*kl0.1*' --skip-existing
 """
 from __future__ import annotations
 
@@ -42,43 +62,80 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from datasets import load_from_disk
-from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from generate_experiment_config import load_spec  # noqa: F401 (kept for parity/imports)
 from src.introspector.config import ExperimentConfig
+from src.introspector.analysis_loading import (
+    load_run_for_analysis, absolute_positions, layer_output_is_tuple)
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
-from src.introspector.prompts import PROMPT_REGISTRY
-from src.introspector.training.collator import LoRAGatingCollator
-from src.introspector.training.model import (
-    IntrospectionRegressionModel,
-    load_regression_head,
-    load_added_token_embeddings,
-    replace_model_with_gated_version,
-    replace_lora_with_gated_version,
-)
-from train_introspector import preprocess_example, INTROSPECTION_SEPARATOR
+from src.introspector.run_discovery import add_discovery_args, runs_from_args
 
 from nnsight.modeling.language import LanguageModel
+
+
+# ======================================================================
+# Probe positions for the decodability map (analysis 2)
+# ======================================================================
+# (label, anchor, offset). anchor "origin" is the introspected token t; anchor "last"
+# is the final token of the sequence, where the regression head reads. See the module
+# docstring for what each one is FOR -- t-1 is the null every other number is read
+# against, t+1..t+3 separate a broadcast channel from one that is only pulled at the
+# readout, and the last-k tail shows where the value arrives.
+PROBE_SPECS = [
+    ("t-1", "origin", -1),
+    ("t", "origin", 0),
+    ("t+1", "origin", 1),
+    ("t+2", "origin", 2),
+    ("t+3", "origin", 3),
+    ("last-3", "last", -3),
+    ("last-2", "last", -2),
+    ("last-1", "last", -1),
+    ("last", "last", 0),
+]
+
+
+def probe_positions(abs_pos, attention_mask):
+    """
+    Absolute index of every probe position, per row, plus a validity mask.
+
+    abs_pos: [B] the introspected token, already left-pad corrected.
+    Returns (pos [B, P] long, valid [B, P] bool).
+
+    A position is valid when it lies inside the real (non-padding) sequence. With
+    LEFT padding the sequence occupies [num_left_pad, seq_len), so `t-1` on a row whose
+    introspected token is the very first one falls into padding and is dropped for that
+    row rather than silently probing a pad embedding.
+    """
+    bs, seq_len = attention_mask.shape
+    num_left_pad = (attention_mask == 0).sum(dim=1).to(abs_pos.device)
+    last = torch.full_like(abs_pos, seq_len - 1)
+    cols = []
+    for _, anchor, off in PROBE_SPECS:
+        base = abs_pos if anchor == "origin" else last
+        cols.append(base + off)
+    pos = torch.stack(cols, dim=1)
+    valid = (pos >= num_left_pad.unsqueeze(1)) & (pos <= (seq_len - 1))
+    # clamp so the gather is always in range; invalid entries are masked out after
+    return pos.clamp(min=0, max=seq_len - 1), valid
 
 
 # ======================================================================
 # Args
 # ======================================================================
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--config", type=Path, required=True,
-                   help="Experiment config used to train the introspector.")
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoint", type=Path, default=None,
                    help="Checkpoint dir override (default: latest under output_dir/experiment_name).")
-    p.add_argument("--signal-idx", type=int, default=0,
-                   help="Which entry of config.train_signals to trace (default: 0).")
     # example selection
     p.add_argument("--n-examples", type=int, default=200,
                    help="Number of endogenous-success examples to trace.")
+    p.add_argument("--probe-examples", type=int, default=150,
+                   help="Examples kept for the decodability captures (analysis 2). The "
+                        "residual at every (layer, probe position) is held in memory for "
+                        "every example x grid point, so this is the memory knob; the "
+                        "attribution (analysis 1) still uses all --n-examples.")
     p.add_argument("--success-threshold", type=float, default=0.02,
                    help="Keep examples with |endogenous_pred - true_activation| <= this.")
     p.add_argument("--max-scan", type=int, default=None,
@@ -93,75 +150,30 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--output-dir", type=Path, default=None)
+    p.add_argument("--output-dir", type=Path, default=None,
+                   help="Single-run override. A --group sweep always writes into each "
+                        "run's own directory (<run>/circuit_trace/) so the aggregator "
+                        "can find results per run.")
+    add_discovery_args(p)
     return p.parse_args()
 
 
 # ======================================================================
-# Loading (reuses the training script's building blocks)
+# Loading
 # ======================================================================
-def compute_signal_ranges(train_dataset_raw):
-    df = train_dataset_raw.to_pandas()
-    grouped = df.groupby(["signal_layer", "signal_index"])["activation"]
-    ranges = {}
-    for key, vals in grouped:
-        ranges[key] = {"min": float(vals.min()), "max": float(vals.max()),
-                       "mean": float(vals.mean()), "std": float(vals.std())}
-    return ranges
-
-
 def load_model_and_data(config: ExperimentConfig, checkpoint: Path):
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name, local_files_only=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.add_special_tokens({"additional_special_tokens": [INTROSPECTION_SEPARATOR]})
+    """
+    (model, tokenizer, test_dataset, test_raw, collator, signal_ranges).
 
-    cache_dir = Path(config.cache_dir) / config.experiment_name
-    train_raw = load_from_disk(str(cache_dir / "train"))
-    test_raw = load_from_disk(str(cache_dir / "test"))
-    signal_ranges = compute_signal_ranges(train_raw)
-
-    base = AutoModelForCausalLM.from_pretrained(
-        config.model_name, device_map="auto", local_files_only=True,
-        torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32,
-    )
-    base.resize_token_embeddings(len(tokenizer))
-    peft_model = PeftModel.from_pretrained(base, str(checkpoint), autocast_adapter_dtype=False)
-
-    if not config.use_regressor:
-        raise SystemExit("This tracer targets the regressor head (config.use_regressor must be True).")
-    model = IntrospectionRegressionModel(
-        peft_model,
-        signal_ranges=signal_ranges,
-        intervention_distribution=config.training_config.intervention_signal_distribution,
-        intervention_extreme_scale=config.training_config.intervention_extreme_scale,
-    )
-    load_regression_head(model, str(checkpoint))
-    # no-op unless the checkpoint's frozen embeddings were stripped to save disk
-    load_added_token_embeddings(model, str(checkpoint))
-    replace_model_with_gated_version(model)
-    replace_lora_with_gated_version(model)
-    model.eval()
-
-    def preprocess(ex):
-        out = preprocess_example(
-            ex, tokenizer=tokenizer,
-            prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
-            max_length=config.training_config.max_seq_length,
-            return_frozen_input_len=True, for_prediction=True,
-        )
-        out["token_position"] = ex["token_position"]
-        out["signal_layer"] = ex["signal_layer"]
-        out["signal_index"] = ex["signal_index"]
-        out["activation"] = ex["activation"]
-        return out
-
-    test_dataset = test_raw.map(preprocess, remove_columns=test_raw.column_names)
-    pred_collator = LoRAGatingCollator(
-        tokenizer=tokenizer, model=model, padding=True,
-        label_pad_token_id=-100, return_tensors="pt", for_prediction=True,
-    )
-    return model, tokenizer, test_dataset, test_raw, pred_collator, signal_ranges
+    A thin wrapper over the shared loader, kept because ablate_lora_modules.py imports
+    it. The loading itself moved to src.introspector.analysis_loading, which fixed two
+    things this copy got wrong for every sweep run: the cache path (shared caches are
+    keyed by dataset_name, not experiment_name, and the run's neuron is selected with
+    signal_filter) and the collator (a gate-off run analyzed with the gated collator
+    has its adapter disabled over the input text -- i.e. at the origin token).
+    """
+    run = load_run_for_analysis(config, checkpoint=checkpoint)
+    return (run.model, run.tokenizer, run.dataset, run.raw, run.collator, run.signal_ranges)
 
 
 # ======================================================================
@@ -306,7 +318,8 @@ def nnsight_module_handles(lm, inject_layer):
 
 @torch.no_grad()
 def trace_batch(lm, layers, embed, norm, inputs, abs_pos, inject_layer, inject_path,
-                neuron, v, n_layers, start_layer):
+                neuron, v, n_layers, start_layer, probe_pos=None, capture_probes=True,
+                layer_out_tuple=False):
     """
     One injected forward. Modules are accessed in COMPUTATIONAL-PATH ORDER
     (embed -> for each layer: attention block -> [inject at signal layer] -> mlp
@@ -315,14 +328,27 @@ def trace_batch(lm, layers, embed, norm, inputs, abs_pos, inject_layer, inject_p
     module path) between the attention write and the MLP that consumes the neuron.
 
     Returns last-token component writes (embed, per-layer attn/mlp), per-layer
-    residuals at (inject position, last token), o_proj inputs (>= start_layer),
-    the pre-norm final residual, and the post-norm hidden.
+    residuals at every PROBE position (`probe_pos`: [B, P] absolute indices, from
+    probe_positions()), o_proj inputs (>= start_layer), the pre-norm final residual,
+    and the post-norm hidden.
+
+    Probe residuals come back in fp16: they exist to be fed to a ridge probe over
+    2048 dimensions, where fp16 is far below the noise floor, and at P=9 positions x
+    16 layers x every (example, grid point) the fp32 version is the memory budget of
+    the whole script. The attribution captures stay fp32 -- those are differenced and
+    summed against an exactness check.
+
     `inputs` must contain ONLY input_ids/attention_mask/lora_token_mask so the
     model's own intervention path does not also fire.
+
+    `layer_out_tuple` says whether a decoder layer returns `(hidden, ...)` or the bare
+    tensor -- it differs between transformers 4.x and 5.x, so it is DETECTED per run
+    (see analysis_loading.layer_output_is_tuple) rather than assumed here.
     """
     bs = inputs["input_ids"].shape[0]
     bidx = torch.arange(bs, device=abs_pos.device)
-    attn, mlp, resid_inj, resid_last, oproj = {}, {}, {}, {}, {}
+    attn, mlp, resid_last, oproj, probes = {}, {}, {}, {}, {}
+    probe_bidx = bidx.unsqueeze(1) if probe_pos is not None else None
     with lm.trace(inputs):
         emb = embed.output[bidx, -1, :].save()
         for L in range(n_layers):
@@ -337,9 +363,12 @@ def trace_batch(lm, layers, embed, norm, inputs, abs_pos, inject_layer, inject_p
                 operator.attrgetter(inject_path)(lm)[bidx, abs_pos, neuron] = v
             # --- mlp block ---
             mlp[L] = layer.mlp.output[bidx, -1, :].save()
-            # --- residual after the layer (both positions, for decodability) ---
-            resid_inj[L] = layer.output[bidx, abs_pos, :].save()
-            resid_last[L] = layer.output[bidx, -1, :].save()
+            # --- residual after the layer ---
+            resid = layer.output[0] if layer_out_tuple else layer.output
+            resid_last[L] = resid[bidx, -1, :].save()
+            if capture_probes and probe_pos is not None:
+                # [B, P, H]: every probe position in one gather
+                probes[L] = resid[probe_bidx, probe_pos, :].save()
         normed = norm.output[bidx, -1, :].save()
 
     val = lambda p: p.value if hasattr(p, "value") else p
@@ -349,8 +378,7 @@ def trace_batch(lm, layers, embed, norm, inputs, abs_pos, inject_layer, inject_p
         "mlp": {L: val(t).float().cpu() for L, t in mlp.items()},
         "final_resid": val(resid_last[n_layers - 1]).float().cpu(),
         "normed": val(normed).float().cpu(),
-        "resid_inj": {L: val(t).float().cpu() for L, t in resid_inj.items()},
-        "resid_last": {L: val(t).float().cpu() for L, t in resid_last.items()},
+        "resid_probe": {L: val(t).half().cpu() for L, t in probes.items()},
         "oproj": {L: val(t).float().cpu() for L, t in oproj.items()},
     }
 
@@ -358,28 +386,16 @@ def trace_batch(lm, layers, embed, norm, inputs, abs_pos, inject_layer, inject_p
 # ======================================================================
 # Main
 # ======================================================================
-def main():
-    args = parse_args()
-    config = ExperimentConfig.model_validate_json(args.config.read_text())
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-
-    checkpoint = args.checkpoint
-    if checkpoint is None:
-        ckpts = glob.glob(str(Path(config.output_dir) / config.experiment_name / "checkpoint-*"))
-        if not ckpts:
-            raise SystemExit("No checkpoint found; pass --checkpoint.")
-        checkpoint = Path(max(ckpts, key=os.path.getctime))
-    out_dir = args.output_dir or (Path(config.output_dir) / config.experiment_name / "circuit_trace")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    signal = config.train_signals[args.signal_idx]
-    inject_layer, neuron = signal.layer, signal.index
+def trace_one_run(run, args, out_dir: Path):
+    """The whole trace for ONE loaded run, into `out_dir`."""
+    config, checkpoint = run.config, run.checkpoint
+    model, tokenizer = run.model, run.tokenizer
+    test_dataset, collator, signal_ranges = run.dataset, run.collator, run.signal_ranges
+    inject_layer, neuron, signal_type = run.layer, run.index, run.signal_type
     start_layer = args.start_layer if args.start_layer is not None else inject_layer
-    print(f"[trace] signal={signal} inject_layer={inject_layer} neuron={neuron} "
-          f"start_layer={start_layer} checkpoint={checkpoint}")
+    print(f"[trace] signal=N{inject_layer}.{neuron} inject_layer={inject_layer} "
+          f"neuron={neuron} start_layer={start_layer} checkpoint={checkpoint}")
 
-    model, tokenizer, test_dataset, test_raw, collator, signal_ranges = load_model_and_data(config, checkpoint)
     device = model.device
     hf = model.get_base_model()                       # underlying LlamaForCausalLM
     n_layers = hf.config.num_hidden_layers
@@ -408,34 +424,47 @@ def main():
     print(f"[trace] v-grid: {args.grid_points} points in [{lo:.4f}, {hi:.4f}] "
           f"(neuron mean={stats['mean']:.4f} std={stats['std']:.4f})")
 
+    # transformers 4.x decoder layers return (hidden, ...), 5.x returns the tensor;
+    # every residual capture below has to index the right one
+    layer_out_tuple = layer_output_is_tuple(model)
+    print(f"[trace] decoder layer output is {'a tuple' if layer_out_tuple else 'a bare tensor'}")
+
     lm = LanguageModel(model, tokenizer=tokenizer)
     layers, embed, norm = nnsight_module_handles(lm, inject_layer)
-    inject_path = resolve_signal_injection_path(lm, signal.type, inject_layer)
+    inject_path = resolve_signal_injection_path(lm, signal_type, inject_layer)
 
     # accumulators indexed [example, grid_point]
     comp_names = ["embed"] + [f"attn_{L}" for L in range(n_layers)] + [f"mlp_{L}" for L in range(n_layers)]
     contribs = {c: [] for c in comp_names}                       # each -> list over grid of [Nexp]
     head_contribs = {L: [] for L in range(start_layer, n_layers)}  # -> list over grid of [Nexp, n_heads]
     pred_check = []                                              # [grid][Nexp]
-    resid_inj = {L: [] for L in range(n_layers)}                # decodability
-    resid_last = {L: [] for L in range(n_layers)}
+    n_probe_rows = min(args.probe_examples, len(sub))
+    resid_probe = {L: [] for L in range(n_layers)}               # decodability: [Nprobe, P, H]
+    probe_valid, probe_region = None, None                       # set on the first grid pass
 
     from torch.utils.data import DataLoader
     for gi, v in enumerate(grid):
         dl = DataLoader(sub, batch_size=args.batch_size, collate_fn=collator, shuffle=False)
         g_contribs = {c: [] for c in comp_names}
         g_head = {L: [] for L in range(start_layer, n_layers)}
-        g_pred, g_ri, g_rl = [], {L: [] for L in range(n_layers)}, {L: [] for L in range(n_layers)}
+        g_pred, g_probe = [], {L: [] for L in range(n_layers)}
+        g_valid, g_region, row0 = [], [], 0
         for batch in dl:
             batch = batch.to(device)
             attn_mask = batch["attention_mask"]
             token_pos = batch["token_position"]
-            abs_pos = token_pos + (attn_mask == 0).sum(dim=1)         # left-pad offset fix
+            abs_pos = absolute_positions(token_pos, attn_mask)        # left-pad offset fix
+            ppos, pvalid = probe_positions(abs_pos, attn_mask)        # [b,P] each
+            # probe captures are the memory budget, so only the first --probe-examples
+            # rows of the (sequential, unshuffled) split contribute to analysis 2
+            keep = max(0, min(ppos.shape[0], n_probe_rows - row0))
             trace_inputs = {"input_ids": batch["input_ids"],
                             "attention_mask": attn_mask,
                             "lora_token_mask": batch.get("lora_token_mask")}
             cap = trace_batch(lm, layers, embed, norm, trace_inputs, abs_pos,
-                              inject_layer, inject_path, neuron, float(v), n_layers, start_layer)
+                              inject_layer, inject_path, neuron, float(v), n_layers, start_layer,
+                              probe_pos=ppos, capture_probes=keep > 0,
+                              layer_out_tuple=layer_out_tuple)
 
             a = readout_scale(cap["final_resid"], w, gamma, eps)      # [b,H]
             g_contribs["embed"].append(contribution(a, cap["embed"]))
@@ -446,8 +475,18 @@ def main():
                 g_head[L].append(per_head_contributions(cap["oproj"][L], W_O[L], n_heads, head_dim, a))
             # head prediction (from post-norm hidden) for the decomposition sanity check
             g_pred.append((cap["normed"] * w).sum(-1) + bias)
-            for L in range(n_layers):
-                g_ri[L].append(cap["resid_inj"][L]); g_rl[L].append(cap["resid_last"][L])
+            if keep > 0:
+                for L in range(n_layers):
+                    g_probe[L].append(cap["resid_probe"][L][:keep])
+                if gi == 0:
+                    g_valid.append(pvalid[:keep].cpu())
+                    # region mask: 0 = input text, 1 = introspection prompt. The gated
+                    # collator calls it lora_token_mask, the ungated one keeps the same
+                    # tensor as anchor_region_mask (it is not a model input there).
+                    region = batch.get("lora_token_mask", batch.get("anchor_region_mask"))
+                    if region is not None:
+                        g_region.append(torch.gather(region, 1, ppos)[:keep].cpu())
+            row0 += ppos.shape[0]
 
         for c in comp_names:
             contribs[c].append(torch.cat(g_contribs[c]))
@@ -455,7 +494,11 @@ def main():
             head_contribs[L].append(torch.cat(g_head[L]))
         pred_check.append(torch.cat(g_pred))
         for L in range(n_layers):
-            resid_inj[L].append(torch.cat(g_ri[L])); resid_last[L].append(torch.cat(g_rl[L]))
+            if g_probe[L]:
+                resid_probe[L].append(torch.cat(g_probe[L]))
+        if gi == 0:
+            probe_valid = torch.cat(g_valid) if g_valid else None
+            probe_region = torch.cat(g_region) if g_region else None
         print(f"[trace] grid {gi + 1}/{len(grid)} (v={float(v):+.4f}) done")
 
     # stack -> [Nexp, grid]
@@ -502,28 +545,88 @@ def main():
     pd.DataFrame(head_rows).to_csv(out_dir / "attribution_heads.csv", index=False)
 
     # ======================= Analysis 2: decodability =======================
+    # One probe per (layer, probe position). The row order is example-major
+    # ([Nprobe, grid] flattened row-major), which is what makes decodability()'s
+    # 70/30 split a split BY EXAMPLE -- the same example at a different grid point
+    # must never appear on both sides, or the probe scores its own memory.
+    probe_labels = [lbl for lbl, _, _ in PROBE_SPECS]
+    n_probe = len(probe_labels)
     dec_rows = []
-    dec_mat = np.zeros((n_layers, 2))  # cols: [token_position, last_token]
+    dec_mat = np.full((n_layers, n_probe), np.nan)
     for L in range(n_layers):
-        Xi = torch.stack(resid_inj[L], 1).reshape(-1, resid_inj[L][0].shape[-1]).numpy()
-        Xl = torch.stack(resid_last[L], 1).reshape(-1, resid_last[L][0].shape[-1]).numpy()
-        y = np.tile(v_np, Nexp)  # matches reshape order [Nexp, grid] -> row-major
-        ci = decodability(Xi, y); cl = decodability(Xl, y)
-        dec_mat[L] = [ci, cl]
-        dec_rows.append({"layer": L, "corr_token_position": ci, "corr_last_token": cl})
-    pd.DataFrame(dec_rows).to_csv(out_dir / "decodability.csv", index=False)
+        if not resid_probe[L]:
+            continue
+        X_all = torch.stack(resid_probe[L], 1).float()          # [Nprobe, grid, P, H]
+        for pi, label in enumerate(probe_labels):
+            ok = probe_valid[:, pi] if probe_valid is not None else None
+            rows = torch.ones(X_all.shape[0], dtype=torch.bool) if ok is None else ok
+            n_rows = int(rows.sum())
+            if n_rows < 20:          # too few valid examples to fit anything
+                dec_rows.append({"layer": L, "probe": label, "corr": float("nan"),
+                                 "n_examples": n_rows, "frac_prompt_region": float("nan")})
+                continue
+            X = X_all[rows, :, pi, :].reshape(-1, X_all.shape[-1]).numpy()
+            y = np.tile(v_np, n_rows)
+            c = decodability(X, y)
+            dec_mat[L, pi] = c
+            frac = (float(probe_region[rows, pi].float().mean())
+                    if probe_region is not None else float("nan"))
+            dec_rows.append({"layer": L, "probe": label, "corr": c,
+                             "n_examples": n_rows, "frac_prompt_region": frac})
+    dec_df = pd.DataFrame(dec_rows)
+    dec_df.to_csv(out_dir / "decodability.csv", index=False)
+    if not dec_df.empty:
+        null = dec_df[dec_df["probe"] == "t-1"]["corr"]
+        print(f"[trace] decodability: max over (layer, probe) = {dec_df['corr'].max():.3f}; "
+              f"causal null (t-1) max = {null.max() if len(null) else float('nan'):.3f} "
+              f"-- read every other cell against that floor")
 
     # ============================ plots ============================
     _plot_attribution(attr_df, n_layers, start_layer, inject_layer, out_dir)
     _plot_heads(head_slope_mat, start_layer, n_layers, n_heads, out_dir)
-    _plot_decodability(dec_mat, n_layers, inject_layer, out_dir)
+    _plot_decodability(dec_mat, probe_labels, n_layers, inject_layer, out_dir)
 
     with open(out_dir / "trace_meta.json", "w") as f:
-        json.dump({"checkpoint": str(checkpoint), "signal": str(signal),
-                   "inject_layer": inject_layer, "neuron": neuron, "start_layer": start_layer,
-                   "n_examples": Nexp, "grid": v_np.tolist(),
-                   "decomposition_max_err": max_err}, f, indent=2)
+        json.dump({"run": config.experiment_name, "checkpoint": str(checkpoint),
+                   "signal": f"N{inject_layer}.{neuron}", "signal_type": signal_type,
+                   "inject_layer": inject_layer, "neuron": neuron,
+                   "token_position": (config.test_token_selector.position
+                                      if config.test_token_selector.type == "fixed" else None),
+                   "start_layer": start_layer, "n_examples": Nexp,
+                   "n_probe_examples": n_probe_rows, "probe_labels": probe_labels,
+                   "grid": v_np.tolist(), "decomposition_max_err": max_err,
+                   "e2e_corr_pred_vs_v": float(e2e)}, f, indent=2)
     print(f"[trace] wrote results to {out_dir}")
+
+
+def main():
+    args = parse_args()
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+
+    runs = runs_from_args(args)
+    if not runs:
+        raise SystemExit("No runs with checkpoints matched.")
+    sweeping = len(runs) > 1 or args.group is not None
+    for k, spec in enumerate(runs, 1):
+        # a sweep writes into each run's own directory, so results stay next to the run
+        # they describe and the aggregator can find them by globbing run dirs
+        out_dir = ((args.output_dir or (spec.run_dir / "circuit_trace")) if not sweeping
+                   else spec.run_dir / "circuit_trace")
+        if args.skip_existing and (out_dir / "decodability.csv").exists():
+            print(f"[trace] [{k}/{len(runs)}] {spec.name}: results exist, skipping")
+            continue
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n[trace] ===== [{k}/{len(runs)}] {spec.name} ({spec.cell}) =====")
+        run = load_run_for_analysis(spec.config, checkpoint=args.checkpoint or spec.checkpoint())
+        try:
+            trace_one_run(run, args, out_dir)
+        finally:
+            # a sweep loads one model per run; without this the previous run's weights
+            # stay resident and the second checkpoint OOMs on a single GPU
+            del run
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def _plot_attribution(attr_df, n_layers, start_layer, inject_layer, out_dir):
@@ -554,15 +657,20 @@ def _plot_heads(mat, start_layer, n_layers, n_heads, out_dir):
     plt.close()
 
 
-def _plot_decodability(mat, n_layers, inject_layer, out_dir):
-    plt.figure(figsize=(4, max(4, 0.35 * n_layers)))
-    sns.heatmap(mat, cmap="viridis", vmin=0, vmax=1, annot=True, fmt=".2f",
-                yticklabels=list(range(n_layers)),
-                xticklabels=["token_position", "last_token"],
-                cbar_kws={"label": "probe corr (v decodability)"})
+def _plot_decodability(mat, probe_labels, n_layers, inject_layer, out_dir):
+    plt.figure(figsize=(1.0 * len(probe_labels) + 3, max(4, 0.35 * n_layers)))
+    ax = sns.heatmap(mat, cmap="viridis", vmin=0, vmax=1, annot=True, fmt=".2f",
+                     annot_kws={"size": 7},
+                     yticklabels=list(range(n_layers)), xticklabels=probe_labels,
+                     cbar_kws={"label": "probe corr (v decodability)"})
     plt.axhline(inject_layer + 0.5, color="w", ls="--", lw=1)
-    plt.ylabel("layer")
-    plt.title("Injected-value decodability by (layer, position)")
+    # the causal null: nothing left of this line can carry v, so its column is the
+    # floor the rest of the map is read against
+    if "t-1" in probe_labels:
+        ax.axvline(probe_labels.index("t-1") + 1, color="w", ls=":", lw=1.5)
+    plt.ylabel("layer"); plt.xlabel("probe position")
+    plt.title("Injected-value decodability by (layer, probe position)\n"
+              "t-1 = causal null | t = origin | last = readout", fontsize=10)
     plt.tight_layout()
     plt.savefig(out_dir / "decodability.png", dpi=150)
     plt.close()

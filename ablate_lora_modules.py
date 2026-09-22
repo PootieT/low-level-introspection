@@ -14,8 +14,17 @@ Reading each cell as Delta = corr(ablated) - corr(baseline):
     endogenous prediction (a "blocker").
 
 Baseline (nothing ablated) and all-LoRA-off rows are included as references.
+WHICH INJECTION REGIME THE DELTA IS MEASURED IN matters more than it looks. This
+used to score the interventional arm at gaussian scale=1 always. For a run trained
+with a 10x injection that is the wrong operating point: its own scale sweep puts the
+head at ~0.19 there against ~0.98 at scale 10, so an ablation delta is a difference
+between two numbers that are mostly noise, and a module that matters can read as
+doing nothing. The default is now the regime the run was TRAINED in (--interv-scale /
+--interv-distribution to override), where the baseline is near ceiling and a drop is
+unambiguous.
+
 Config-driven (model/dataset/signal/checkpoint from --config) so future runs
-just swap the config.
+just swap the config, and --group ablates a whole sweep.
 
 Example
 -------
@@ -42,7 +51,9 @@ import seaborn as sns
 from torch.utils.data import DataLoader
 
 from src.introspector.config import ExperimentConfig
-from trace_introspection_circuit import load_model_and_data, endogenous_predictions, select_success_indices
+from src.introspector.analysis_loading import load_run_for_analysis
+from src.introspector.run_discovery import add_discovery_args, runs_from_args
+from trace_introspection_circuit import endogenous_predictions, select_success_indices
 
 MODULE_ORDER = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 LAYER_RE = re.compile(r"layers\.(\d+)\.")
@@ -50,8 +61,8 @@ MODULE_RE = re.compile(r"\.((?:q|k|v|o|gate|up|down)_proj)$")
 
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--config", type=Path, required=True)
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoint", type=Path, default=None,
                    help="Checkpoint dir override (default: latest under output_dir/experiment_name).")
     p.add_argument("--no-success-filter", action="store_true", help="Disable success sample filtering.")
@@ -66,7 +77,15 @@ def parse_args():
     p.add_argument("--modules", type=str, default=None,
                    help="Comma-separated module names to ablate (default: all present).")
     p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--output-dir", type=Path, default=None)
+    p.add_argument("--interv-distribution", type=str, default="auto",
+                   help="Injection distribution for the interventional arm. 'auto' (default) "
+                        "uses the one the run was TRAINED with -- see the module docstring "
+                        "for why the old fixed gaussian@1 hid real effects.")
+    p.add_argument("--interv-scale", type=float, default=None,
+                   help="Injection scale for the interventional arm (default: the run's own).")
+    p.add_argument("--output-dir", type=Path, default=None,
+                   help="Single-run override; a sweep always writes to <run>/lora_ablation/.")
+    add_discovery_args(p)
     return p.parse_args()
 
 
@@ -137,12 +156,24 @@ def _corr(pred, target):
     return float(pearsonr(p, t)[0])
 
 
-def eval_corrs(model, dataset, collator, config):
-    """(interventional@gaussian scale=1 corr, endogenous corr) for current model state."""
+def resolve_injection_regime(config, distribution="auto", scale=None):
+    """(distribution, scale) the interventional arm is scored at -- the run's own
+    training regime unless overridden. See the module docstring."""
+    tc = config.training_config
+    if distribution == "auto":
+        distribution = tc.intervention_signal_distribution
+    if scale is None:
+        scale = tc.intervention_extreme_scale if distribution == "extreme" else 1.0
+    return distribution, float(scale)
+
+
+def eval_corrs(model, dataset, collator, config, distribution="gaussian", scale=1.0):
+    """(interventional corr at the given regime, endogenous corr) for current state."""
     bs = config.training_config.eval_batch_size
-    # interventional (endogenous-matched gaussian, scale=1), reproducibly seeded
+    # reproducibly seeded so every ablated variant sees the SAME injected values --
+    # otherwise the delta would include the sampler's noise
     prev_dist, prev_scale = model.intervention_distribution, model.intervention_scale
-    model.intervention_distribution, model.intervention_scale = "gaussian", 1.0
+    model.intervention_distribution, model.intervention_scale = distribution, scale
     model.seed_intervention_rng(config.seed)
     p_iv, y_iv = predict_and_target(model, dataset, collator, bs, do_intervention=True)
     model.intervention_distribution, model.intervention_scale = prev_dist, prev_scale
@@ -153,18 +184,35 @@ def eval_corrs(model, dataset, collator, config):
 
 def main():
     args = parse_args()
-    config = ExperimentConfig.model_validate_json(args.config.read_text())
+    runs = runs_from_args(args)
+    if not runs:
+        raise SystemExit("No runs with checkpoints matched.")
+    sweeping = len(runs) > 1 or args.group is not None
+    for k, spec in enumerate(runs, 1):
+        out_dir = ((args.output_dir or (spec.run_dir / "lora_ablation")) if not sweeping
+                   else spec.run_dir / "lora_ablation")
+        if args.skip_existing and (out_dir / "lora_ablation.csv").exists():
+            print(f"[ablate] [{k}/{len(runs)}] {spec.name}: results exist, skipping")
+            continue
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n[ablate] ===== [{k}/{len(runs)}] {spec.name} ({spec.cell}) =====")
+        run = load_run_for_analysis(spec.config,
+                                    checkpoint=args.checkpoint or spec.checkpoint())
+        try:
+            ablate_one_run(run, args, out_dir)
+        finally:
+            del run
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-    checkpoint = args.checkpoint
-    if checkpoint is None:
-        ckpts = glob.glob(str(Path(config.output_dir) / config.experiment_name / "checkpoint-*"))
-        if not ckpts:
-            raise SystemExit("No checkpoint found; pass --checkpoint.")
-        checkpoint = Path(max(ckpts, key=os.path.getctime))
-    out_dir = args.output_dir or (Path(config.output_dir) / config.experiment_name / "lora_ablation")
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    model, tokenizer, test_dataset, test_raw, collator, signal_ranges = load_model_and_data(config, checkpoint)
+def ablate_one_run(run, args, out_dir: Path):
+    config, checkpoint = run.config, run.checkpoint
+    model, test_dataset, collator = run.model, run.dataset, run.collator
+    distribution, scale = resolve_injection_regime(
+        config, args.interv_distribution, args.interv_scale)
+    print(f"[ablate] interventional arm scored at distribution={distribution} scale={scale:g} "
+          f"(the run's own training regime unless overridden)")
     if args.no_success_filter:
         dataset = test_dataset.select(range(min(args.n_examples, len(test_dataset))))
     else:
@@ -187,10 +235,10 @@ def main():
     print(f"[ablate] layers={layer_filter} modules={module_filter} n={len(dataset)}")
 
     # ---- references ----
-    base_iv, base_en = eval_corrs(model, dataset, collator, config)
+    base_iv, base_en = eval_corrs(model, dataset, collator, config, distribution, scale)
     print(f"[ablate] BASELINE          interv={base_iv:.4f}  endo={base_en:.4f}")
     saved = zero_lora(list(lora.values()))
-    off_iv, off_en = eval_corrs(model, dataset, collator, config)
+    off_iv, off_en = eval_corrs(model, dataset, collator, config, distribution, scale)
     restore_lora(saved)
     print(f"[ablate] ALL-LoRA-OFF      interv={off_iv:.4f}  endo={off_en:.4f}")
 
@@ -207,7 +255,7 @@ def main():
             if mod is None:
                 continue
             saved = zero_lora([mod])
-            iv, en = eval_corrs(model, dataset, collator, config)
+            iv, en = eval_corrs(model, dataset, collator, config, distribution, scale)
             restore_lora(saved)
             d_iv_mat[li, mi] = iv - base_iv
             d_en_mat[li, mi] = en - base_en
@@ -216,13 +264,20 @@ def main():
             print(f"[ablate] L{L:<2} {m:<9} interv={iv:.4f} (d={iv-base_iv:+.4f})  "
                   f"endo={en:.4f} (d={en-base_en:+.4f})")
 
-    pd.DataFrame(rows).to_csv(out_dir / "lora_ablation.csv", index=False)
+    abl_df = pd.DataFrame(rows)
+    abl_df.insert(0, "run", config.experiment_name)
+    abl_df.insert(1, "signal_layer", run.layer)
+    abl_df.insert(2, "signal_index", run.index)
+    abl_df.to_csv(out_dir / "lora_ablation.csv", index=False)
     _plot_delta(d_iv_mat, layer_filter, module_filter, base_iv,
                 "Δ interventional corr when module ablated", out_dir / "ablation_delta_interventional.png")
     _plot_delta(d_en_mat, layer_filter, module_filter, base_en,
                 "Δ endogenous corr when module ablated", out_dir / "ablation_delta_endogenous.png")
     with open(out_dir / "ablation_meta.json", "w") as f:
-        json.dump({"checkpoint": str(checkpoint), "baseline_interv": base_iv,
+        json.dump({"run": config.experiment_name, "checkpoint": str(checkpoint),
+                   "signal": f"N{run.layer}.{run.index}",
+                   "interv_distribution": distribution, "interv_scale": scale,
+                   "baseline_interv": base_iv,
                    "baseline_endo": base_en, "all_off_interv": off_iv,
                    "all_off_endo": off_en, "n_examples": len(dataset)}, f, indent=2)
     print(f"[ablate] wrote results to {out_dir}")
