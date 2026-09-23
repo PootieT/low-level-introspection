@@ -9,7 +9,28 @@ positions, and "head (M, h) carries the signal" is only a transport claim once t
 share coming from the introspected token t is separated from the share coming from
 everywhere else.
 
-This script takes the top movers and decomposes them twice, exactly.
+WHICH HEADS ARE "THE MOVERS". A head's score is NOT an attention statistic. It is the
+dose-response slope of its own exact, additive contribution to the prediction:
+
+    prediction - bias = a . x_final,        a = (w * gamma) / rms(x_final)
+    contribution(head h of layer M) = sum_s alpha[h, last, s] * (a . W_O^h v_s)
+
+with v_s the value vector at source position s (from the LoRA-FOLDED v_proj, so it is
+the trained model's OV circuit) and the query fixed at the readout token. Each head's
+contribution is regressed on the injected value v across the dose-response grid, and
+the mean slope over examples is its score. Two consequences worth stating, because
+both bit:
+  * A head can attend hard at t and score ~0, if its OV does not read the private
+    channel; and a head with tiny attention can score high, because the contribution
+    is alpha TIMES an OV term that the injection makes enormous.
+  * This is DIRECT attribution to the final residual. A head's indirect effect -- what
+    it writes being re-read by later layers -- is attributed to those later components,
+    which is precisely why deep heads score highly: they re-read what an early head
+    already deposited. Hence the two rankings (see select_heads): `rank` over the total
+    slope, and `rank_at_t` over the part routed through the origin token, which is the
+    transport claim.
+
+This script takes the selected heads and decomposes them twice, exactly.
 
   1. BY SOURCE POSITION.  A head's contribution to the readout is
          sum_s  alpha[h, last, s] * (a . W_O^h v_s)
@@ -44,6 +65,12 @@ This script takes the top movers and decomposes them twice, exactly.
      it would look there in the absence of training. The complementary test is
      ablate_lora_modules.py restricted to the mover layer, splitting q/k (where to
      look) from v/o (what to carry).
+
+EVERYTHING IS RUN AT TWO INJECTION SCALES by default (1 and the run's training scale),
+because the circuit is not the same at both. On joint_N0.1377_POS-12 the top head by
+total slope at x10 (L14h15) is rank 68 at x1, and the x10 transporter L1h31 -- 98.6% of
+its v-dependence coming from t -- falls to rank 455 at x1. One scale cannot tell you
+whether what you found is the circuit that runs endogenously.
 
 Usage
 -----
@@ -85,9 +112,13 @@ def parse_args():
     p.add_argument("--n-examples", type=int, default=200)
     p.add_argument("--grid-points", type=int, default=7)
     p.add_argument("--grid-std-mult", type=float, default=3.0)
-    p.add_argument("--inject-scale", type=float, default=None,
-                   help="Multiply the grid's half-width by this. Default: the run's own "
-                        "training scale, where the signal is well above the bf16 floor.")
+    p.add_argument("--inject-scales", type=str, default=None,
+                   help="Comma-separated injection scales (x the neuron's std) to run "
+                        "the whole trace at. Default: BOTH 1 and the run's own training "
+                        "scale -- the mechanism is scale-dependent (the identified mover "
+                        "can attend to t only because the injection is large), so one "
+                        "scale cannot tell you whether it describes the endogenous "
+                        "circuit. Pass a single value to halve the runtime.")
     p.add_argument("--top-heads", type=int, default=3,
                    help="Movers taken into the source/origin decompositions.")
     p.add_argument("--batch-size", type=int, default=16,
@@ -260,6 +291,40 @@ def origin_covector(cap, M, h, u, alpha_t, W_V, n_heads, n_kv_heads, head_dim, g
     return alpha_t.unsqueeze(-1) * src * gamma_in.unsqueeze(0) / rms
 
 
+def select_heads(heads_df, signal_layer: int, top_k: int):
+    """[((layer, head), why)] for the decompositions: a union of three criteria.
+
+    TOP BY TOTAL SLOPE is what the ranking used to be on its own, and it is not
+    sufficient: it is equally large for a head that fetches v from the origin and for
+    a later head that re-reads v from where the first one put it (see the rank_at_t
+    note above).
+
+    TOP BY SLOPE AT t is the transporter proper.
+
+    FIRST LAYER ABOVE THE SIGNAL is included unconditionally because it is the only
+    layer whose attention can reach v while v exists NOWHERE ELSE -- at layer L+1 the
+    signal has had no opportunity to be copied anywhere, so a head there that depends
+    on v must have taken it from t. It happened to land in the top 3 on the run this
+    was developed against; that was luck, and the whole transport story would have been
+    missed had it not.
+
+    Duplicates collapse, keeping the first (most specific) reason.
+    """
+    picked = {}
+
+    def add(row, why):
+        picked.setdefault((int(row["layer"]), int(row["head"])), why)
+
+    for _, r in heads_df.nsmallest(top_k, "rank").iterrows():
+        add(r, "top total")
+    for _, r in heads_df.nsmallest(max(1, top_k), "rank_at_t").iterrows():
+        add(r, "top at t")
+    above = heads_df[heads_df["layer"] == signal_layer + 1]
+    if not above.empty:
+        add(above.nsmallest(1, "rank_at_t").iloc[0], f"best in L{signal_layer + 1}")
+    return list(picked.items())
+
+
 def slopes_over_grid(values, grid):
     """Mean dose-response slope and R^2 of `values` [grid][Nexp] against the grid."""
     arr = torch.stack(values, 0).numpy()                # [grid, Nexp]
@@ -290,18 +355,30 @@ def trace_movers(run, args, out_dir: Path):
     loader = lambda: DataLoader(dataset, batch_size=args.batch_size,
                                 collate_fn=run.collator, shuffle=False)
 
+    # ---- injection scales ----
+    # BOTH by default: the mechanism is scale-dependent, and the two questions are
+    # different. The training scale (10x on these runs) is where the dose-response is
+    # cleanest and where the mover was originally identified; scale 1 is the size of
+    # perturbation the neuron actually undergoes, and the readout still reads it there
+    # (gaussian@1 corr ~0.75 on joint_N0.1377_POS-12). If the transporter differs
+    # between them, the circuit described at 10x is not the circuit that runs
+    # endogenously -- which is exactly what the attention profile below was built to
+    # expose, after the 10x pattern turned out to be 6600x the clean one.
     stats = run.stats
-    scale = args.inject_scale
-    if scale is None:
-        tc = run.config.training_config
-        scale = tc.intervention_extreme_scale if (
-            tc.intervention_signal_distribution == "extreme") else 1.0
-    half = args.grid_std_mult * stats["std"] * scale
-    grid = np.linspace(stats["mean"] - half, stats["mean"] + half, args.grid_points)
-    print(f"[mover] v-grid: {args.grid_points} points in "
-          f"[{grid[0]:.4f}, {grid[-1]:.4f}] (scale x{scale:g})")
+    tc = run.config.training_config
+    train_scale = (tc.intervention_extreme_scale
+                   if tc.intervention_signal_distribution == "extreme" else 1.0)
+    if args.inject_scales:
+        scales = [float(x) for x in str(args.inject_scales).split(",")]
+    else:
+        scales = sorted({1.0, float(train_scale)})
+    grids = {sc: np.linspace(stats["mean"] - args.grid_std_mult * stats["std"] * sc,
+                             stats["mean"] + args.grid_std_mult * stats["std"] * sc,
+                             args.grid_points) for sc in scales}
+    print(f"[mover] injection scales: {scales} (training scale {train_scale:g}); "
+          f"{args.grid_points} grid points each")
 
-    # ---- pass 1: per-head dose response, to find the movers ----
+    # ---- shared setup ----
     # a head at layer M reads the residual BEFORE that layer's MLP writes, so a mover
     # must sit strictly ABOVE the signal layer; layer L's own heads cannot see it
     cand_layers = list(range(L + 1, n_layers))
@@ -312,164 +389,333 @@ def trace_movers(run, args, out_dir: Path):
     W_V = {M: effective_weight(run.base.model.layers[M].self_attn.v_proj) for M in cand_layers}
     gammas = {M: run.base.model.layers[M].input_layernorm.weight.detach().float().cpu()
               for M in cand_layers}
-
-    per_head = {(M, h): [] for M in cand_layers for h in range(n_heads)}
-    totals = {M: [] for M in cand_layers}
-    preds = []
-    for gi, v in enumerate(grid):
-        g_head = {k: [] for k in per_head}
-        g_tot = {M: [] for M in cand_layers}
-        g_pred = []
-        for batch in loader():
-            batch = batch.to(device)
-            cap = run_injected_batch(run, batch, v, cand_layers, layer_out_tuple)
-            a = readout_scale(cap["final_resid"], w, gamma, eps)
-            g_pred.append(cap["pred"])
-            for M in cand_layers:
-                z = cap[f"o_in_{M}"]                                  # [B, heads*hd]
-                tot = contribution(a, z @ W_O[M].T)
-                g_tot[M].append(tot)
-                for h in range(n_heads):
-                    src, alpha, u = head_source_contributions(
-                        cap, M, h, a, W_O[M], W_V[M], n_heads, n_kv_heads, head_dim)
-                    g_head[(M, h)].append(src.sum(-1))
-        for k in per_head:
-            per_head[k].append(torch.cat(g_head[k]))
-        for M in cand_layers:
-            totals[M].append(torch.cat(g_tot[M]))
-        preds.append(torch.cat(g_pred))
-        print(f"[mover] pass 1: grid {gi + 1}/{len(grid)}")
-
-    rows = []
-    for (M, h), vals in per_head.items():
-        slope, r2 = slopes_over_grid(vals, grid)
-        rows.append({"run": run.config.experiment_name, "signal_layer": L, "signal_index": i,
-                     "layer": M, "head": h, "mean_slope": slope, "mean_abs_slope": abs(slope),
-                     "mean_r2": r2})
-    heads_df = pd.DataFrame(rows).sort_values("mean_abs_slope", ascending=False)
-    heads_df["rank"] = np.arange(1, len(heads_df) + 1)
-    heads_df.to_csv(out_dir / "mover_heads.csv", index=False)
-
-    # exactness: the per-source decomposition must reproduce the layer's own total
-    err = []
-    for M in cand_layers:
-        by_head = sum(torch.stack(per_head[(M, h)], 0) for h in range(n_heads))
-        err.append(float((by_head - torch.stack(totals[M], 0)).abs().max()))
-    print(f"[sanity] max|sum_h sum_s contribution - o_proj total| = {max(err):.3e} "
-          f"(should be ~0; the per-source split is exact when it is)")
-    e2e = np.corrcoef(torch.stack(preds, 0).numpy().reshape(-1),
-                      np.repeat(grid, len(dataset)))[0, 1]
-    print(f"[sanity] corr(prediction, injected v) = {e2e:.4f}")
-
-    top = heads_df.head(args.top_heads)[["layer", "head"]].values.tolist()
-    print(f"[mover] top movers: {[(int(m), int(h)) for m, h in top]}")
-
-    # ---- pass 2: source positions + origin components, for the movers only ----
-    # The residual a mover at layer M reads is embed + every attn/mlp write BELOW M --
-    # not just those up to the signal layer. Truncating at L leaves the writes of
-    # layers L+1..M-1 out of the sum, which does not make the decomposition wrong so
-    # much as incomplete: it stops summing to the quantity it decomposes, and the
-    # exactness check below is what caught it.
     comp_names_for = lambda M: (["embed"] + [f"attn_{l}" for l in range(M)]
                                 + [f"mlp_{l}" for l in range(M)])
-    src_acc = {(int(M), int(h)): [] for M, h in top}   # [grid] of [Nexp, bins]
-    alpha_acc = {k: [] for k in src_acc}
-    comp_acc = {k: {c: [] for c in comp_names_for(k[0])} for k in src_acc}
-    tot_t_acc = {k: [] for k in src_acc}
-    for gi, v in enumerate(grid):
-        g_src = {k: [] for k in src_acc}
-        g_alpha = {k: [] for k in alpha_acc}
-        g_comp = {k: {c: [] for c in comp_names_for(k[0])} for k in comp_acc}
-        g_tot_t = {k: [] for k in tot_t_acc}
-        for batch in loader():
-            batch = batch.to(device)
-            cap = run_injected_batch(run, batch, v, [int(m) for m, _ in top], layer_out_tuple)
-            a = readout_scale(cap["final_resid"], w, gamma, eps)
-            t = cap["abs_pos"]
-            brows = torch.arange(t.shape[0])
-            for M, h in top:
-                M, h = int(M), int(h)
-                src, alpha, u = head_source_contributions(
-                    cap, M, h, a, W_O[M], W_V[M], n_heads, n_kv_heads, head_dim)
-                g_src[(M, h)].append(_rel_bin(src, t))
-                g_alpha[(M, h)].append(_rel_bin(alpha, t))
-                g_tot_t[(M, h)].append(src[brows, t])
-                a_src = origin_covector(cap, M, h, u, alpha[brows, t], W_V[M],
-                                        n_heads, n_kv_heads, head_dim, gammas[M], eps)
-                for c in comp_names_for(M):
-                    g_comp[(M, h)][c].append(contribution(a_src, cap[c]))
-        for k in src_acc:
-            src_acc[k].append(torch.cat(g_src[k])); alpha_acc[k].append(torch.cat(g_alpha[k]))
-            tot_t_acc[k].append(torch.cat(g_tot_t[k]))
-            for c in comp_names_for(k[0]):
-                comp_acc[k][c].append(torch.cat(g_comp[k][c]))
-        print(f"[mover] pass 2: grid {gi + 1}/{len(grid)}")
 
-    src_rows, comp_rows = [], []
-    for (M, h) in src_acc:
-        stacked = torch.stack(src_acc[(M, h)], 0)         # [grid, Nexp, bins]
-        alphas = torch.stack(alpha_acc[(M, h)], 0)
-        for b in range(stacked.shape[-1]):
-            rel = b - SOURCE_REL_WINDOW
-            col = [stacked[g, :, b] for g in range(stacked.shape[0])]
-            slope, r2 = slopes_over_grid(col, grid)
-            src_rows.append({"run": run.config.experiment_name, "layer": M, "head": h,
-                             "rel_source": rel if b < 2 * SOURCE_REL_WINDOW + 1 else None,
-                             "bin": _BIN_LABELS[b], "mean_slope": slope, "mean_r2": r2,
-                             "mean_attention": float(alphas[:, :, b].mean())})
-        # exactness of the origin decomposition against the source-t contribution
-        tot_t = torch.stack(tot_t_acc[(M, h)], 0)
-        summed = sum(torch.stack(comp_acc[(M, h)][c], 0) for c in comp_names_for(M))
-        print(f"[sanity] head L{M}.h{h}: max|sum_components - contribution via t| = "
-              f"{float((summed - tot_t).abs().max()):.3e} "
-              f"(decomposes embed + {M} attn + {M} mlp writes at t)")
-        for c in comp_names_for(M):
-            slope, r2 = slopes_over_grid(comp_acc[(M, h)][c], grid)
-            comp_rows.append({"run": run.config.experiment_name, "layer": M, "head": h,
-                              "component": c, "mean_slope": slope, "mean_r2": r2,
-                              "is_signal_layer_mlp": c == f"mlp_{L}"})
-    src_df = pd.DataFrame(src_rows); src_df.to_csv(out_dir / "mover_source_positions.csv", index=False)
-    comp_df = pd.DataFrame(comp_rows); comp_df.to_csv(out_dir / "mover_origin_components.csv", index=False)
+    def pass1(grid):
+        """Per-head dose response over every head above the signal layer."""
+        per_head = {(M, h): [] for M in cand_layers for h in range(n_heads)}
+        per_head_t = {(M, h): [] for M in cand_layers for h in range(n_heads)}
+        totals = {M: [] for M in cand_layers}
+        preds = []
+        for gi, v in enumerate(grid):
+            g_head = {k: [] for k in per_head}
+            g_head_t = {k: [] for k in per_head}
+            g_tot = {M: [] for M in cand_layers}
+            g_pred = []
+            for batch in loader():
+                batch = batch.to(device)
+                cap = run_injected_batch(run, batch, v, cand_layers, layer_out_tuple)
+                a = readout_scale(cap["final_resid"], w, gamma, eps)
+                g_pred.append(cap["pred"])
+                t_pos = cap["abs_pos"]
+                brows = torch.arange(t_pos.shape[0])
+                for M in cand_layers:
+                    z = cap[f"o_in_{M}"]
+                    g_tot[M].append(contribution(a, z @ W_O[M].T))
+                    for h in range(n_heads):
+                        src, alpha, u = head_source_contributions(
+                            cap, M, h, a, W_O[M], W_V[M], n_heads, n_kv_heads, head_dim)
+                        g_head[(M, h)].append(src.sum(-1))
+                        g_head_t[(M, h)].append(src[brows, t_pos])
+            for k in per_head:
+                per_head[k].append(torch.cat(g_head[k]))
+                per_head_t[k].append(torch.cat(g_head_t[k]))
+            for M in cand_layers:
+                totals[M].append(torch.cat(g_tot[M]))
+            preds.append(torch.cat(g_pred))
+            print(f"[mover] pass 1: grid {gi + 1}/{len(grid)}")
 
-    # ---- pass 3: is the addressing inherited? attention with the adapter on vs off ----
-    addr_rows = []
+        rows = []
+        for (M, h), vals in per_head.items():
+            slope, r2 = slopes_over_grid(vals, grid)
+            slope_t, r2_t = slopes_over_grid(per_head_t[(M, h)], grid)
+            rows.append({"run": run.config.experiment_name, "signal_layer": L,
+                         "signal_index": i, "layer": M, "head": h,
+                         "mean_slope": slope, "mean_abs_slope": abs(slope), "mean_r2": r2,
+                         "mean_slope_at_t": slope_t, "mean_abs_slope_at_t": abs(slope_t),
+                         "mean_r2_at_t": r2_t,
+                         # can exceed 1, and legitimately: sources cancel, so the
+                         # contribution routed through t may be larger than the head's
+                         # net total. Read it as "is t where this head's v-dependence
+                         # lives", not as a share of a positive budget.
+                         "frac_slope_from_t": (abs(slope_t) / abs(slope)
+                                               if abs(slope) > 1e-12 else np.nan)})
+        df = pd.DataFrame(rows).sort_values("mean_abs_slope", ascending=False)
+        df["rank"] = np.arange(1, len(df) + 1)
+        # A SECOND ranking, by the contribution routed through source position t.
+        # Total slope does not mean "mover": it is large both for the head that FETCHES
+        # v from the origin and for any later head that re-reads v from wherever the
+        # first one deposited it. On joint_N0.1377_POS-12 the top head by total slope
+        # (L14h15) took 0.0% of its v-dependence from t and ~99% from the prompt region,
+        # while the actual transporter (L1h31) took 98.6% from t.
+        df = df.sort_values("mean_abs_slope_at_t", ascending=False)
+        df["rank_at_t"] = np.arange(1, len(df) + 1)
+        df = df.sort_values("rank")
+
+        err = []
+        for M in cand_layers:
+            by_head = sum(torch.stack(per_head[(M, h)], 0) for h in range(n_heads))
+            err.append(float((by_head - torch.stack(totals[M], 0)).abs().max()))
+        e2e = np.corrcoef(torch.stack(preds, 0).numpy().reshape(-1),
+                          np.repeat(grid, len(dataset)))[0, 1]
+        print(f"[sanity] max|sum_h sum_s contribution - o_proj total| = {max(err):.3e} "
+              f"(should be ~0) | corr(prediction, injected v) = {e2e:.4f}")
+        return df, max(err), float(e2e)
+
+    def pass2(grid, heads, why_of):
+        """Source-position and origin-component decompositions for selected heads.
+
+        `why_of` maps (layer, head) -> the criterion that selected it, and is written
+        into every row: a reader of the figures should never have to guess whether a
+        head is there because it was the biggest mover overall or because it was the
+        best in the layer above the signal, since those mean different things.
+        """
+        src_acc = {(int(M), int(h)): [] for M, h in heads}
+        alpha_acc = {k: [] for k in src_acc}
+        comp_acc = {k: {c: [] for c in comp_names_for(k[0])} for k in src_acc}
+        tot_t_acc = {k: [] for k in src_acc}
+        for gi, v in enumerate(grid):
+            g_src = {k: [] for k in src_acc}
+            g_alpha = {k: [] for k in alpha_acc}
+            g_comp = {k: {c: [] for c in comp_names_for(k[0])} for k in comp_acc}
+            g_tot_t = {k: [] for k in tot_t_acc}
+            for batch in loader():
+                batch = batch.to(device)
+                cap = run_injected_batch(run, batch, v, sorted({M for M, _ in src_acc}),
+                                         layer_out_tuple)
+                a = readout_scale(cap["final_resid"], w, gamma, eps)
+                t = cap["abs_pos"]
+                brows = torch.arange(t.shape[0])
+                for (M, h) in src_acc:
+                    src, alpha, u = head_source_contributions(
+                        cap, M, h, a, W_O[M], W_V[M], n_heads, n_kv_heads, head_dim)
+                    g_src[(M, h)].append(_rel_bin(src, t))
+                    g_alpha[(M, h)].append(_rel_bin(alpha, t))
+                    g_tot_t[(M, h)].append(src[brows, t])
+                    a_src = origin_covector(cap, M, h, u, alpha[brows, t], W_V[M],
+                                            n_heads, n_kv_heads, head_dim, gammas[M], eps)
+                    for c in comp_names_for(M):
+                        g_comp[(M, h)][c].append(contribution(a_src, cap[c]))
+            for k in src_acc:
+                src_acc[k].append(torch.cat(g_src[k]))
+                alpha_acc[k].append(torch.cat(g_alpha[k]))
+                tot_t_acc[k].append(torch.cat(g_tot_t[k]))
+                for c in comp_names_for(k[0]):
+                    comp_acc[k][c].append(torch.cat(g_comp[k][c]))
+            print(f"[mover] pass 2: grid {gi + 1}/{len(grid)}")
+
+        src_rows, comp_rows, dose_rows = [], [], []
+        t_bin = SOURCE_REL_WINDOW                     # index of the "t" bin in _BIN_LABELS
+        for (M, h) in src_acc:
+            stacked = torch.stack(src_acc[(M, h)], 0)
+            alphas = torch.stack(alpha_acc[(M, h)], 0)      # [grid, Nexp, bins]
+            # attention to t AT EACH GRID POINT, not just its average over them.
+            # A head that ROUTES the value should attend to t in a graded way; a head
+            # that merely notices an outlier should switch on past a threshold and
+            # saturate. The grid-averaged number cannot tell those apart -- four
+            # layer-1 heads all averaging ~0.42 is exactly what a step function
+            # sampled over a symmetric grid looks like.
+            for gi, v in enumerate(grid):
+                dose_rows.append({"run": run.config.experiment_name, "layer": M, "head": h,
+                                  "selected_as": why_of.get((M, h), ""), "v": float(v),
+                                  "attn_to_t": float(alphas[gi, :, t_bin].mean()),
+                                  "contribution_at_t": float(stacked[gi, :, t_bin].mean())})
+            for b in range(stacked.shape[-1]):
+                rel = b - SOURCE_REL_WINDOW
+                col = [stacked[g, :, b] for g in range(stacked.shape[0])]
+                slope, r2 = slopes_over_grid(col, grid)
+                src_rows.append({"run": run.config.experiment_name, "layer": M, "head": h,
+                                 "selected_as": why_of.get((M, h), ""),
+                                 "rel_source": rel if b < 2 * SOURCE_REL_WINDOW + 1 else None,
+                                 "bin": _BIN_LABELS[b], "mean_slope": slope, "mean_r2": r2,
+                                 "mean_attention": float(alphas[:, :, b].mean())})
+            tot_t = torch.stack(tot_t_acc[(M, h)], 0)
+            summed = sum(torch.stack(comp_acc[(M, h)][c], 0) for c in comp_names_for(M))
+            print(f"[sanity] head L{M}.h{h}: max|sum_components - contribution via t| = "
+                  f"{float((summed - tot_t).abs().max()):.3e} "
+                  f"(decomposes embed + {M} attn + {M} mlp writes at t)")
+            for c in comp_names_for(M):
+                slope, r2 = slopes_over_grid(comp_acc[(M, h)][c], grid)
+                comp_rows.append({"run": run.config.experiment_name, "layer": M, "head": h,
+                                  "selected_as": why_of.get((M, h), ""),
+                                  "component": c, "mean_slope": slope, "mean_r2": r2,
+                                  "is_signal_layer_mlp": c == f"mlp_{L}"})
+        return src_rows, comp_rows, dose_rows
+
+    # ---- passes 1 and 2, per scale ----
+    heads_frames, src_rows, comp_rows, dose_rows, sanity = [], [], [], [], {}
+    per_scale_heads = {}
+    for sc in scales:
+        print(f"\n[mover] ===== scale x{sc:g} =====")
+        df, max_err, e2e = pass1(grids[sc])
+        df.insert(0, "inject_scale", sc)
+        heads_frames.append(df)
+        per_scale_heads[sc] = select_heads(df, L, args.top_heads)
+        sanity[sc] = {"per_source_max_err": max_err, "e2e_corr_pred_vs_v": e2e}
+
+    # The SAME head set is decomposed at every scale, so the scales can be compared
+    # head by head: the question "is the transporter at 10x still the transporter at
+    # 1x" is unanswerable if each scale only decomposes its own winners.
+    top = list({k: why for sc in scales for k, why in per_scale_heads[sc]}.items())
+    top_heads = [k for k, _ in top]          # ((layer, head), why) -> (layer, head)
+    why_of = {k: why for k, why in top}
+    print("\n[mover] heads taken into the decompositions (union over scales):")
+    for (M, h), why in top:
+        bits = []
+        for sc in scales:
+            r = heads_frames[scales.index(sc)]
+            r = r[(r["layer"] == M) & (r["head"] == h)].iloc[0]
+            bits.append(f"x{sc:g}: rank={int(r['rank'])} rank@t={int(r['rank_at_t'])}")
+        print(f"[mover]   L{M}h{h:<2} ({why:<16}) " + " | ".join(bits))
+
+    for sc in scales:
+        print(f"\n[mover] ===== pass 2 at scale x{sc:g} =====")
+        sr, cr, dr = pass2(grids[sc], top_heads, why_of)
+        for r in sr + cr + dr:
+            r["inject_scale"] = sc
+        src_rows += sr
+        comp_rows += cr
+        dose_rows += dr
+
+    heads_df = pd.concat(heads_frames, ignore_index=True)
+    heads_df["selected_as"] = [why_of.get((int(L_), int(h_)), "")
+                               for L_, h_ in zip(heads_df["layer"], heads_df["head"])]
+    heads_df.to_csv(out_dir / "mover_heads.csv", index=False)
+    src_df = pd.DataFrame(src_rows)
+    src_df.to_csv(out_dir / "mover_source_positions.csv", index=False)
+    comp_df = pd.DataFrame(comp_rows)
+    comp_df.to_csv(out_dir / "mover_origin_components.csv", index=False)
+    dose_df = pd.DataFrame(dose_rows)
+    dose_df.to_csv(out_dir / "mover_attention_vs_v.csv", index=False)
+    _plot_attention_vs_v(run, dose_df, out_dir)
+
+    # ---- pass 3: WHERE does each head look, in each regime ----
+    #
+    # The attention a mover is identified by is measured under injection, and the
+    # injection is itself a large perturbation of the source token's key: on
+    # joint_N0.1377_POS-12 the transporter L1h31 attends to t with weight 6.3e-05
+    # clean and 0.42 under a 10x injection. A clean-only panel therefore describes a
+    # different model than the rest of the script. Every regime is measured instead,
+    # over a fixed set of token bins, so "where is it looking if not at t" has an
+    # answer on the same figure (on that run: BOS, at 0.95).
+    # AVERAGED OVER THE DOSE-RESPONSE GRID, not measured at one extreme point. The
+    # attention a large injection produces SATURATES: on joint_N0.1377_POS-12 at
+    # v=+2.49 (the top grid point) head L1h22 takes 100% of the readout's attention and
+    # every other head's share of t collapses to ~0, while the grid-averaged figure has
+    # four layer-1 heads sitting near 0.42 each. A single endpoint therefore describes
+    # the endpoint, not the regime, and disagreed with pass 2's own numbers.
+    conditions = [("endogenous", [None])] + [(f"inject x{sc:g}", [float(v) for v in grids[sc]])
+                                             for sc in scales]
+    prof_rows, addr_rows = [], []
     for disable in (False, True):
-        alpha_t, alpha_bos, alpha_max_other = {k: [] for k in src_acc}, {k: [] for k in src_acc}, {k: [] for k in src_acc}
-        for batch in loader():
-            batch = batch.to(device)
-            cap = run_injected_batch(run, batch, None, [int(m) for m, _ in top],
-                                     layer_out_tuple, disable_adapter=disable)
-            t = cap["abs_pos"]
-            brows = torch.arange(t.shape[0])
-            for M, h in src_acc:
-                alpha = cap["attn_probs"][M][:, h, :]
-                alpha_t[(M, h)].append(alpha[brows, t])
-                first = (batch["attention_mask"] == 0).sum(dim=1).cpu()   # BOS after left pad
-                alpha_bos[(M, h)].append(alpha[brows, first])
-                masked = alpha.clone(); masked[brows, t] = -1
-                alpha_max_other[(M, h)].append(masked.max(-1).values)
-        for M, h in src_acc:
-            addr_rows.append({
-                "run": run.config.experiment_name, "layer": M, "head": h,
-                "adapter": "off" if disable else "on",
-                "attn_to_t": float(torch.cat(alpha_t[(M, h)]).mean()),
-                "attn_to_bos": float(torch.cat(alpha_bos[(M, h)]).mean()),
-                "max_attn_elsewhere": float(torch.cat(alpha_max_other[(M, h)]).mean())})
+        for cond_name, inj_values in conditions:
+            acc = {(int(M), int(h)): None for M, h in top_heads}
+            n_rows_seen = 0
+            for inj in inj_values:
+                for batch in loader():
+                    batch = batch.to(device)
+                    cap = run_injected_batch(run, batch, inj, sorted({M for M, _ in top_heads}),
+                                             layer_out_tuple, disable_adapter=disable)
+                    t = cap["abs_pos"]
+                    num_left_pad = (batch["attention_mask"] == 0).sum(dim=1).cpu()
+                    n_rows_seen += t.shape[0]
+                    for (M, h) in acc:
+                        alpha = cap["attn_probs"][M][:, h, :]
+                        binned = _attention_bins(alpha, t, num_left_pad)
+                        acc[(M, h)] = binned if acc[(M, h)] is None else {
+                            k: acc[(M, h)][k] + v for k, v in binned.items()}
+            for (M, h), sums in acc.items():
+                for label, total in sums.items():
+                    prof_rows.append({
+                        "run": run.config.experiment_name, "layer": M, "head": h,
+                        "selected_as": why_of.get((M, h), ""),
+                        "adapter": "off" if disable else "on", "condition": cond_name,
+                        "injected": inj_values[0] is not None, "token_bin": label,
+                        "mean_attention": float(total) / max(1, n_rows_seen)})
+                addr_rows.append({
+                    "run": run.config.experiment_name, "layer": M, "head": h,
+                    "selected_as": why_of.get((M, h), ""),
+                    "adapter": "off" if disable else "on", "condition": cond_name,
+                    "injected": inj_values[0] is not None,
+                    "attn_to_t": float(sums["t"]) / max(1, n_rows_seen),
+                    "attn_to_bos": float(sums["BOS"]) / max(1, n_rows_seen),
+                    "attn_to_final": float(sums["final"]) / max(1, n_rows_seen)})
+    prof_df = pd.DataFrame(prof_rows)
+    prof_df.to_csv(out_dir / "mover_attention_profile.csv", index=False)
     addr_df = pd.DataFrame(addr_rows)
     addr_df.to_csv(out_dir / "mover_attention_base_vs_tuned.csv", index=False)
-    print("\n[mover] addressing: attention from the readout token to t")
-    print(addr_df.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
 
-    _plot(run, heads_df, src_df, comp_df, addr_df, out_dir)
+    # the headline contrast, stated rather than left to be spotted in the csv
+    for (M, h), g in addr_df[addr_df["adapter"] == "on"].groupby(["layer", "head"]):
+        clean = g[g["condition"] == "endogenous"]["attn_to_t"]
+        if not len(clean) or float(clean.iloc[0]) <= 0:
+            continue
+        for _, r in g[g["injected"]].iterrows():
+            ratio = r["attn_to_t"] / float(clean.iloc[0])
+            if ratio > 10:
+                print(f"[mover] NOTE L{M}h{h}: attention to t is {ratio:.0f}x larger at "
+                      f"'{r['condition']}' ({r['attn_to_t']:.3f}) than endogenous "
+                      f"({float(clean.iloc[0]):.2e}) -- at that scale the probe is "
+                      f"creating the attention pattern, not revealing it")
+    print("\n[mover] attention from the readout token (adapter on):")
+    print(addr_df[addr_df["adapter"] == "on"].to_string(
+        index=False, float_format=lambda v: f"{v:.5f}"))
+
+    _plot(run, heads_df, src_df, comp_df, addr_df, prof_df, out_dir)
     with open(out_dir / "mover_meta.json", "w") as f:
         json.dump({"run": run.config.experiment_name, "checkpoint": str(run.checkpoint),
-                   "signal": f"N{L}.{i}", "top_heads": [[int(m), int(h)] for m, h in top],
-                   "grid": grid.tolist(), "inject_scale": scale,
-                   "per_source_max_err": max(err), "e2e_corr_pred_vs_v": float(e2e),
+                   "signal": f"N{L}.{i}", "top_heads": [[int(M), int(h)] for M, h in top_heads],
+                   "head_selection": {f"L{M}h{h}": why for (M, h), why in top},
+                   "inject_scales": scales, "training_scale": float(train_scale),
+                   "grids": {str(sc): grids[sc].tolist() for sc in scales},
+                   "sanity_per_scale": {str(k): v for k, v in sanity.items()},
                    "n_examples": len(dataset)}, f, indent=2)
     if prev_impl is not None:
         cfg._attn_implementation = prev_impl
     print(f"[mover] wrote {out_dir}")
+
+
+# Token bins the attention profile is reported over. BOS is absolute (Llama's
+# attention sink); the t window is where the introspected signal lives; the final
+# window is the readout end of the introspection prompt. Everything else is pooled
+# into two catch-alls so the bins sum to 1 and a missing mass is visible.
+ATTENTION_BINS = (["BOS"] + [f"t{d:+d}" if d else "t" for d in range(-3, 4)]
+                  + [f"final{d:+d}" if d else "final" for d in range(-3, 1)]
+                  + ["other_text", "other_prompt"])
+
+
+def _attention_bins(alpha, t, num_left_pad):
+    """{bin label: summed attention over rows} for one batch, one head.
+
+    Bins can overlap when the sequence is short (t+3 may BE final-3); the sum over
+    bins is therefore not forced to 1 and `other_*` is computed by subtracting only
+    the disjoint part. Every row contributes its full attention mass somewhere.
+    """
+    bs, seq = alpha.shape
+    rows = torch.arange(bs)
+    last = seq - 1
+    out, claimed = {}, torch.zeros_like(alpha, dtype=torch.bool)
+
+    def take(label, pos):
+        valid = (pos >= num_left_pad) & (pos <= last)
+        p = pos.clamp(0, last)
+        vals = alpha[rows, p] * valid.float()
+        out[label] = float(vals.sum())
+        claimed[rows[valid], p[valid]] = True
+
+    take("BOS", num_left_pad.clone())
+    for d in range(-3, 4):
+        take(f"t{d:+d}" if d else "t", t + d)
+    for d in range(-3, 1):
+        take(f"final{d:+d}" if d else "final", torch.full_like(t, last) + d)
+    # the rest, split by region: text is everything at or before t, prompt after it
+    rest = alpha.masked_fill(claimed, 0.0)
+    pos_idx = torch.arange(seq).unsqueeze(0).expand(bs, -1)
+    is_text = pos_idx <= t.unsqueeze(1)
+    out["other_text"] = float((rest * is_text.float()).sum())
+    out["other_prompt"] = float((rest * (~is_text).float()).sum())
+    return out
 
 
 _BIN_LABELS = ([f"t{d:+d}" if d else "t" for d in range(-SOURCE_REL_WINDOW, SOURCE_REL_WINDOW + 1)]
@@ -496,17 +742,160 @@ def _rel_bin(x, t):
     return out
 
 
-def _plot(run, heads_df, src_df, comp_df, addr_df, out_dir):
+def _head_label(L, h, why=""):
+    """'L3h1 [top at t]' -- the selection criterion travels with the head everywhere it
+    is drawn, because "top total" and "top at t" are different claims (see
+    select_heads) and a reader cannot tell them apart from the head id alone."""
+    why = "" if not isinstance(why, str) or not why else f" [{why}]"
+    return f"L{int(L)}h{int(h)}{why}"
+
+
+def _plot_attention_vs_v(run, dose_df, out_dir):
+    """Attention to t as a function of the injected value, per head, per scale.
+
+    This is the graded-vs-threshold test. A head that routes the value should show
+    attention rising smoothly with |v|; a head that is merely detecting an out-of-
+    distribution activation should switch on past a threshold and saturate, and its
+    grid-AVERAGED attention is then an artefact of where the grid points happen to
+    fall rather than a property of the head.
+    """
+    if dose_df is None or dose_df.empty:
+        return
+    scales = sorted(dose_df["inject_scale"].unique())
+    fig, axes = plt.subplots(1, len(scales), figsize=(1 + 4.0 * len(scales), 3.4),
+                             squeeze=False, sharey=True)
+    for ax, sc in zip(axes.flat, scales):
+        d = dose_df[dose_df["inject_scale"] == sc]
+        for (M, h), g in d.groupby(["layer", "head"]):
+            g = g.sort_values("v")
+            why = g["selected_as"].fillna("").iloc[0] if "selected_as" in g else ""
+            ax.plot(g["v"], g["attn_to_t"], "o-", ms=4, label=_head_label(M, h, why))
+        ax.set_xlabel("injected value v"); ax.grid(alpha=0.25)
+        ax.set_title(f"injection x{sc:g}", fontsize=9); ax.tick_params(labelsize=8)
+    axes.flat[0].set_ylabel("attention: readout -> t", fontsize=9)
+    axes.flat[-1].legend(fontsize=6, ncol=2)
+    fig.suptitle("Graded routing or threshold detection?\n"
+                 "attention to the introspected token vs the value injected there",
+                 fontsize=9, y=1.04)
+    fig.tight_layout()
+    path = out_dir / "mover_attention_vs_v.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"[mover] wrote {path}")
+
+
+def _plot_attention_profile(run, prof_df, out_dir):
+    """Where each selected head looks, per regime: heads x token bins, one panel per
+    condition, adapter ON. Attention is averaged over the dose-response grid, so a
+    cell is what the head does across the regime rather than at one saturating endpoint.
+
+    Log colour scale, because that is the range the quantity actually spans (1e-5 to
+    1e0 on the same head) and a linear map shows one dark row and nothing else. The
+    panels are the point: if the t column only lights up in the injected panels, the
+    head does not natively look at the introspected token.
+    """
+    if prof_df.empty:
+        return
+    from matplotlib.colors import LogNorm
+    d = prof_df[prof_df["adapter"] == "on"]
+    conds = [c for c in d["condition"].unique()]
+    why = {}
+    if "selected_as" in d:
+        why = {(int(L), int(h)): w for L, h, w in
+               zip(d["layer"], d["head"], d["selected_as"].fillna(""))}
+    heads = sorted({(int(L), int(h)) for L, h in zip(d["layer"], d["head"])})
+    bins = [b for b in ATTENTION_BINS if b in set(d["token_bin"])]
+    if not conds or not heads or not bins:
+        return
+    vmin = max(1e-6, float(d[d["mean_attention"] > 0]["mean_attention"].min()))
+    vmax = float(d["mean_attention"].max())
+    fig, axes = plt.subplots(1, len(conds), figsize=(1 + 3.6 * len(conds), 0.42 * len(heads) + 2.2),
+                             squeeze=False, sharey=True)
+    for ax, cond in zip(axes.flat, conds):
+        sub = d[d["condition"] == cond]
+        mat = np.full((len(heads), len(bins)), np.nan)
+        for r in sub.itertuples():
+            mat[heads.index((int(r.layer), int(r.head))), bins.index(r.token_bin)] = r.mean_attention
+        im = ax.imshow(np.clip(mat, vmin, None), aspect="auto", cmap="magma",
+                       norm=LogNorm(vmin=vmin, vmax=max(vmax, vmin * 10)))
+        ax.set_xticks(range(len(bins)))
+        ax.set_xticklabels(bins, rotation=90, fontsize=7)
+        ax.set_yticks(range(len(heads)))
+        ax.set_yticklabels([_head_label(L, h, why.get((L, h), "")) for L, h in heads],
+                           fontsize=7)
+        ax.set_title(cond, fontsize=9)
+        if "t" in bins:
+            ax.axvline(bins.index("t") - 0.5, color="cyan", lw=0.8)
+            ax.axvline(bins.index("t") + 0.5, color="cyan", lw=0.8)
+    fig.colorbar(im, ax=axes.ravel().tolist(), label="mean attention from readout", pad=0.02)
+    fig.suptitle(f"Where the movers look, by regime -- {run.config.experiment_name}",
+                 fontsize=9, y=1.02)
+    path = out_dir / "mover_attention_profile.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"[mover] wrote {path}")
+
+
+def _plot(run, heads_df, src_df, comp_df, addr_df, prof_df, out_dir):
+    # one three-panel figure PER INJECTION SCALE: the panels describe a circuit at a
+    # particular injection magnitude, and overlaying scales would average a mechanism
+    # with whatever replaces it at another scale
+    scales = (sorted(heads_df["inject_scale"].dropna().unique())
+              if "inject_scale" in heads_df else [None])
+    for sc in scales:
+        sel = (lambda d: d if sc is None or "inject_scale" not in d
+               else d[d["inject_scale"] == sc])
+        _plot_scale(run, sel(heads_df), sel(src_df), sel(comp_df), sc, out_dir)
+    _plot_attention_profile(run, prof_df, out_dir)
+
+    if not addr_df.empty and "condition" in addr_df:
+        # attention to t alone, with the adapter as the contrast -- the inherited-
+        # addressing question, asked separately in each injection regime. Log y: the
+        # regimes differ by orders of magnitude on one head, and on a linear axis the
+        # endogenous bars vanish, which is the comparison the panel exists for.
+        conds = list(addr_df["condition"].unique())
+        fig, axes = plt.subplots(1, len(conds), figsize=(1 + 3.2 * len(conds), 3.4),
+                                 squeeze=False, sharey=True)
+        for ax, cond in zip(axes.flat, conds):
+            sub = addr_df[addr_df["condition"] == cond]
+            piv = sub.pivot_table(index=["layer", "head"], columns="adapter", values="attn_to_t")
+            why = ({(int(L), int(h)): w for L, h, w in
+                    zip(sub["layer"], sub["head"], sub["selected_as"].fillna(""))}
+                   if "selected_as" in sub else {})
+            piv.index = [_head_label(L, h, why.get((int(L), int(h)), "")) for L, h in piv.index]
+            piv.plot.bar(ax=ax, width=0.78, rot=90, legend=(ax is axes.flat[0]),
+                         color={"on": "tab:red", "off": "tab:grey"})
+            ax.set_yscale("log"); ax.set_xlabel("")
+            ax.tick_params(labelsize=7); ax.grid(axis="y", alpha=0.25, which="both")
+            ax.set_title(cond, fontsize=9)
+        axes.flat[0].set_ylabel("mean attention: readout -> t", fontsize=9)
+        axes.flat[0].legend(fontsize=7, title="adapter", title_fontsize=7)
+        fig.suptitle("Is the addressing inherited? (adapter on vs off, per regime)",
+                     fontsize=9, y=1.03)
+        fig.tight_layout()
+        fig.savefig(out_dir / "mover_addressing.png", dpi=150, bbox_inches="tight"); plt.close(fig)
+
+
+def _plot_scale(run, heads_df, src_df, comp_df, scale, out_dir):
     fig, axes = plt.subplots(1, 3, figsize=(17, 4.6))
-    top = heads_df.head(12)
-    labels = [f"L{int(r.layer)}h{int(r.head)}" for r in top.itertuples()]
-    axes[0].barh(labels[::-1], top["mean_slope"].values[::-1])
+    top = heads_df.nsmallest(12, "rank") if "rank" in heads_df else heads_df.head(12)
+    sel = (top["selected_as"].fillna("") != "") if "selected_as" in top else None
+    labels = [_head_label(r.layer, r.head, getattr(r, "selected_as", ""))
+              for r in top.itertuples()]
+    # selected heads coloured: this panel ranks by TOTAL slope, and the heads carried
+    # into the other two panels are not simply its first three (see select_heads)
+    colors = (["tab:red" if x else "tab:blue" for x in sel] if sel is not None
+              else ["tab:blue"] * len(top))
+    axes[0].barh(labels[::-1], top["mean_slope"].values[::-1], color=colors[::-1])
     axes[0].axvline(0, color="k", lw=0.8)
-    axes[0].set_xlabel("dose-response slope"); axes[0].set_title("top mover heads")
+    axes[0].tick_params(axis="y", labelsize=7)
+    axes[0].set_xlabel("dose-response slope")
+    axes[0].set_title("top 12 heads by TOTAL slope\n(red = carried into the panels at right)",
+                      fontsize=9)
 
     for (M, h), g in src_df.groupby(["layer", "head"]):
+        why = g["selected_as"].fillna("").iloc[0] if "selected_as" in g else ""
         g = g[g["rel_source"].notna()].sort_values("rel_source")
-        axes[1].plot(g["rel_source"], g["mean_slope"], "o-", ms=4, label=f"L{M}h{h}")
+        axes[1].plot(g["rel_source"], g["mean_slope"], "o-", ms=4,
+                     label=_head_label(M, h, why))
     axes[1].axvline(0, color="k", ls="--", lw=1)
     axes[1].set_xlabel("source position relative to t"); axes[1].set_ylabel("slope")
     axes[1].set_title("where the mover picks up v"); axes[1].legend(fontsize=8); axes[1].grid(alpha=0.25)
@@ -521,25 +910,20 @@ def _plot(run, heads_df, src_df, comp_df, addr_df, out_dir):
     order = sorted(comp_df["component"].unique(), key=_ckey)
     xpos = {c: k for k, c in enumerate(order)}
     for (M, h), g in comp_df.groupby(["layer", "head"]):
+        why = g["selected_as"].fillna("").iloc[0] if "selected_as" in g else ""
         g = g.assign(x=g["component"].map(xpos)).sort_values("x")
-        axes[2].plot(g["x"], g["mean_slope"], "o-", ms=4, label=f"L{M}h{h}")
+        axes[2].plot(g["x"], g["mean_slope"], "o-", ms=4, label=_head_label(M, h, why))
     axes[2].set_xticks(range(len(order)))
     axes[2].set_xticklabels(order, rotation=90, fontsize=6)
     axes[2].axhline(0, color="k", lw=0.8)
     axes[2].set_ylabel("slope"); axes[2].set_title("which write at t carries it")
     axes[2].legend(fontsize=8); axes[2].grid(alpha=0.25)
-    fig.suptitle(f"Mover-head trace: {run.config.experiment_name}", y=1.02)
+    tag = "" if scale is None else f" (injection x{scale:g})"
+    fig.suptitle(f"Mover-head trace: {run.config.experiment_name}{tag}", y=1.02)
     fig.tight_layout()
-    fig.savefig(out_dir / "mover_trace.png", dpi=150, bbox_inches="tight"); plt.close(fig)
-
-    if not addr_df.empty:
-        fig, ax = plt.subplots(figsize=(6, 4.2))
-        piv = addr_df.pivot_table(index=["layer", "head"], columns="adapter", values="attn_to_t")
-        piv.plot.bar(ax=ax)
-        ax.set_ylabel("mean attention from readout to t")
-        ax.set_title("Is the addressing inherited?\n(adapter on vs off)", fontsize=11)
-        fig.tight_layout()
-        fig.savefig(out_dir / "mover_addressing.png", dpi=150, bbox_inches="tight"); plt.close(fig)
+    name = "mover_trace.png" if scale is None else f"mover_trace_scale{scale:g}.png"
+    fig.savefig(out_dir / name, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"[mover] wrote {out_dir / name}")
 
 
 def replot_mover(spec, out_dir: Path, args) -> bool:
@@ -555,9 +939,14 @@ def replot_mover(spec, out_dir: Path, args) -> bool:
         return pd.read_csv(p) if p.exists() else pd.DataFrame(columns=cols)
 
     _plot(spec, pd.read_csv(heads_csv),
-          _rd("mover_source_positions.csv", ["layer", "head", "rel_source", "mean_slope"]),
-          _rd("mover_origin_components.csv", ["layer", "head", "component", "mean_slope"]),
-          _rd("mover_attention_base_vs_tuned.csv", ["layer", "head", "adapter", "attn_to_t"]),
+          _rd("mover_source_positions.csv",
+              ["layer", "head", "selected_as", "rel_source", "mean_slope"]),
+          _rd("mover_origin_components.csv",
+              ["layer", "head", "selected_as", "component", "mean_slope"]),
+          _rd("mover_attention_base_vs_tuned.csv",
+              ["layer", "head", "adapter", "condition", "injected", "attn_to_t"]),
+          _rd("mover_attention_profile.csv",
+              ["layer", "head", "adapter", "condition", "token_bin", "mean_attention"]),
           out_dir)
     return True
 
