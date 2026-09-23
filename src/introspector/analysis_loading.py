@@ -87,7 +87,11 @@ def compute_signal_ranges(raw) -> dict:
     intervention sampler was configured against during training; using test stats
     would quietly change the injected values relative to what the run saw.
     """
-    df = raw.to_pandas()
+    # only the three columns the stats need: a cached split also carries `text` and
+    # `text_input_ids`, and materializing those for 300k rows costs seconds and
+    # hundreds of MB per run -- once per run, times every run in a sweep.
+    cols = [c for c in ("signal_layer", "signal_index", "activation") if c in raw.column_names]
+    df = raw.select_columns(cols).to_pandas()
     ranges = {}
     for key, vals in df.groupby(["signal_layer", "signal_index"])["activation"]:
         ranges[key] = {"min": float(vals.min()), "max": float(vals.max()),

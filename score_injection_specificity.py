@@ -19,17 +19,19 @@ varied at a time, so each category isolates one claim:
     vary_position   (L, i, t')   same neuron, other token positions
                                  -> is it this token, or the neuron anywhere in the text?
 
-TWO STIMULUS TYPES, because "no response at the wrong locale" has a boring reading
-that has to be excluded. Values are drawn per row from:
+TWO STIMULUS TYPES (--stimuli, both by default), because "no response at the wrong
+locale" has a boring reading that has to be excluded. Values are drawn per row from:
 
-    target_dist   the TARGET neuron's own distribution -- the same stimulus the true
-                  locale receives, delivered to the wrong wire. This is the
-                  like-for-like control: identical numbers, different address.
-    own_dist      the PROBED locale's own empirical distribution, measured on this
-                  same corpus. A neuron with a tiny dynamic range would look
-                  unresponsive under target_dist merely because the injected values
-                  are off its natural scale; under own_dist it gets a perturbation
-                  sized to itself, so a null here cannot be blamed on scale.
+    target_dist   (--stimuli target) the TARGET neuron's own distribution -- the same
+                  stimulus the true locale receives, delivered to the wrong wire. This
+                  is the like-for-like control: identical numbers, different address.
+    own_dist      (--stimuli locale) the PROBED locale's own empirical distribution,
+                  measured on this same corpus. A neuron with a tiny dynamic range
+                  would look unresponsive under target_dist merely because the injected
+                  values are off its natural scale; under own_dist it gets a
+                  perturbation sized to itself, so a null cannot be blamed on scale.
+
+    For the true locale the two coincide by definition, so it is scored once.
 
 The draws are PAIRED: one standard-normal z per row is drawn once and reused for
 every locale and stimulus, rescaled by that locale's mean/std. Differences between
@@ -95,6 +97,14 @@ from src.introspector.training.model import InterventionHook
 # introspected token t. Log-ish spacing: what matters is the ORDER of magnitude of the
 # displacement, and +/-1 is the case a band-limited selector would fail on.
 DEFAULT_POSITION_OFFSETS = (-16, -8, -4, -2, -1, 1, 2, 4, 8, 16)
+# --stimuli values -> (column value written to the CSV, which locale's stats to draw
+# from). Named after WHOSE distribution supplies the numbers, since "native" is
+# ambiguous about whether it means the trained neuron or the one being probed.
+STIMULUS_CHOICES = {"target": "target_dist", "locale": "own_dist"}
+# Below this, the true locale is not reporting the injected value at that scale and the
+# wrong-locale comparison has nothing to stand against (see _summarize).
+WEAK_TRUE_CORR = 0.3
+
 # A locale is only scored when this many rows can actually receive the injection: a
 # position offset can fall outside a short document, and a correlation over a handful
 # of surviving rows is not comparable with one over the whole split. Override with
@@ -112,11 +122,22 @@ def parse_args():
                    help="Random indices of the signal layer probed by vary_index.")
     p.add_argument("--position-offsets", type=str, default=None,
                    help=f"Comma-separated offsets from t (default: {DEFAULT_POSITION_OFFSETS}).")
-    p.add_argument("--scales", type=str, default="10,1",
+    p.add_argument("--scales", type=str, default="1",
                    help="Injection scales (x the locale's std) to run the whole grid at. "
-                        "10 is where the trained runs operate and the true locale reads "
-                        "~0.98; 1 is the natural scale, where a null is uninformative "
-                        "because even the TRUE locale is near the noise floor.")
+                        "1 is the natural scale -- the size of perturbation the neuron "
+                        "actually undergoes. CAVEAT: a wrong-locale null only means "
+                        "something if the TRUE locale responds at the same scale, and a "
+                        "run trained with a 10x injection can sit near its noise floor "
+                        "at 1 (its own scale sweep is the reference). The true locale's "
+                        "corr is printed per scale and warned about when it is weak; "
+                        "pass e.g. --scales 1,10 to bracket it.")
+    p.add_argument("--stimuli", type=str, default="target",
+                   help="Which value distributions to inject, comma-separated (default: "
+                        "both). 'target' draws from the TRAINED neuron's own range and "
+                        "delivers it to the wrong wire; 'locale' draws from the probed "
+                        "(e.g. random) neuron's own range, so a null cannot be blamed on "
+                        "the values being off its natural scale. They coincide at the "
+                        "true locale, which is therefore scored once.") # empirically found target vs. locale doesn't change much
     p.add_argument("--batch-size", type=int, default=None,
                    help="Default: the run's own eval_batch_size.")
     p.add_argument("--min-valid-rows", type=int, default=MIN_VALID_ROWS,
@@ -314,6 +335,23 @@ def build_locales(run, args, rng):
     return locales
 
 
+def parse_stimuli(spec: str):
+    """'target,locale' -> [(csv value, which stats to use), ...], order preserved."""
+    out = []
+    for name in (x.strip().lower() for x in spec.split(",")):
+        if not name:
+            continue
+        if name not in STIMULUS_CHOICES:
+            raise SystemExit(f"Unknown --stimuli value {name!r}; "
+                             f"choose from {sorted(STIMULUS_CHOICES)}.")
+        pair = (STIMULUS_CHOICES[name], name)
+        if pair not in out:
+            out.append(pair)
+    if not out:
+        raise SystemExit("--stimuli selected nothing.")
+    return out
+
+
 def paired_values(z, stats, scale):
     """mean + scale*std*z, with ONE z per row shared across every locale and stimulus.
 
@@ -335,10 +373,11 @@ def score_run(run, args, out_dir: Path):
     rng = np.random.RandomState(args.seed + 1000 * run.layer + run.index)
     z = rng.randn(n_rows)
     scales = [float(s) for s in args.scales.split(",")]
+    stimuli = parse_stimuli(args.stimuli)
 
     locales = build_locales(run, args, rng)
-    print(f"[spec] {len(locales)} locales x {len(scales)} scale(s) x 2 stimuli on "
-          f"{n_rows} rows")
+    print(f"[spec] {len(locales)} locales x {len(scales)} scale(s) x "
+          f"{len(stimuli)} stimulus type(s) {[c for c, _ in stimuli]} on {n_rows} rows")
 
     # ---- natural stats for every locale (one pass) ----
     layer_indices: dict = {}
@@ -371,9 +410,16 @@ def score_run(run, args, out_dir: Path):
                       f"{own['n'] if own else 0} valid rows < --min-valid-rows "
                       f"{args.min_valid_rows} (of {n_rows} rows)")
                 continue
-            for stimulus, st in (("target_dist", target_stats), ("own_dist", own)):
-                if loc["category"] == "true" and stimulus == "own_dist":
-                    continue                      # identical to target_dist by definition
+            for stimulus, which in stimuli:
+                # At the true locale the probed neuron IS the target, so the two
+                # distributions are the same object and it is scored ONCE -- under
+                # whichever stimulus was requested first. Keyed off the request rather
+                # than hardcoding "skip own_dist", which dropped the true locale
+                # altogether under `--stimuli locale` and left the wrong-locale nulls
+                # with no reference and the positive control with nothing to check.
+                if loc["category"] == "true" and stimulus != stimuli[0][0]:
+                    continue
+                st = target_stats if which == "target" else own
                 vals = paired_values(z, st, scale)
                 pred, inj, valid = inject_and_read(
                     run, loader(), loc["layer"], loc["index"], loc["offset"],
@@ -412,7 +458,8 @@ def score_run(run, args, out_dir: Path):
     with open(out_dir / "injection_specificity_meta.json", "w") as f:
         json.dump({"run": run.config.experiment_name, "checkpoint": str(run.checkpoint),
                    "signal": f"N{run.layer}.{run.index}", "n_rows": n_rows,
-                   "scales": scales, "endogenous_corr": en_corr,
+                   "scales": scales, "stimuli": [c for c, _ in stimuli],
+                   "endogenous_corr": en_corr,
                    "target_stats": target_stats}, f, indent=2)
     print(f"[spec] wrote {out_dir}")
     return df
@@ -434,37 +481,82 @@ def _summarize(df, out_dir):
             print(f"[spec] scale={scale}: true={t.iloc[0]:.4f} | wrong locales: "
                   f"max={wrong.max():.4f} mean={wrong.mean():.4f} "
                   f"(n={len(wrong)}) -- the gap IS the specificity claim")
+            # A null at a wrong locale is only evidence of addressing if the RIGHT
+            # locale answers at the same scale. Runs trained with a large injection can
+            # sit near their noise floor at scale 1, where every locale reads ~0 and the
+            # file looks like perfect specificity while measuring nothing.
+            if abs(t.iloc[0]) < WEAK_TRUE_CORR:
+                print(f"[spec] *** WARNING: the TRUE locale only reads "
+                      f"{t.iloc[0]:.4f} at scale {scale}. The wrong-locale nulls below "
+                      f"it are NOT evidence of specificity -- nothing is being reported "
+                      f"at this scale. Re-run with a larger --scales (the run's own "
+                      f"interventional_scale_sweep.csv says where it responds). ***")
+
+
+# x axis of the summary figure: the three ways a locale can be wrong.
+PLOT_CONDITIONS = [("vary_index", "wrong index\n(same layer, same token)"),
+                   ("vary_layer", "wrong layer\n(same index, same token)"),
+                   ("vary_position", "wrong token\n(same neuron)")]
 
 
 def _plot(df, run, out_dir):
+    """One small panel per injection scale: the wrong locales as a distribution, the
+    true locale as the reference they are read against.
+
+    A box rather than corr-vs-coordinate scatters, because the coordinate carries no
+    information here -- neuron 5676 is not "between" 24 and 8191 in any sense the model
+    respects, and plotting against it invites reading a trend into what is a set of
+    independent nulls. What matters is the SPREAD of the wrong locales against the one
+    number that is supposed to stand apart from them.
+
+    Only the target-distribution stimulus is drawn (own_dist tracks it closely enough
+    that two series per condition was clutter); the CSV keeps both.
+    """
     if df.empty:
         return
+    if (df["stimulus"] == "target_dist").any():
+        df = df[df["stimulus"] == "target_dist"]
+
     for scale, g in df.groupby("scale"):
         true_corr = g[g["category"] == "true"]["corr"]
         true_corr = float(true_corr.iloc[0]) if len(true_corr) else float("nan")
-        fig, axes = plt.subplots(1, 3, figsize=(16, 4.6))
-        panels = [
-            ("vary_index", "inject_index", f"neuron index (layer {run.layer})", run.index),
-            ("vary_layer", "inject_layer", "layer (index fixed)", run.layer),
-            ("vary_position", "position_offset", "token offset from t", 0),
-        ]
-        for ax, (cat, xcol, xlabel, true_x) in zip(axes, panels):
-            sub = g[g["category"] == cat]
-            for stimulus, marker in (("target_dist", "o"), ("own_dist", "s")):
-                s = sub[sub["stimulus"] == stimulus].sort_values(xcol)
-                if len(s):
-                    ax.plot(s[xcol], s["corr"], marker, ms=5, ls="--", lw=0.8, alpha=0.8,
-                            label=stimulus)
-            ax.axhline(0, color="k", lw=0.8)
-            ax.scatter([true_x], [true_corr], marker="*", s=260, color="tab:red", zorder=5,
-                       label="true locale")
-            ax.set_xlabel(xlabel); ax.set_ylabel("corr(readout, injected v)")
-            ax.set_ylim(-0.1, 1.02); ax.grid(alpha=0.25); ax.set_title(cat)
-            if cat == "vary_index":
-                ax.set_xscale("symlog")
-            ax.legend(fontsize=8)
-        fig.suptitle(f"Injection specificity: {run.config.experiment_name} "
-                     f"(N{run.layer}.{run.index}, inject scale {scale}x)", y=1.02)
+
+        fig, ax = plt.subplots(figsize=(5.2, 3.4))
+        rng = np.random.RandomState(0)
+        data, labels, positions = [], [], []
+        for k, (cat, label) in enumerate(PLOT_CONDITIONS, 1):
+            vals = g[g["category"] == cat]["corr"].dropna().values
+            labels.append(f"{label}\nn={len(vals)}")
+            positions.append(k)
+            data.append(vals)
+            if len(vals):
+                # the individual locales, so a box drawn over 3 points is not mistaken
+                # for a distribution over many
+                ax.scatter(k + rng.uniform(-0.09, 0.09, len(vals)), vals, s=14,
+                           color="tab:blue", alpha=0.55, zorder=3, linewidths=0)
+        drawn = [(p, d) for p, d in zip(positions, data) if len(d)]
+        if drawn:
+            bp = ax.boxplot([d for _, d in drawn], positions=[p for p, _ in drawn],
+                            widths=0.5, patch_artist=True, showfliers=False, zorder=2)
+            for box in bp["boxes"]:
+                box.set(facecolor="tab:blue", alpha=0.22, edgecolor="tab:blue")
+            for part in ("whiskers", "caps", "medians"):
+                for artist in bp[part]:
+                    artist.set(color="tab:blue")
+
+        ax.axhline(0, color="k", lw=0.8, zorder=1)
+        if np.isfinite(true_corr):
+            ax.axhline(true_corr, color="tab:red", ls="--", lw=1.4, zorder=4,
+                       label=f"target locale N{run.layer}.{run.index} @t ({true_corr:.2f})")
+            ax.legend(fontsize=8, loc="best", framealpha=0.9)
+        ax.set_xticks(positions); ax.set_xticklabels(labels, fontsize=8)
+        ax.set_ylabel("corr(readout, injected v)", fontsize=9)
+        lo = min(-0.08, float(np.nanmin([v.min() for v in data if len(v)], initial=0)) - 0.05)
+        ax.set_ylim(lo, max(1.02, true_corr + 0.08 if np.isfinite(true_corr) else 1.02))
+        ax.tick_params(labelsize=8)
+        ax.grid(axis="y", alpha=0.25)
+        ax.set_title(f"{run.config.experiment_name}\ninjection scale {scale:g}x",
+                     fontsize=8)
         fig.tight_layout()
         path = out_dir / f"injection_specificity_scale{scale:g}.png"
         fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
