@@ -69,7 +69,7 @@ from torch.utils.data import DataLoader
 from src.introspector.analysis_loading import (
     load_run_for_analysis, absolute_positions, layer_output_is_tuple)
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
-from src.introspector.run_discovery import add_discovery_args, runs_from_args
+from src.introspector.run_discovery import add_discovery_args, runs_from_args, resolve_run_action
 from src.introspector.training.model import InterventionHook
 from trace_introspection_circuit import readout_scale, contribution, linfit_slope_r2
 
@@ -542,6 +542,26 @@ def _plot(run, heads_df, src_df, comp_df, addr_df, out_dir):
         fig.savefig(out_dir / "mover_addressing.png", dpi=150, bbox_inches="tight"); plt.close(fig)
 
 
+def replot_mover(spec, out_dir: Path, args) -> bool:
+    """Redraw the mover-trace figures from the four cached CSVs; False if the primary
+    one is absent. Optional CSVs fall back to empty frames with the right columns so the
+    plot's groupbys stay valid."""
+    heads_csv = out_dir / "mover_heads.csv"
+    if not heads_csv.exists():
+        return False
+
+    def _rd(name, cols):
+        p = out_dir / name
+        return pd.read_csv(p) if p.exists() else pd.DataFrame(columns=cols)
+
+    _plot(spec, pd.read_csv(heads_csv),
+          _rd("mover_source_positions.csv", ["layer", "head", "rel_source", "mean_slope"]),
+          _rd("mover_origin_components.csv", ["layer", "head", "component", "mean_slope"]),
+          _rd("mover_attention_base_vs_tuned.csv", ["layer", "head", "adapter", "attn_to_t"]),
+          out_dir)
+    return True
+
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -552,9 +572,15 @@ def main():
     for k, spec in enumerate(runs, 1):
         out_dir = ((args.output_dir or (spec.run_dir / "mover_trace")) if not sweeping
                    else spec.run_dir / "mover_trace")
-        if args.skip_existing and (out_dir / "mover_heads.csv").exists():
+        action = resolve_run_action(args, out_dir / "mover_heads.csv")
+        if action == "skip":
             print(f"[mover] [{k}/{len(runs)}] {spec.name}: results exist, skipping")
             continue
+        if action == "replot":
+            if replot_mover(spec, out_dir, args):
+                print(f"[mover] [{k}/{len(runs)}] {spec.name}: re-plotted from cache")
+                continue
+            print(f"[mover] [{k}/{len(runs)}] {spec.name}: cache incomplete, recomputing")
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n[mover] ===== [{k}/{len(runs)}] {spec.name} ({spec.cell}) =====")
         run = load_run_for_analysis(spec.config, checkpoint=args.checkpoint or spec.checkpoint())

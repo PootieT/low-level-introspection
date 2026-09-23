@@ -88,7 +88,7 @@ from torch.utils.data import DataLoader
 
 from src.introspector.analysis_loading import load_run_for_analysis, absolute_positions
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
-from src.introspector.run_discovery import add_discovery_args, runs_from_args
+from src.introspector.run_discovery import add_discovery_args, runs_from_args, resolve_run_action
 from src.introspector.training.model import InterventionHook
 
 # Token-position offsets probed by the vary_position category, relative to the
@@ -471,6 +471,15 @@ def _plot(df, run, out_dir):
         print(f"[spec] wrote {path}")
 
 
+def replot_specificity(spec, out_dir: Path, args) -> bool:
+    """Redraw the specificity figures from injection_specificity.csv; False if absent."""
+    csv = out_dir / "injection_specificity.csv"
+    if not csv.exists():
+        return False
+    _plot(pd.read_csv(csv), spec, out_dir)
+    return True
+
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -481,9 +490,15 @@ def main():
     for k, spec in enumerate(runs, 1):
         out_dir = ((args.output_dir or (spec.run_dir / "injection_specificity")) if not sweeping
                    else spec.run_dir / "injection_specificity")
-        if args.skip_existing and (out_dir / "injection_specificity.csv").exists():
+        action = resolve_run_action(args, out_dir / "injection_specificity.csv")
+        if action == "skip":
             print(f"[spec] [{k}/{len(runs)}] {spec.name}: results exist, skipping")
             continue
+        if action == "replot":
+            if replot_specificity(spec, out_dir, args):
+                print(f"[spec] [{k}/{len(runs)}] {spec.name}: re-plotted from cache")
+                continue
+            print(f"[spec] [{k}/{len(runs)}] {spec.name}: cache incomplete, recomputing")
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n[spec] ===== [{k}/{len(runs)}] {spec.name} ({spec.cell}) =====")
         run = load_run_for_analysis(spec.config, checkpoint=args.checkpoint or spec.checkpoint())

@@ -426,6 +426,56 @@ def conditions_from_runs(runs) -> list[dict]:
             for r in runs]
 
 
+def plot_profiles_from_df(df, out_dir, group_profiles=None):
+    """Draw the profile figures from an already-built profiles frame. Shared by main()
+    and the --from-cache re-plot path so both stay in lockstep. Returns group_profiles."""
+    # A line per condition is the point at 4 conditions and unreadable at 320, so a
+    # handful gets per-condition panels and a sweep gets the grouped version instead.
+    if group_profiles is None:
+        group_profiles = df["condition"].nunique() > 12
+    if group_profiles:
+        for by in ("signal_layer", "position"):
+            if df[by].nunique() > 1:
+                plot_profiles_grouped(df, out_dir, group_col=by, x="rel_depth")
+                plot_profiles_grouped(df, out_dir, group_col=by, x="rel_depth", value="frob")
+    else:
+        for x in ("rel_depth", "layer"):
+            plot_profiles(df, out_dir, x=x)
+            # absolute (log) version too: required for any "A moved more weight than B"
+            # claim, since the normalized panels hide that different KL budgets rescale all.
+            plot_profiles(df, out_dir, x=x, value="frob")
+    return group_profiles
+
+
+def plot_targeted_from_t(t, out_dir):
+    """Aggregate the long-format targeted table and draw its figures. Shared by main()
+    and --from-cache. Returns (per_run, cell)."""
+    per_run, cell = aggregate_targeted(t, out_dir)
+    plot_target_vs_random(t, out_dir)
+    if cell["position"].notna().any() and len(cell) > len(cell["module"].unique()):
+        plot_targeted_heatmaps(cell, out_dir)
+    return per_run, cell
+
+
+def replot_from_cache(out_dir, group_profiles=None):
+    """Re-draw every figure from the CSVs a previous run cached in out_dir, without
+    loading any checkpoint or the base model. Use after tweaking plot styling."""
+    out_dir = Path(out_dir)
+    prof_csv = out_dir / "lora_profiles.csv"
+    if not prof_csv.exists():
+        raise SystemExit(f"No cached CSVs in {out_dir} (missing {prof_csv.name}). "
+                         f"Run once without --from-cache to generate them.")
+    plot_profiles_from_df(pd.read_csv(prof_csv), out_dir, group_profiles)
+
+    t_csv = out_dir / "lora_targeted_columns.csv"
+    if t_csv.exists():
+        plot_targeted_from_t(pd.read_csv(t_csv), out_dir)
+    else:
+        print(f"[lora] no {t_csv.name} in {out_dir}; skipping targeted-column plots "
+              "(the first run used --no-base-model).")
+    print(f"[lora] re-plotted from cache -> {out_dir}")
+
+
 def main(conditions, out_dir, per_checkpoint=True, use_base_model=True,
          model_name="meta-llama/Llama-3.2-1B", n_random=DEFAULT_N_RANDOM,
          group_profiles=None):
@@ -454,23 +504,7 @@ def main(conditions, out_dir, per_checkpoint=True, use_base_model=True,
 
     df = pd.concat(profiles, ignore_index=True)
     df.to_csv(out_dir / "lora_profiles.csv", index=False)
-    # A line per condition is the point at 4 conditions and unreadable at 320, so the
-    # per-condition panels are drawn only for a handful and the sweep gets the grouped
-    # version instead. group_profiles=None picks by size.
-    if group_profiles is None:
-        group_profiles = df["condition"].nunique() > 12
-    if group_profiles:
-        for by in ("signal_layer", "position"):
-            if df[by].nunique() > 1:
-                plot_profiles_grouped(df, out_dir, group_col=by, x="rel_depth")
-                plot_profiles_grouped(df, out_dir, group_col=by, x="rel_depth", value="frob")
-    else:
-        plot_profiles(df, out_dir, x="rel_depth")
-        plot_profiles(df, out_dir, x="layer")
-        # absolute versions: required for any "A moved more weight than B" statement,
-        # since the normalized panels hide that different KL budgets rescale everything
-        plot_profiles(df, out_dir, x="rel_depth", value="frob")
-        plot_profiles(df, out_dir, x="layer", value="frob")
+    plot_profiles_from_df(df, out_dir, group_profiles)
 
     tot = (df.groupby("condition")["frob"].sum().sort_values(ascending=False)
              .rename("total_||dW||_F").reset_index())
@@ -480,10 +514,7 @@ def main(conditions, out_dir, per_checkpoint=True, use_base_model=True,
     if targeted:
         t = pd.DataFrame(targeted)
         t.to_csv(out_dir / "lora_targeted_columns.csv", index=False)
-        per_run, cell = aggregate_targeted(t, out_dir)
-        plot_target_vs_random(t, out_dir)
-        if cell["position"].notna().any() and len(cell) > len(cell["module"].unique()):
-            plot_targeted_heatmaps(cell, out_dir)
+        per_run, cell = plot_targeted_from_t(t, out_dir)
 
         print("\n[lora] targeted-column test (is the READ neuron special?), per run:")
         cols = ["condition", "layer", "position", "module", "rel_norm_target",
@@ -514,6 +545,10 @@ if __name__ == "__main__":
                    help="Skip the targeted-column test (which needs base weights).")
     p.add_argument("--no-per-checkpoint", action="store_true",
                    help="Skip the per-checkpoint heatmap/lineplot from plot_lora_weight_pattern.")
+    p.add_argument("--from-cache", action="store_true",
+                   help="Re-draw every figure from a previous run's cached CSVs in --out-dir "
+                        "(or the group's default plot dir) -- no checkpoints or base model "
+                        "loaded. For iterating on plot styling.")
     p.add_argument("--n-random", type=int, default=DEFAULT_N_RANDOM,
                    help="Untrained indices of the signal layer measured alongside the target "
                         "as the baseline distribution (0 disables).")
@@ -524,6 +559,18 @@ if __name__ == "__main__":
     args = p.parse_args()
 
     GROUP = "mlp_joint_prev_token_hyper"
+    if args.from_cache:
+        # out_dir is resolved the same way as a real run, so --from-cache pairs with the
+        # same --group / --out-dir the original run used.
+        if args.out_dir:
+            cache_dir = args.out_dir
+        elif args.group:
+            cache_dir = ROOT / "outputs/plots" / args.group / "lora_weights"
+        else:
+            cache_dir = ROOT / "outputs/plots/lora_weight_pattern_compare"
+        replot_from_cache(cache_dir)
+        raise SystemExit(0)
+
     if args.group or args.config:
         conditions = conditions_from_runs(runs_from_args(args))
         if not conditions:

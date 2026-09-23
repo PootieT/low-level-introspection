@@ -69,7 +69,7 @@ from src.introspector.config import ExperimentConfig
 from src.introspector.analysis_loading import (
     load_run_for_analysis, absolute_positions, layer_output_is_tuple)
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
-from src.introspector.run_discovery import add_discovery_args, runs_from_args
+from src.introspector.run_discovery import add_discovery_args, runs_from_args, resolve_run_action
 
 from nnsight.modeling.language import LanguageModel
 
@@ -613,9 +613,15 @@ def main():
         # they describe and the aggregator can find them by globbing run dirs
         out_dir = ((args.output_dir or (spec.run_dir / "circuit_trace")) if not sweeping
                    else spec.run_dir / "circuit_trace")
-        if args.skip_existing and (out_dir / "decodability.csv").exists():
+        action = resolve_run_action(args, out_dir / "decodability.csv")
+        if action == "skip":
             print(f"[trace] [{k}/{len(runs)}] {spec.name}: results exist, skipping")
             continue
+        if action == "replot":
+            if replot_circuit(spec, out_dir, args):
+                print(f"[trace] [{k}/{len(runs)}] {spec.name}: re-plotted from cache")
+                continue
+            print(f"[trace] [{k}/{len(runs)}] {spec.name}: cache incomplete, recomputing")
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n[trace] ===== [{k}/{len(runs)}] {spec.name} ({spec.cell}) =====")
         run = load_run_for_analysis(spec.config, checkpoint=args.checkpoint or spec.checkpoint())
@@ -674,6 +680,35 @@ def _plot_decodability(mat, probe_labels, n_layers, inject_layer, out_dir):
     plt.tight_layout()
     plt.savefig(out_dir / "decodability.png", dpi=150)
     plt.close()
+
+
+def replot_circuit(spec, out_dir: Path, args) -> bool:
+    """Redraw the three circuit-trace figures from cached CSVs + trace_meta.json; False
+    if any is missing. head/decodability matrices are pivoted back out of the long CSVs;
+    layer/head counts and scalars come from the CSVs and meta."""
+    comp_csv = out_dir / "attribution_components.csv"
+    heads_csv = out_dir / "attribution_heads.csv"
+    dec_csv = out_dir / "decodability.csv"
+    meta_p = out_dir / "trace_meta.json"
+    if not (comp_csv.exists() and heads_csv.exists() and dec_csv.exists() and meta_p.exists()):
+        return False
+    meta = json.loads(meta_p.read_text())
+    attr_df = pd.read_csv(comp_csv)
+    head_df = pd.read_csv(heads_csv)
+    dec_df = pd.read_csv(dec_csv)
+    start_layer = int(meta["start_layer"])
+    inject_layer = int(meta["inject_layer"])
+    n_layers = int(max(head_df["layer"].max(), dec_df["layer"].max())) + 1
+    n_heads = int(head_df["head"].max()) + 1
+    probe_labels = meta.get("probe_labels") or list(dict.fromkeys(dec_df["probe"]))
+    head_mat = (head_df.pivot(index="layer", columns="head", values="mean_slope")
+                .reindex(index=range(start_layer, n_layers), columns=range(n_heads)).to_numpy())
+    dec_mat = (dec_df.pivot(index="layer", columns="probe", values="corr")
+               .reindex(index=range(n_layers), columns=probe_labels).to_numpy())
+    _plot_attribution(attr_df, n_layers, start_layer, inject_layer, out_dir)
+    _plot_heads(head_mat, start_layer, n_layers, n_heads, out_dir)
+    _plot_decodability(dec_mat, probe_labels, n_layers, inject_layer, out_dir)
+    return True
 
 
 if __name__ == "__main__":

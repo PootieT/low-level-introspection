@@ -264,7 +264,27 @@ def add_discovery_args(parser):
                         help="Total array tasks (default: $SGE_TASK_LAST).")
     parser.add_argument("--skip-existing", action="store_true",
                         help="Skip runs whose result file already exists.")
+    parser.add_argument("--from-cache", action="store_true",
+                        help="For each run: if its cached results exist, skip the slow "
+                             "recompute and just regenerate the plots from those cached "
+                             "CSVs/arrays; otherwise compute it normally. For iterating on "
+                             "plot styling without re-running the whole sweep.")
     return parser
+
+
+def resolve_run_action(args, sentinel: Path) -> str:
+    """Per-run dispatch shared by every analysis loop: returns 'replot', 'skip', or
+    'compute' from --from-cache / --skip-existing and whether `sentinel` (a file that
+    only exists once the run finished) is present.
+
+    --from-cache wins: a cached run is re-plotted, an uncached one is computed (resume).
+    The caller's replot function still validates the cache and may fall back to compute."""
+    exists = Path(sentinel).exists()
+    if getattr(args, "from_cache", False):
+        return "replot" if exists else "compute"
+    if getattr(args, "skip_existing", False) and exists:
+        return "skip"
+    return "compute"
 
 
 def runs_from_args(args, require_checkpoint: bool = True) -> list[RunSpec]:

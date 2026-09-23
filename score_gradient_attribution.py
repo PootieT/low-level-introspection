@@ -71,7 +71,7 @@ from torch.utils.data import DataLoader
 
 from src.introspector.analysis_loading import load_run_for_analysis, absolute_positions
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
-from src.introspector.run_discovery import add_discovery_args, runs_from_args
+from src.introspector.run_discovery import add_discovery_args, runs_from_args, resolve_run_action
 
 # Attribution is accumulated in coordinates RELATIVE to the introspected token t,
 # because t is what the prompt names and what the readout has to find; absolute
@@ -370,18 +370,36 @@ def report(run, args, mean_signed, mean_abs, counts, frac_prompt, preds, acts, o
     print(f"[grad] top unit: L{summary['top1']['layer']} n{summary['top1']['neuron']} "
           f"rel{summary['top1']['rel_position']:+d} |attr|={summary['top1']['mean_abs_attr']:.3e}")
     print(top_df.head(10).to_string(index=False))
-    _plot(run, args, mean_abs, counts, pos_df, at_t, out_dir)
+    # small arrays the plot needs but the CSVs do not hold, cached so --from-cache can
+    # redraw without a forward/backward pass (the full [L, rel, neurons] tensor is not saved)
+    mass = mean_abs.sum(-1).numpy()
+    np.savez(out_dir / "gradient_attribution_arrays.npz",
+             mass=mass, counts=counts.numpy(), at_t=at_t.numpy())
+    _plot(run, args, mass, counts.numpy(), pos_df, at_t.numpy(), out_dir)
     return summary
 
 
-def _plot(run, args, mean_abs, counts, pos_df, at_t, out_dir):
+def replot_gradient(spec, out_dir: Path, args) -> bool:
+    """Redraw the gradient-attribution figure from cache; False if the cache is incomplete."""
+    npz = out_dir / "gradient_attribution_arrays.npz"
+    pos_csv = out_dir / "attribution_by_position.csv"
+    if not (npz.exists() and pos_csv.exists()):
+        return False
+    d = np.load(npz)
+    _plot(spec, args, d["mass"], d["counts"], pd.read_csv(pos_csv), d["at_t"], out_dir)
+    return True
+
+
+def _plot(run, args, mass, counts, pos_df, at_t, out_dir):
+    """`mass` [layers, rel] and `at_t` [neurons] are the small plot-only arrays cached
+    to npz (the full [layers, rel, neurons] tensor is not); `counts` [layers, rel]."""
     L, i = run.layer, run.index
     rel0 = args.max_rel
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.4))
 
     # 1: attribution mass by (layer, relative position), summed over neurons
-    mass = mean_abs.sum(-1).numpy()
-    mass[counts.numpy() == 0] = np.nan
+    mass = np.asarray(mass, dtype=float).copy()
+    mass[np.asarray(counts) == 0] = np.nan
     lo, hi = -args.max_rel, args.max_rel
     im = axes[0].imshow(mass, aspect="auto", origin="lower", extent=[lo, hi, -0.5, mass.shape[0] - 0.5],
                         cmap="magma")
@@ -401,7 +419,7 @@ def _plot(run, args, mean_abs, counts, pos_df, at_t, out_dir):
     axes[1].set_title("target neuron across positions"); axes[1].grid(alpha=0.25)
 
     # 3: where the target sits in its layer's distribution at t
-    v = at_t.numpy()
+    v = np.asarray(at_t, dtype=float)
     v = v[v > 0]
     axes[2].hist(np.log10(v), bins=60, color="tab:grey")
     tgt = float(at_t[i])
@@ -427,9 +445,15 @@ def main():
     for k, spec in enumerate(runs, 1):
         out_dir = ((args.output_dir or (spec.run_dir / "gradient_attribution")) if not sweeping
                    else spec.run_dir / "gradient_attribution")
-        if args.skip_existing and (out_dir / "attribution_summary.json").exists():
+        action = resolve_run_action(args, out_dir / "attribution_summary.json")
+        if action == "skip":
             print(f"[grad] [{k}/{len(runs)}] {spec.name}: results exist, skipping")
             continue
+        if action == "replot":
+            if replot_gradient(spec, out_dir, args):
+                print(f"[grad] [{k}/{len(runs)}] {spec.name}: re-plotted from cache")
+                continue
+            print(f"[grad] [{k}/{len(runs)}] {spec.name}: cache incomplete, recomputing")
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n[grad] ===== [{k}/{len(runs)}] {spec.name} ({spec.cell}) =====")
         run = load_run_for_analysis(spec.config, checkpoint=args.checkpoint or spec.checkpoint())

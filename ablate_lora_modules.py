@@ -52,7 +52,7 @@ from torch.utils.data import DataLoader
 
 from src.introspector.config import ExperimentConfig
 from src.introspector.analysis_loading import load_run_for_analysis
-from src.introspector.run_discovery import add_discovery_args, runs_from_args
+from src.introspector.run_discovery import add_discovery_args, runs_from_args, resolve_run_action
 from trace_introspection_circuit import endogenous_predictions, select_success_indices
 
 MODULE_ORDER = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
@@ -191,9 +191,15 @@ def main():
     for k, spec in enumerate(runs, 1):
         out_dir = ((args.output_dir or (spec.run_dir / "lora_ablation")) if not sweeping
                    else spec.run_dir / "lora_ablation")
-        if args.skip_existing and (out_dir / "lora_ablation.csv").exists():
+        action = resolve_run_action(args, out_dir / "lora_ablation.csv")
+        if action == "skip":
             print(f"[ablate] [{k}/{len(runs)}] {spec.name}: results exist, skipping")
             continue
+        if action == "replot":
+            if replot_ablation(spec, out_dir, args):
+                print(f"[ablate] [{k}/{len(runs)}] {spec.name}: re-plotted from cache")
+                continue
+            print(f"[ablate] [{k}/{len(runs)}] {spec.name}: cache incomplete, recomputing")
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n[ablate] ===== [{k}/{len(runs)}] {spec.name} ({spec.cell}) =====")
         run = load_run_for_analysis(spec.config,
@@ -294,6 +300,32 @@ def _plot_delta(mat, layers, modules, baseline, title, path):
     plt.tight_layout()
     plt.savefig(path, dpi=150)
     plt.close()
+
+
+def replot_ablation(spec, out_dir: Path, args) -> bool:
+    """Redraw both ablation heatmaps from lora_ablation.csv; False if it is absent.
+    The per-(layer, module) delta matrices are pivoted back out of the long CSV."""
+    csv = out_dir / "lora_ablation.csv"
+    if not csv.exists():
+        return False
+    df = pd.read_csv(csv)
+    per = df[~df["layer"].astype(str).isin(["baseline", "all_off"])].copy()
+    per["layer"] = per["layer"].astype(int)
+    layers = sorted(per["layer"].unique())
+    modules = [m for m in MODULE_ORDER if m in set(per["module"])]
+
+    def _mat(col):
+        return (per.pivot_table(index="layer", columns="module", values=col)
+                .reindex(index=layers, columns=modules).to_numpy())
+
+    base = df[df["layer"].astype(str) == "baseline"].iloc[0]
+    _plot_delta(_mat("d_interv"), layers, modules, float(base["interv"]),
+                "Δ interventional corr when module ablated",
+                out_dir / "ablation_delta_interventional.png")
+    _plot_delta(_mat("d_endo"), layers, modules, float(base["endo"]),
+                "Δ endogenous corr when module ablated",
+                out_dir / "ablation_delta_endogenous.png")
+    return True
 
 
 if __name__ == "__main__":
