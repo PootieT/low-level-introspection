@@ -278,7 +278,7 @@ def paired_stats(merged, metric, label_a, label_b, min_activation_std=1e-6):
 
 
 def plot_ood_ladder(frames: dict, out_dir, readout="endogenous", common_only=True,
-                    arm_colors=None):
+                    arm_colors=None, corpus_order=None):
     """Every arm across the corpus ladder, mean ± SE over neurons.
 
     common_only restricts to runs present in ALL arms, so a line is not lifted by a
@@ -293,7 +293,7 @@ def plot_ood_ladder(frames: dict, out_dir, readout="endogenous", common_only=Tru
                       if c.startswith("ood_") and c.endswith(f"_{readout}")})
     if not corpora:
         print(f"[cmp] no OOD {readout} columns; skipping ladder")
-        return
+        return None
     rows = []
     for arm, f in frames.items():
         for corpus in ["in-domain"] + corpora:
@@ -308,12 +308,20 @@ def plot_ood_ladder(frames: dict, out_dir, readout="endogenous", common_only=Tru
     df = pd.DataFrame(rows)
     if df.empty:
         print(f"[cmp] ladder ({readout}): no data; skipping")
-        return
-    # OOD corpora ordered by DECREASING mean performance (averaged over arms), with
-    # in-domain pinned leftmost as the reference.
-    ood_order = (df[df["corpus"] != "in-domain"].groupby("corpus")["mean"].mean()
-                 .sort_values(ascending=False).index.tolist())
-    order = ["in-domain"] + ood_order
+        return None
+    if corpus_order is not None:
+        # reuse a shared order (from the endogenous plot) so both readouts line up;
+        # keep only corpora present here, appending any extras by their own performance.
+        order = [c for c in corpus_order if c in set(df["corpus"])]
+        extra = (df[(~df["corpus"].isin(order)) & (df["corpus"] != "in-domain")]
+                 .groupby("corpus")["mean"].mean().sort_values(ascending=False).index.tolist())
+        order = order + extra
+    else:
+        # OOD corpora ordered by DECREASING mean performance (averaged over arms), with
+        # in-domain pinned leftmost as the reference.
+        ood_order = (df[df["corpus"] != "in-domain"].groupby("corpus")["mean"].mean()
+                     .sort_values(ascending=False).index.tolist())
+        order = ["in-domain"] + ood_order
     fig, ax = plt.subplots(figsize=(13, 8))
     for arm, sub in df.groupby("arm"):
         sub = sub.set_index("corpus").reindex(order).reset_index()
@@ -336,6 +344,7 @@ def plot_ood_ladder(frames: dict, out_dir, readout="endogenous", common_only=Tru
     fig.savefig(path, dpi=150); plt.close(fig)
     df.to_csv(Path(out_dir) / f"ood_ladder_{readout}.csv", index=False)
     print(f"[cmp] wrote {path}")
+    return order
 
 
 def pretty_arm(label: str) -> str:
@@ -472,8 +481,11 @@ def main(arms: dict, out_dir, pairs=None, model=None):
                                                     index=False)
     # one color per arm, shared by both readouts so their legends line up
     arm_colors = {arm: c for arm, c in zip(frames, plt.get_cmap("tab10").colors)}
-    plot_ood_ladder(frames, out_dir, readout="endogenous", arm_colors=arm_colors)
-    plot_ood_ladder(frames, out_dir, readout="interventional", arm_colors=arm_colors)
+    # order corpora by endogenous performance, then reuse that x-order for the
+    # interventional ladder so the two figures line up column-for-column.
+    endo_order = plot_ood_ladder(frames, out_dir, readout="endogenous", arm_colors=arm_colors)
+    plot_ood_ladder(frames, out_dir, readout="interventional", arm_colors=arm_colors,
+                    corpus_order=endo_order)
     return frames, tables
 
 
