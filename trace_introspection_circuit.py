@@ -69,7 +69,11 @@ from src.introspector.config import ExperimentConfig
 from src.introspector.analysis_loading import (
     load_run_for_analysis, absolute_positions, layer_output_is_tuple)
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
-from src.introspector.run_discovery import add_discovery_args, runs_from_args, resolve_run_action
+from src.introspector.run_discovery import (
+    add_discovery_args, runs_from_args, resolve_run_action)
+from src.introspector.regimes import (
+    DEFAULT_REGIMES, DEFAULT_LOCAL_DELTA_SIGMA, parse_regimes, zero_offset_index,
+    identity_check, power_warning)
 
 from nnsight.modeling.language import LanguageModel
 
@@ -143,7 +147,19 @@ def parse_args():
     # dose-response grid
     p.add_argument("--grid-points", type=int, default=10)
     p.add_argument("--grid-std-mult", type=float, default=3.0,
-                   help="Grid spans mean +/- (this * std) of the neuron's endogenous distribution.")
+                   help="Global grids span mean +/- (this * std * scale) of the neuron's "
+                        "endogenous distribution.")
+    p.add_argument("--regimes", type=str, default=DEFAULT_REGIMES,
+                   help="Injection regimes to sweep, comma separated (see "
+                        "src/introspector/regimes.py). 'xN' is a global grid at N times "
+                        "the natural std, 'xtrain' the run's own training scale, and "
+                        "'local' perturbs each example around ITS OWN current value -- "
+                        "the tangent at the operating point rather than a chord across "
+                        "the whole natural range. They disagree when the response is "
+                        "nonlinear, which is the point of running both.")
+    p.add_argument("--local-delta-sigma", type=float, default=DEFAULT_LOCAL_DELTA_SIGMA,
+                   help="Half-width of the 'local' sweep, in units of the neuron's std. "
+                        "Override per regime with e.g. 'local@0.5'.")
     # scope / infra
     p.add_argument("--start-layer", type=int, default=None,
                    help="First layer for per-head attention decomposition (default: the injected layer).")
@@ -344,6 +360,10 @@ def trace_batch(lm, layers, embed, norm, inputs, abs_pos, inject_layer, inject_p
     `layer_out_tuple` says whether a decoder layer returns `(hidden, ...)` or the bare
     tensor -- it differs between transformers 4.x and 5.x, so it is DETECTED per run
     (see analysis_loading.layer_output_is_tuple) rather than assumed here.
+
+    `v` is either a scalar (global regimes: every example gets the same value) or a
+    [B] tensor (the `local` regime: every example gets its own value). Advanced-index
+    assignment handles both identically.
     """
     bs = inputs["input_ids"].shape[0]
     bidx = torch.arange(bs, device=abs_pos.device)
@@ -383,6 +403,44 @@ def trace_batch(lm, layers, embed, norm, inputs, abs_pos, inject_layer, inject_p
     }
 
 
+@torch.no_grad()
+def capture_live_centres(model, dataset, collator, batch_size, inject_layer, neuron):
+    """
+    The neuron's LIVE activation at the introspected token, per example, in dataset
+    order -- the centre the `local` regime perturbs around.
+
+    Taken from the model as it is, NOT from the cached `activation` column. Those are
+    the same thing only when the adapter is gated off the input text; with the gate
+    off the adapter changes the very neuron it reports on (the drift diagnostic
+    measures corr ~0.87 on the pre-flight runs), and centring on the cached value
+    would perturb around a point the model is not at -- which the delta=0 identity
+    check would then fail.
+    """
+    from torch.utils.data import DataLoader
+    path = resolve_mlp_signal_path(model, inject_layer, path_to_output=False)
+    module = operator.attrgetter(path)(model)
+    grabbed = {}
+
+    def hook(_m, _inputs, outputs):
+        grabbed["act"] = outputs.detach()
+
+    out = []
+    dl = DataLoader(dataset, batch_size=batch_size, collate_fn=collator, shuffle=False)
+    for batch in dl:
+        batch = batch.to(model.device)
+        attn_mask = batch["attention_mask"]
+        abs_pos = absolute_positions(batch["token_position"], attn_mask)
+        handle = module.register_forward_hook(hook)
+        try:
+            model(input_ids=batch["input_ids"], attention_mask=attn_mask,
+                  lora_token_mask=batch.get("lora_token_mask"), do_intervention=False)
+        finally:
+            handle.remove()
+        rows = torch.arange(abs_pos.shape[0], device=abs_pos.device)
+        out.append(grabbed["act"][rows, abs_pos, neuron].float().cpu())
+    return torch.cat(out)
+
+
 # ======================================================================
 # Main
 # ======================================================================
@@ -416,13 +474,26 @@ def trace_one_run(run, args, out_dir: Path):
     sub = test_dataset.select(idx)
     print(f"{len(idx)} endogenous examples selected ...")
 
-    # ---- dose-response grid over the neuron's endogenous gaussian ----
+    # ---- injection regimes ----
     stats = signal_ranges[(inject_layer, neuron)]
-    lo = stats["mean"] - args.grid_std_mult * stats["std"]
-    hi = stats["mean"] + args.grid_std_mult * stats["std"]
-    grid = torch.linspace(lo, hi, args.grid_points)
-    print(f"[trace] v-grid: {args.grid_points} points in [{lo:.4f}, {hi:.4f}] "
-          f"(neuron mean={stats['mean']:.4f} std={stats['std']:.4f})")
+    tc = run.config.training_config
+    train_scale = (tc.intervention_extreme_scale
+                   if tc.intervention_signal_distribution == "extreme" else 1.0)
+    regimes = parse_regimes(args.regimes, stats, args.grid_points, args.grid_std_mult,
+                            delta_sigma=args.local_delta_sigma, train_scale=train_scale)
+    for rg in regimes:
+        print(f"[trace] regime {rg.describe(stats)}")
+
+    # `local` perturbs each example around its own live activation, so those have to be
+    # measured first -- and in the SAME order the trace loop will see them (the loader
+    # is sequential and unshuffled, so a plain concatenation lines up row for row).
+    centres = None
+    if any(rg.is_local for rg in regimes):
+        centres = capture_live_centres(model, sub, collator, args.batch_size,
+                                       inject_layer, neuron)
+        print(f"[trace] live centres for {len(centres)} examples: "
+              f"mean={centres.mean():.4f} std={centres.std():.4f} "
+              f"(cached-column mean={stats['mean']:.4f} std={stats['std']:.4f})")
 
     # transformers 4.x decoder layers return (hidden, ...), 5.x returns the tensor;
     # every residual capture below has to index the right one
@@ -433,17 +504,24 @@ def trace_one_run(run, args, out_dir: Path):
     layers, embed, norm = nnsight_module_handles(lm, inject_layer)
     inject_path = resolve_signal_injection_path(lm, signal_type, inject_layer)
 
-    # accumulators indexed [example, grid_point]
     comp_names = ["embed"] + [f"attn_{L}" for L in range(n_layers)] + [f"mlp_{L}" for L in range(n_layers)]
-    contribs = {c: [] for c in comp_names}                       # each -> list over grid of [Nexp]
-    head_contribs = {L: [] for L in range(start_layer, n_layers)}  # -> list over grid of [Nexp, n_heads]
-    pred_check = []                                              # [grid][Nexp]
     n_probe_rows = min(args.probe_examples, len(sub))
-    resid_probe = {L: [] for L in range(n_layers)}               # decodability: [Nprobe, P, H]
-    probe_valid, probe_region = None, None                       # set on the first grid pass
-
+    # the injected tensor must match the model's dtype: a python float is coerced by
+    # index_put, a fp32 tensor written into a bf16 activation is not. Round-tripping a
+    # captured bf16 centre through fp32 and back is lossless, so delta=0 still writes
+    # back exactly the value that was there.
+    inject_dtype = next(model.parameters()).dtype
     from torch.utils.data import DataLoader
-    for gi, v in enumerate(grid):
+
+    def measure(regime):
+      """One full sweep of `regime`: per-component/per-head contributions, the
+      prediction, and the probe residuals, accumulated over its grid."""
+      contribs = {c: [] for c in comp_names}                       # each -> list over grid of [Nexp]
+      head_contribs = {L: [] for L in range(start_layer, n_layers)}  # -> over grid of [Nexp, n_heads]
+      pred_check = []                                              # [grid][Nexp]
+      resid_probe = {L: [] for L in range(n_layers)}               # decodability: [Nprobe, P, H]
+      probe_valid, probe_region = None, None                       # set on the first grid pass
+      for gi in range(len(regime.grid)):
         dl = DataLoader(sub, batch_size=args.batch_size, collate_fn=collator, shuffle=False)
         g_contribs = {c: [] for c in comp_names}
         g_head = {L: [] for L in range(start_layer, n_layers)}
@@ -461,8 +539,15 @@ def trace_one_run(run, args, out_dir: Path):
             trace_inputs = {"input_ids": batch["input_ids"],
                             "attention_mask": attn_mask,
                             "lora_token_mask": batch.get("lora_token_mask")}
+            # scalar for a global regime; this batch's own centres + the offset for
+            # `local` (rows line up because the loader is sequential and unshuffled)
+            nrow = ppos.shape[0]
+            v = regime.values_for(
+                None if not regime.is_local else centres[row0:row0 + nrow].to(device), gi)
+            if torch.is_tensor(v):
+                v = v.to(dtype=inject_dtype)
             cap = trace_batch(lm, layers, embed, norm, trace_inputs, abs_pos,
-                              inject_layer, inject_path, neuron, float(v), n_layers, start_layer,
+                              inject_layer, inject_path, neuron, v, n_layers, start_layer,
                               probe_pos=ppos, capture_probes=keep > 0,
                               layer_out_tuple=layer_out_tuple)
 
@@ -499,92 +584,137 @@ def trace_one_run(run, args, out_dir: Path):
         if gi == 0:
             probe_valid = torch.cat(g_valid) if g_valid else None
             probe_region = torch.cat(g_region) if g_region else None
-        print(f"[trace] grid {gi + 1}/{len(grid)} (v={float(v):+.4f}) done")
+        shown = float(v.mean()) if torch.is_tensor(v) else float(v)
+        print(f"[trace] {regime.name}: grid {gi + 1}/{len(regime.grid)} "
+              f"({'mean v' if torch.is_tensor(v) else 'v'}={shown:+.4f}) done")
+      return contribs, head_contribs, pred_check, resid_probe, probe_valid, probe_region
 
-    # stack -> [Nexp, grid]
-    Nexp = len(idx)
-    contribs = {c: torch.stack(contribs[c], 1) for c in comp_names}   # [Nexp, grid]
-    pred_check = torch.stack(pred_check, 1)                           # [Nexp, grid]
-    v_np = grid.numpy()
+    # ---- one measurement per regime; every output frame carries which one ----
+    attr_frames, head_frames, dec_frames, meta_regimes = [], [], [], {}
+    unperturbed_pred = None
+    for regime in regimes:
+      (contribs, head_contribs, pred_check,
+       resid_probe, probe_valid, probe_region) = measure(regime)
 
-    # ---- decomposition sanity: sum of contributions + bias == prediction ----
-    total = sum(contribs[c] for c in comp_names) + bias
-    max_err = (total - pred_check).abs().max().item()
-    print(f"[sanity] max|sum(contributions)+bias - prediction| = {max_err:.3e} (should be ~0)")
+      # stack -> [Nexp, grid]
+      Nexp = len(idx)
+      contribs = {c: torch.stack(contribs[c], 1) for c in comp_names}   # [Nexp, grid]
+      pred_check = torch.stack(pred_check, 1)                           # [Nexp, grid]
+      v_np = regime.regressor
 
-    # end-to-end validation: the traced model must still causally read the neuron,
-    # i.e. its prediction tracks the injected v. Low corr here => gating/injection
-    # broke in the trace (the known interventional corr for this run is ~0.99).
-    from scipy.stats import pearsonr
-    e2e = pearsonr(pred_check.reshape(-1).numpy(), np.tile(v_np, Nexp))[0]
-    print(f"[sanity] corr(traced prediction, injected v) = {e2e:.4f} "
-          f"(should be high; validates gating+injection+readout through nnsight)")
+      # ---- decomposition sanity: sum of contributions + bias == prediction ----
+      total = sum(contribs[c] for c in comp_names) + bias
+      max_err = (total - pred_check).abs().max().item()
+      print(f"[sanity] {regime.name}: max|sum(contributions)+bias - prediction| = "
+            f"{max_err:.3e} (should be ~0)")
 
-    # ======================= Analysis 1: attribution =======================
-    rows = []
-    for c in comp_names:
-        slopes, r2s = [], []
-        for e in range(Nexp):
-            s, r2 = linfit_slope_r2(v_np, contribs[c][e].numpy())
-            slopes.append(s); r2s.append(r2)
-        rows.append({"component": c, "mean_slope": float(np.mean(slopes)),
-                     "mean_abs_slope": float(np.mean(np.abs(slopes))), "mean_r2": float(np.mean(r2s))})
-    attr_df = pd.DataFrame(rows)
-    attr_df.to_csv(out_dir / "attribution_components.csv", index=False)
+      # end-to-end validation: the traced model must still causally read the neuron,
+      # i.e. its prediction tracks the swept value.
+      from scipy.stats import pearsonr
+      e2e = pearsonr(pred_check.reshape(-1).numpy(), np.tile(v_np, Nexp))[0]
+      print(f"[sanity] {regime.name}: corr(traced prediction, swept value) = {e2e:.4f}")
 
-    # per-head slopes -> [layer, head]
-    head_rows = []
-    head_slope_mat = np.zeros((n_layers - start_layer, n_heads))
-    for li, L in enumerate(range(start_layer, n_layers)):
-        hc = torch.stack(head_contribs[L], 1)   # [Nexp, grid, n_heads]
-        for h in range(n_heads):
-            slopes = [linfit_slope_r2(v_np, hc[e, :, h].numpy())[0] for e in range(Nexp)]
-            m = float(np.mean(slopes))
-            head_slope_mat[li, h] = m
-            head_rows.append({"layer": L, "head": h, "mean_slope": m})
-    pd.DataFrame(head_rows).to_csv(out_dir / "attribution_heads.csv", index=False)
+      # `local` only: re-injecting the neuron's OWN value must be a no-op, which is a
+      # stronger check on the centres and the row alignment than any offset scan.
+      zi = zero_offset_index(regime)
+      if zi is not None:
+          if unperturbed_pred is None:
+              unperturbed_pred, _ = endogenous_predictions(model, sub, collator,
+                                                           args.batch_size)
+          identity_check(regime, pred_check[:, zi].numpy(),
+                         unperturbed_pred.numpy(), label=config.experiment_name)
 
-    # ======================= Analysis 2: decodability =======================
-    # One probe per (layer, probe position). The row order is example-major
-    # ([Nprobe, grid] flattened row-major), which is what makes decodability()'s
-    # 70/30 split a split BY EXAMPLE -- the same example at a different grid point
-    # must never appear on both sides, or the probe scores its own memory.
-    probe_labels = [lbl for lbl, _, _ in PROBE_SPECS]
-    n_probe = len(probe_labels)
-    dec_rows = []
-    dec_mat = np.full((n_layers, n_probe), np.nan)
-    for L in range(n_layers):
-        if not resid_probe[L]:
-            continue
-        X_all = torch.stack(resid_probe[L], 1).float()          # [Nprobe, grid, P, H]
-        for pi, label in enumerate(probe_labels):
-            ok = probe_valid[:, pi] if probe_valid is not None else None
-            rows = torch.ones(X_all.shape[0], dtype=torch.bool) if ok is None else ok
-            n_rows = int(rows.sum())
-            if n_rows < 20:          # too few valid examples to fit anything
-                dec_rows.append({"layer": L, "probe": label, "corr": float("nan"),
-                                 "n_examples": n_rows, "frac_prompt_region": float("nan")})
-                continue
-            X = X_all[rows, :, pi, :].reshape(-1, X_all.shape[-1]).numpy()
-            y = np.tile(v_np, n_rows)
-            c = decodability(X, y)
-            dec_mat[L, pi] = c
-            frac = (float(probe_region[rows, pi].float().mean())
-                    if probe_region is not None else float("nan"))
-            dec_rows.append({"layer": L, "probe": label, "corr": c,
-                             "n_examples": n_rows, "frac_prompt_region": frac})
-    dec_df = pd.DataFrame(dec_rows)
-    dec_df.to_csv(out_dir / "decodability.csv", index=False)
-    if not dec_df.empty:
-        null = dec_df[dec_df["probe"] == "t-1"]["corr"]
-        print(f"[trace] decodability: max over (layer, probe) = {dec_df['corr'].max():.3f}; "
-              f"causal null (t-1) max = {null.max() if len(null) else float('nan'):.3f} "
-              f"-- read every other cell against that floor")
+      # ======================= Analysis 1: attribution =======================
+      rows = []
+      for c in comp_names:
+          slopes, r2s = [], []
+          for e in range(Nexp):
+              sl, r2 = linfit_slope_r2(v_np, contribs[c][e].numpy())
+              slopes.append(sl); r2s.append(r2)
+          rows.append({"regime": regime.name, "component": c,
+                       "mean_slope": float(np.mean(slopes)),
+                       "mean_abs_slope": float(np.mean(np.abs(slopes))),
+                       "mean_r2": float(np.mean(r2s))})
+      attr_df = pd.DataFrame(rows)
+      attr_frames.append(attr_df)
 
-    # ============================ plots ============================
-    _plot_attribution(attr_df, n_layers, start_layer, inject_layer, out_dir)
-    _plot_heads(head_slope_mat, start_layer, n_layers, n_heads, out_dir)
-    _plot_decodability(dec_mat, probe_labels, n_layers, inject_layer, out_dir)
+      # is this regime's dose-response resolved above the numerical floor at all?
+      # Checked on the component that responds most, so a flat *circuit* is not
+      # mistaken for a flat *measurement*.
+      power_warning(regime, float(attr_df.loc[attr_df["mean_abs_slope"].idxmax(), "mean_r2"]),
+                    label=config.experiment_name)
+
+      # per-head slopes -> [layer, head]
+      head_rows = []
+      head_slope_mat = np.zeros((n_layers - start_layer, n_heads))
+      for li, L in enumerate(range(start_layer, n_layers)):
+          hc = torch.stack(head_contribs[L], 1)   # [Nexp, grid, n_heads]
+          for h in range(n_heads):
+              slopes = [linfit_slope_r2(v_np, hc[e, :, h].numpy())[0] for e in range(Nexp)]
+              m = float(np.mean(slopes))
+              head_slope_mat[li, h] = m
+              head_rows.append({"regime": regime.name, "layer": L, "head": h, "mean_slope": m})
+      head_frames.append(pd.DataFrame(head_rows))
+
+      # ======================= Analysis 2: decodability =======================
+      # One probe per (layer, probe position). The row order is example-major
+      # ([Nprobe, grid] flattened row-major), which is what makes decodability()'s
+      # 70/30 split a split BY EXAMPLE -- the same example at a different grid point
+      # must never appear on both sides, or the probe scores its own memory.
+      #
+      # Under `local` the target is the OFFSET, not the absolute value: the offset is
+      # what was causally imposed, while the absolute value carries the example's own
+      # activation and is therefore correlated with context -- a context-reading probe
+      # would score on it without the signal having propagated anywhere.
+      probe_labels = [lbl for lbl, _, _ in PROBE_SPECS]
+      n_probe = len(probe_labels)
+      dec_rows = []
+      dec_mat = np.full((n_layers, n_probe), np.nan)
+      for L in range(n_layers):
+          if not resid_probe[L]:
+              continue
+          X_all = torch.stack(resid_probe[L], 1).float()          # [Nprobe, grid, P, H]
+          for pi, label in enumerate(probe_labels):
+              ok = probe_valid[:, pi] if probe_valid is not None else None
+              prows = torch.ones(X_all.shape[0], dtype=torch.bool) if ok is None else ok
+              n_rows = int(prows.sum())
+              if n_rows < 20:          # too few valid examples to fit anything
+                  dec_rows.append({"regime": regime.name, "layer": L, "probe": label,
+                                   "corr": float("nan"), "n_examples": n_rows,
+                                   "frac_prompt_region": float("nan")})
+                  continue
+              X = X_all[prows, :, pi, :].reshape(-1, X_all.shape[-1]).numpy()
+              y = np.tile(v_np, n_rows)
+              c = decodability(X, y)
+              dec_mat[L, pi] = c
+              frac = (float(probe_region[prows, pi].float().mean())
+                      if probe_region is not None else float("nan"))
+              dec_rows.append({"regime": regime.name, "layer": L, "probe": label, "corr": c,
+                               "n_examples": n_rows, "frac_prompt_region": frac})
+      dec_df = pd.DataFrame(dec_rows)
+      dec_frames.append(dec_df)
+      if not dec_df.empty:
+          null = dec_df[dec_df["probe"] == "t-1"]["corr"]
+          print(f"[trace] {regime.name}: decodability max over (layer, probe) = "
+                f"{dec_df['corr'].max():.3f}; causal null (t-1) max = "
+                f"{null.max() if len(null) else float('nan'):.3f}")
+
+      # ============================ plots (per regime) ============================
+      tag = f"_{regime.name}"
+      _plot_attribution(attr_df, n_layers, start_layer, inject_layer, out_dir, tag)
+      _plot_heads(head_slope_mat, start_layer, n_layers, n_heads, out_dir, tag)
+      _plot_decodability(dec_mat, probe_labels, n_layers, inject_layer, out_dir, tag)
+      meta_regimes[regime.name] = {
+          "kind": regime.kind, "scale": regime.scale, "delta_sigma": regime.delta_sigma,
+          "grid": [float(x) for x in regime.grid],
+          "decomposition_max_err": max_err, "e2e_corr_pred_vs_v": float(e2e)}
+
+    # ---- one combined csv per analysis, regimes side by side ----
+    pd.concat(attr_frames, ignore_index=True).to_csv(
+        out_dir / "attribution_components.csv", index=False)
+    pd.concat(head_frames, ignore_index=True).to_csv(
+        out_dir / "attribution_heads.csv", index=False)
+    pd.concat(dec_frames, ignore_index=True).to_csv(out_dir / "decodability.csv", index=False)
 
     with open(out_dir / "trace_meta.json", "w") as f:
         json.dump({"run": config.experiment_name, "checkpoint": str(checkpoint),
@@ -592,10 +722,12 @@ def trace_one_run(run, args, out_dir: Path):
                    "inject_layer": inject_layer, "neuron": neuron,
                    "token_position": (config.test_token_selector.position
                                       if config.test_token_selector.type == "fixed" else None),
-                   "start_layer": start_layer, "n_examples": Nexp,
-                   "n_probe_examples": n_probe_rows, "probe_labels": probe_labels,
-                   "grid": v_np.tolist(), "decomposition_max_err": max_err,
-                   "e2e_corr_pred_vs_v": float(e2e)}, f, indent=2)
+                   "start_layer": start_layer, "n_examples": len(idx),
+                   "n_probe_examples": n_probe_rows,
+                   "probe_labels": [lbl for lbl, _, _ in PROBE_SPECS],
+                   "regimes": meta_regimes,
+                   "local_centre_source": "live tuned activation at (L, i, t)"},
+                  f, indent=2)
     print(f"[trace] wrote results to {out_dir}")
 
 
@@ -635,7 +767,7 @@ def main():
                 torch.cuda.empty_cache()
 
 
-def _plot_attribution(attr_df, n_layers, start_layer, inject_layer, out_dir):
+def _plot_attribution(attr_df, n_layers, start_layer, inject_layer, out_dir, tag=""):
     order = ["embed"] + [f"attn_{L}" for L in range(n_layers)] + [f"mlp_{L}" for L in range(n_layers)]
     attr_df = attr_df.set_index("component").loc[order].reset_index()
     plt.figure(figsize=(max(8, 0.18 * len(order)), 4))
@@ -643,13 +775,13 @@ def _plot_attribution(attr_df, n_layers, start_layer, inject_layer, out_dir):
     plt.axhline(0, color="k", lw=0.5)
     plt.xticks(rotation=90, fontsize=6)
     plt.ylabel("dose-response slope (d contribution / d v)")
-    plt.title("Direct attribution to readout w (per component)")
+    plt.title(f"Direct attribution to readout w (per component){tag}")
     plt.tight_layout()
-    plt.savefig(out_dir / "attribution_components.png", dpi=150)
+    plt.savefig(out_dir / f"attribution_components{tag}.png", dpi=150)
     plt.close()
 
 
-def _plot_heads(mat, start_layer, n_layers, n_heads, out_dir):
+def _plot_heads(mat, start_layer, n_layers, n_heads, out_dir, tag=""):
     plt.figure(figsize=(max(6, 0.3 * n_heads), max(3, 0.35 * mat.shape[0])))
     lim = np.abs(mat).max() or 1.0
     sns.heatmap(mat, cmap="coolwarm", center=0, vmin=-lim, vmax=lim,
@@ -657,13 +789,13 @@ def _plot_heads(mat, start_layer, n_layers, n_heads, out_dir):
                 xticklabels=list(range(n_heads)),
                 cbar_kws={"label": "dose-response slope"})
     plt.xlabel("head"); plt.ylabel("layer")
-    plt.title("Per-head attention attribution to readout w")
+    plt.title(f"Per-head attention attribution to readout w{tag}")
     plt.tight_layout()
-    plt.savefig(out_dir / "attribution_heads.png", dpi=150)
+    plt.savefig(out_dir / f"attribution_heads{tag}.png", dpi=150)
     plt.close()
 
 
-def _plot_decodability(mat, probe_labels, n_layers, inject_layer, out_dir):
+def _plot_decodability(mat, probe_labels, n_layers, inject_layer, out_dir, tag=""):
     plt.figure(figsize=(1.0 * len(probe_labels) + 3, max(4, 0.35 * n_layers)))
     ax = sns.heatmap(mat, cmap="viridis", vmin=0, vmax=1, annot=True, fmt=".2f",
                      annot_kws={"size": 7},
@@ -675,10 +807,10 @@ def _plot_decodability(mat, probe_labels, n_layers, inject_layer, out_dir):
     if "t-1" in probe_labels:
         ax.axvline(probe_labels.index("t-1") + 1, color="w", ls=":", lw=1.5)
     plt.ylabel("layer"); plt.xlabel("probe position")
-    plt.title("Injected-value decodability by (layer, probe position)\n"
+    plt.title(f"Injected-value decodability by (layer, probe position){tag}\n"
               "t-1 = causal null | t = origin | last = readout", fontsize=10)
     plt.tight_layout()
-    plt.savefig(out_dir / "decodability.png", dpi=150)
+    plt.savefig(out_dir / f"decodability{tag}.png", dpi=150)
     plt.close()
 
 

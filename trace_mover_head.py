@@ -97,8 +97,12 @@ from src.introspector.analysis_loading import (
     load_run_for_analysis, absolute_positions, layer_output_is_tuple)
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
 from src.introspector.run_discovery import add_discovery_args, runs_from_args, resolve_run_action
+from src.introspector.regimes import (
+    DEFAULT_REGIMES, DEFAULT_LOCAL_DELTA_SIGMA, parse_regimes, zero_offset_index,
+    identity_check, power_warning)
 from src.introspector.training.model import InterventionHook
-from trace_introspection_circuit import readout_scale, contribution, linfit_slope_r2
+from trace_introspection_circuit import (
+    readout_scale, contribution, linfit_slope_r2, capture_live_centres)
 
 # Source positions are reported relative to t, plus the absolute specials (BOS is
 # Llama's attention sink and takes a large share of every head's mass).
@@ -112,13 +116,17 @@ def parse_args():
     p.add_argument("--n-examples", type=int, default=200)
     p.add_argument("--grid-points", type=int, default=7)
     p.add_argument("--grid-std-mult", type=float, default=3.0)
-    p.add_argument("--inject-scales", type=str, default=None,
-                   help="Comma-separated injection scales (x the neuron's std) to run "
-                        "the whole trace at. Default: BOTH 1 and the run's own training "
-                        "scale -- the mechanism is scale-dependent (the identified mover "
-                        "can attend to t only because the injection is large), so one "
-                        "scale cannot tell you whether it describes the endogenous "
-                        "circuit. Pass a single value to halve the runtime.")
+    p.add_argument("--regimes", type=str, default=DEFAULT_REGIMES,
+                   help="Injection regimes to sweep (see src/introspector/regimes.py). "
+                        "'xN' is a global grid at N times the natural std, 'xtrain' the "
+                        "run's own training scale, 'local' perturbs each example around "
+                        "ITS OWN current value. The mechanism is scale-dependent -- the "
+                        "identified mover attends to t only because the injection is "
+                        "large -- so one regime cannot tell you whether it describes the "
+                        "endogenous circuit. Pass one to cut the runtime.")
+    p.add_argument("--local-delta-sigma", type=float, default=DEFAULT_LOCAL_DELTA_SIGMA,
+                   help="Half-width of the 'local' sweep in units of the neuron's std; "
+                        "override per regime with e.g. 'local@0.5'.")
     p.add_argument("--top-heads", type=int, default=3,
                    help="Movers taken into the source/origin decompositions.")
     p.add_argument("--batch-size", type=int, default=16,
@@ -218,7 +226,9 @@ def run_injected_batch(run, batch, v, mover_layers, layer_out_tuple, disable_ada
 
         inject = None
         if v is not None:
-            vals = torch.full((bs,), float(v), device=device)
+            # scalar for a global regime, one value per row for `local`
+            vals = (v.to(device=device, dtype=torch.float32) if torch.is_tensor(v)
+                    else torch.full((bs,), float(v), device=device))
             inject = InterventionHook(
                 row_indices=rows, token_positions=abs_pos,
                 signal_indices=torch.full((bs,), i, device=device, dtype=torch.long),
@@ -355,28 +365,33 @@ def trace_movers(run, args, out_dir: Path):
     loader = lambda: DataLoader(dataset, batch_size=args.batch_size,
                                 collate_fn=run.collator, shuffle=False)
 
-    # ---- injection scales ----
-    # BOTH by default: the mechanism is scale-dependent, and the two questions are
-    # different. The training scale (10x on these runs) is where the dose-response is
-    # cleanest and where the mover was originally identified; scale 1 is the size of
-    # perturbation the neuron actually undergoes, and the readout still reads it there
-    # (gaussian@1 corr ~0.75 on joint_N0.1377_POS-12). If the transporter differs
-    # between them, the circuit described at 10x is not the circuit that runs
-    # endogenously -- which is exactly what the attention profile below was built to
-    # expose, after the 10x pattern turned out to be 6600x the clean one.
+    # ---- injection regimes ----
+    # SEVERAL by default: the mechanism is scale-dependent, and the regimes ask
+    # different questions. The training scale (10x here) is where the dose-response is
+    # cleanest and where the mover was originally identified; x1 is a chord across the
+    # natural range; `local` is the tangent at each example's own operating point. The
+    # 10x mover attends to t only because the injection is large (6600x the clean
+    # pattern), so no single regime can say whether it describes the endogenous
+    # circuit. See src/introspector/regimes.py.
     stats = run.stats
     tc = run.config.training_config
     train_scale = (tc.intervention_extreme_scale
                    if tc.intervention_signal_distribution == "extreme" else 1.0)
-    if args.inject_scales:
-        scales = [float(x) for x in str(args.inject_scales).split(",")]
-    else:
-        scales = sorted({1.0, float(train_scale)})
-    grids = {sc: np.linspace(stats["mean"] - args.grid_std_mult * stats["std"] * sc,
-                             stats["mean"] + args.grid_std_mult * stats["std"] * sc,
-                             args.grid_points) for sc in scales}
-    print(f"[mover] injection scales: {scales} (training scale {train_scale:g}); "
-          f"{args.grid_points} grid points each")
+    regimes = parse_regimes(args.regimes, stats, args.grid_points, args.grid_std_mult,
+                            delta_sigma=args.local_delta_sigma, train_scale=train_scale)
+    for rg in regimes:
+        print(f"[mover] regime {rg.describe(stats)}")
+
+    # `local` centres on each example's LIVE activation, so capture it first, in the
+    # same order the passes below iterate (sequential, unshuffled loader).
+    centres = None
+    if any(rg.is_local for rg in regimes):
+        centres = capture_live_centres(run.model, dataset, run.collator,
+                                       args.batch_size, L, i)
+        print(f"[mover] live centres for {len(centres)} examples: "
+              f"mean={centres.mean():.4f} std={centres.std():.4f} "
+              f"(cached-column mean={stats['mean']:.4f} std={stats['std']:.4f})")
+    inject_dtype = next(run.model.parameters()).dtype
 
     # ---- shared setup ----
     # a head at layer M reads the residual BEFORE that layer's MLP writes, so a mover
@@ -392,19 +407,27 @@ def trace_movers(run, args, out_dir: Path):
     comp_names_for = lambda M: (["embed"] + [f"attn_{l}" for l in range(M)]
                                 + [f"mlp_{l}" for l in range(M)])
 
-    def pass1(grid):
+    def pass1(regime):
         """Per-head dose response over every head above the signal layer."""
+        grid = regime.grid
         per_head = {(M, h): [] for M in cand_layers for h in range(n_heads)}
         per_head_t = {(M, h): [] for M in cand_layers for h in range(n_heads)}
         totals = {M: [] for M in cand_layers}
         preds = []
-        for gi, v in enumerate(grid):
+        for gi in range(len(grid)):
             g_head = {k: [] for k in per_head}
             g_head_t = {k: [] for k in per_head}
             g_tot = {M: [] for M in cand_layers}
             g_pred = []
+            row0 = 0
             for batch in loader():
                 batch = batch.to(device)
+                nrow = batch["input_ids"].shape[0]
+                v = regime.values_for(
+                    None if not regime.is_local else centres[row0:row0 + nrow], gi)
+                if torch.is_tensor(v):
+                    v = v.to(dtype=inject_dtype)
+                row0 += nrow
                 cap = run_injected_batch(run, batch, v, cand_layers, layer_out_tuple)
                 a = readout_scale(cap["final_resid"], w, gamma, eps)
                 g_pred.append(cap["pred"])
@@ -424,12 +447,12 @@ def trace_movers(run, args, out_dir: Path):
             for M in cand_layers:
                 totals[M].append(torch.cat(g_tot[M]))
             preds.append(torch.cat(g_pred))
-            print(f"[mover] pass 1: grid {gi + 1}/{len(grid)}")
+            print(f"[mover] pass 1 [{regime.name}]: grid {gi + 1}/{len(grid)}")
 
         rows = []
         for (M, h), vals in per_head.items():
-            slope, r2 = slopes_over_grid(vals, grid)
-            slope_t, r2_t = slopes_over_grid(per_head_t[(M, h)], grid)
+            slope, r2 = slopes_over_grid(vals, regime.regressor)
+            slope_t, r2_t = slopes_over_grid(per_head_t[(M, h)], regime.regressor)
             rows.append({"run": run.config.experiment_name, "signal_layer": L,
                          "signal_index": i, "layer": M, "head": h,
                          "mean_slope": slope, "mean_abs_slope": abs(slope), "mean_r2": r2,
@@ -458,12 +481,12 @@ def trace_movers(run, args, out_dir: Path):
             by_head = sum(torch.stack(per_head[(M, h)], 0) for h in range(n_heads))
             err.append(float((by_head - torch.stack(totals[M], 0)).abs().max()))
         e2e = np.corrcoef(torch.stack(preds, 0).numpy().reshape(-1),
-                          np.repeat(grid, len(dataset)))[0, 1]
+                          np.repeat(regime.regressor, len(dataset)))[0, 1]
         print(f"[sanity] max|sum_h sum_s contribution - o_proj total| = {max(err):.3e} "
               f"(should be ~0) | corr(prediction, injected v) = {e2e:.4f}")
-        return df, max(err), float(e2e)
+        return df, max(err), float(e2e), torch.stack(preds, 1)   # preds: [Nexp, grid]
 
-    def pass2(grid, heads, why_of):
+    def pass2(regime, heads, why_of):
         """Source-position and origin-component decompositions for selected heads.
 
         `why_of` maps (layer, head) -> the criterion that selected it, and is written
@@ -471,17 +494,25 @@ def trace_movers(run, args, out_dir: Path):
         head is there because it was the biggest mover overall or because it was the
         best in the layer above the signal, since those mean different things.
         """
+        grid = regime.grid
         src_acc = {(int(M), int(h)): [] for M, h in heads}
         alpha_acc = {k: [] for k in src_acc}
         comp_acc = {k: {c: [] for c in comp_names_for(k[0])} for k in src_acc}
         tot_t_acc = {k: [] for k in src_acc}
-        for gi, v in enumerate(grid):
+        for gi in range(len(grid)):
             g_src = {k: [] for k in src_acc}
             g_alpha = {k: [] for k in alpha_acc}
             g_comp = {k: {c: [] for c in comp_names_for(k[0])} for k in comp_acc}
             g_tot_t = {k: [] for k in tot_t_acc}
+            row0 = 0
             for batch in loader():
                 batch = batch.to(device)
+                nrow = batch["input_ids"].shape[0]
+                v = regime.values_for(
+                    None if not regime.is_local else centres[row0:row0 + nrow], gi)
+                if torch.is_tensor(v):
+                    v = v.to(dtype=inject_dtype)
+                row0 += nrow
                 cap = run_injected_batch(run, batch, v, sorted({M for M, _ in src_acc}),
                                          layer_out_tuple)
                 a = readout_scale(cap["final_resid"], w, gamma, eps)
@@ -503,7 +534,7 @@ def trace_movers(run, args, out_dir: Path):
                 tot_t_acc[k].append(torch.cat(g_tot_t[k]))
                 for c in comp_names_for(k[0]):
                     comp_acc[k][c].append(torch.cat(g_comp[k][c]))
-            print(f"[mover] pass 2: grid {gi + 1}/{len(grid)}")
+            print(f"[mover] pass 2 [{regime.name}]: grid {gi + 1}/{len(grid)}")
 
         src_rows, comp_rows, dose_rows = [], [], []
         t_bin = SOURCE_REL_WINDOW                     # index of the "t" bin in _BIN_LABELS
@@ -524,7 +555,7 @@ def trace_movers(run, args, out_dir: Path):
             for b in range(stacked.shape[-1]):
                 rel = b - SOURCE_REL_WINDOW
                 col = [stacked[g, :, b] for g in range(stacked.shape[0])]
-                slope, r2 = slopes_over_grid(col, grid)
+                slope, r2 = slopes_over_grid(col, regime.regressor)
                 src_rows.append({"run": run.config.experiment_name, "layer": M, "head": h,
                                  "selected_as": why_of.get((M, h), ""),
                                  "rel_source": rel if b < 2 * SOURCE_REL_WINDOW + 1 else None,
@@ -536,44 +567,61 @@ def trace_movers(run, args, out_dir: Path):
                   f"{float((summed - tot_t).abs().max()):.3e} "
                   f"(decomposes embed + {M} attn + {M} mlp writes at t)")
             for c in comp_names_for(M):
-                slope, r2 = slopes_over_grid(comp_acc[(M, h)][c], grid)
+                slope, r2 = slopes_over_grid(comp_acc[(M, h)][c], regime.regressor)
                 comp_rows.append({"run": run.config.experiment_name, "layer": M, "head": h,
                                   "selected_as": why_of.get((M, h), ""),
                                   "component": c, "mean_slope": slope, "mean_r2": r2,
                                   "is_signal_layer_mlp": c == f"mlp_{L}"})
         return src_rows, comp_rows, dose_rows
 
-    # ---- passes 1 and 2, per scale ----
+    # ---- passes 1 and 2, per regime ----
     heads_frames, src_rows, comp_rows, dose_rows, sanity = [], [], [], [], {}
-    per_scale_heads = {}
-    for sc in scales:
-        print(f"\n[mover] ===== scale x{sc:g} =====")
-        df, max_err, e2e = pass1(grids[sc])
-        df.insert(0, "inject_scale", sc)
+    per_regime_heads = {}
+    unperturbed_pred = None
+    for rg in regimes:
+        print(f"\n[mover] ===== {rg.name} =====")
+        df, max_err, e2e, preds = pass1(rg)
+        df.insert(0, "regime", rg.name)
         heads_frames.append(df)
-        per_scale_heads[sc] = select_heads(df, L, args.top_heads)
-        sanity[sc] = {"per_source_max_err": max_err, "e2e_corr_pred_vs_v": e2e}
+        per_regime_heads[rg.name] = select_heads(df, L, args.top_heads)
+        sanity[rg.name] = {"kind": rg.kind, "scale": rg.scale,
+                           "delta_sigma": rg.delta_sigma,
+                           "grid": [float(x) for x in rg.grid],
+                           "per_source_max_err": max_err, "e2e_corr_pred_vs_v": e2e}
+        # `local` only: writing the neuron's own value back must leave the prediction
+        # untouched, which is what certifies the centres and the row alignment.
+        zi = zero_offset_index(rg)
+        if zi is not None:
+            if unperturbed_pred is None:
+                from trace_introspection_circuit import endogenous_predictions
+                unperturbed_pred, _ = endogenous_predictions(
+                    run.model, dataset, run.collator, args.batch_size)
+            sanity[rg.name]["delta0_identity_err"] = identity_check(
+                rg, preds[:, zi].numpy(), unperturbed_pred.numpy(),
+                label=run.config.experiment_name)
+        power_warning(rg, float(df.nsmallest(1, "rank")["mean_r2"].iloc[0]),
+                      label=run.config.experiment_name)
 
-    # The SAME head set is decomposed at every scale, so the scales can be compared
-    # head by head: the question "is the transporter at 10x still the transporter at
-    # 1x" is unanswerable if each scale only decomposes its own winners.
-    top = list({k: why for sc in scales for k, why in per_scale_heads[sc]}.items())
+    # The SAME head set is decomposed in every regime, so they can be compared head by
+    # head: "is the transporter at 10x still the transporter locally" is unanswerable
+    # if each regime only decomposes its own winners.
+    top = list({k: why for rg in regimes for k, why in per_regime_heads[rg.name]}.items())
     top_heads = [k for k, _ in top]          # ((layer, head), why) -> (layer, head)
     why_of = {k: why for k, why in top}
-    print("\n[mover] heads taken into the decompositions (union over scales):")
+    print("\n[mover] heads taken into the decompositions (union over regimes):")
     for (M, h), why in top:
         bits = []
-        for sc in scales:
-            r = heads_frames[scales.index(sc)]
+        for k, rg in enumerate(regimes):
+            r = heads_frames[k]
             r = r[(r["layer"] == M) & (r["head"] == h)].iloc[0]
-            bits.append(f"x{sc:g}: rank={int(r['rank'])} rank@t={int(r['rank_at_t'])}")
+            bits.append(f"{rg.name}: rank={int(r['rank'])} rank@t={int(r['rank_at_t'])}")
         print(f"[mover]   L{M}h{h:<2} ({why:<16}) " + " | ".join(bits))
 
-    for sc in scales:
-        print(f"\n[mover] ===== pass 2 at scale x{sc:g} =====")
-        sr, cr, dr = pass2(grids[sc], top_heads, why_of)
+    for rg in regimes:
+        print(f"\n[mover] ===== pass 2 [{rg.name}] =====")
+        sr, cr, dr = pass2(rg, top_heads, why_of)
         for r in sr + cr + dr:
-            r["inject_scale"] = sc
+            r["regime"] = rg.name
         src_rows += sr
         comp_rows += cr
         dose_rows += dr
@@ -605,16 +653,27 @@ def trace_movers(run, args, out_dir: Path):
     # every other head's share of t collapses to ~0, while the grid-averaged figure has
     # four layer-1 heads sitting near 0.42 each. A single endpoint therefore describes
     # the endpoint, not the regime, and disagreed with pass 2's own numbers.
-    conditions = [("endogenous", [None])] + [(f"inject x{sc:g}", [float(v) for v in grids[sc]])
-                                             for sc in scales]
+    conditions = [("endogenous", None)] + [(rg.name, rg) for rg in regimes]
     prof_rows, addr_rows = [], []
     for disable in (False, True):
-        for cond_name, inj_values in conditions:
+        for cond_name, cond_regime in conditions:
             acc = {(int(M), int(h)): None for M, h in top_heads}
             n_rows_seen = 0
-            for inj in inj_values:
+            n_points = 1 if cond_regime is None else len(cond_regime.grid)
+            for gi in range(n_points):
+                row0 = 0
                 for batch in loader():
                     batch = batch.to(device)
+                    nrow = batch["input_ids"].shape[0]
+                    if cond_regime is None:
+                        inj = None
+                    else:
+                        inj = cond_regime.values_for(
+                            None if not cond_regime.is_local else centres[row0:row0 + nrow],
+                            gi)
+                        if torch.is_tensor(inj):
+                            inj = inj.to(dtype=inject_dtype)
+                    row0 += nrow
                     cap = run_injected_batch(run, batch, inj, sorted({M for M, _ in top_heads}),
                                              layer_out_tuple, disable_adapter=disable)
                     t = cap["abs_pos"]
@@ -631,13 +690,13 @@ def trace_movers(run, args, out_dir: Path):
                         "run": run.config.experiment_name, "layer": M, "head": h,
                         "selected_as": why_of.get((M, h), ""),
                         "adapter": "off" if disable else "on", "condition": cond_name,
-                        "injected": inj_values[0] is not None, "token_bin": label,
+                        "injected": cond_regime is not None, "token_bin": label,
                         "mean_attention": float(total) / max(1, n_rows_seen)})
                 addr_rows.append({
                     "run": run.config.experiment_name, "layer": M, "head": h,
                     "selected_as": why_of.get((M, h), ""),
                     "adapter": "off" if disable else "on", "condition": cond_name,
-                    "injected": inj_values[0] is not None,
+                    "injected": cond_regime is not None,
                     "attn_to_t": float(sums["t"]) / max(1, n_rows_seen),
                     "attn_to_bos": float(sums["BOS"]) / max(1, n_rows_seen),
                     "attn_to_final": float(sums["final"]) / max(1, n_rows_seen)})
@@ -667,9 +726,9 @@ def trace_movers(run, args, out_dir: Path):
         json.dump({"run": run.config.experiment_name, "checkpoint": str(run.checkpoint),
                    "signal": f"N{L}.{i}", "top_heads": [[int(M), int(h)] for M, h in top_heads],
                    "head_selection": {f"L{M}h{h}": why for (M, h), why in top},
-                   "inject_scales": scales, "training_scale": float(train_scale),
-                   "grids": {str(sc): grids[sc].tolist() for sc in scales},
-                   "sanity_per_scale": {str(k): v for k, v in sanity.items()},
+                   "regimes": list(sanity.keys()), "training_scale": float(train_scale),
+                   "sanity_per_regime": sanity,
+                   "local_centre_source": "live tuned activation at (L, i, t)",
                    "n_examples": len(dataset)}, f, indent=2)
     if prev_impl is not None:
         cfg._attn_implementation = prev_impl
@@ -761,17 +820,18 @@ def _plot_attention_vs_v(run, dose_df, out_dir):
     """
     if dose_df is None or dose_df.empty:
         return
-    scales = sorted(dose_df["inject_scale"].unique())
-    fig, axes = plt.subplots(1, len(scales), figsize=(1 + 4.0 * len(scales), 3.4),
+    names = list(dict.fromkeys(dose_df["regime"]))
+    fig, axes = plt.subplots(1, len(names), figsize=(1 + 4.0 * len(names), 3.4),
                              squeeze=False, sharey=True)
-    for ax, sc in zip(axes.flat, scales):
-        d = dose_df[dose_df["inject_scale"] == sc]
+    for ax, sc in zip(axes.flat, names):
+        d = dose_df[dose_df["regime"] == sc]
         for (M, h), g in d.groupby(["layer", "head"]):
             g = g.sort_values("v")
             why = g["selected_as"].fillna("").iloc[0] if "selected_as" in g else ""
             ax.plot(g["v"], g["attn_to_t"], "o-", ms=4, label=_head_label(M, h, why))
-        ax.set_xlabel("injected value v"); ax.grid(alpha=0.25)
-        ax.set_title(f"injection x{sc:g}", fontsize=9); ax.tick_params(labelsize=8)
+        ax.set_xlabel("injected value (offset from centre for `local`)")
+        ax.grid(alpha=0.25)
+        ax.set_title(sc, fontsize=9); ax.tick_params(labelsize=8)
     axes.flat[0].set_ylabel("attention: readout -> t", fontsize=9)
     axes.flat[-1].legend(fontsize=6, ncol=2)
     fig.suptitle("Graded routing or threshold detection?\n"
@@ -838,11 +898,11 @@ def _plot(run, heads_df, src_df, comp_df, addr_df, prof_df, out_dir):
     # one three-panel figure PER INJECTION SCALE: the panels describe a circuit at a
     # particular injection magnitude, and overlaying scales would average a mechanism
     # with whatever replaces it at another scale
-    scales = (sorted(heads_df["inject_scale"].dropna().unique())
-              if "inject_scale" in heads_df else [None])
+    scales = (list(dict.fromkeys(heads_df["regime"].dropna()))
+              if "regime" in heads_df else [None])
     for sc in scales:
-        sel = (lambda d: d if sc is None or "inject_scale" not in d
-               else d[d["inject_scale"] == sc])
+        sel = (lambda d: d if sc is None or "regime" not in d
+               else d[d["regime"] == sc])
         _plot_scale(run, sel(heads_df), sel(src_df), sel(comp_df), sc, out_dir)
     _plot_attention_profile(run, prof_df, out_dir)
 
@@ -918,10 +978,10 @@ def _plot_scale(run, heads_df, src_df, comp_df, scale, out_dir):
     axes[2].axhline(0, color="k", lw=0.8)
     axes[2].set_ylabel("slope"); axes[2].set_title("which write at t carries it")
     axes[2].legend(fontsize=8); axes[2].grid(alpha=0.25)
-    tag = "" if scale is None else f" (injection x{scale:g})"
+    tag = "" if scale is None else f" ({scale})"
     fig.suptitle(f"Mover-head trace: {run.config.experiment_name}{tag}", y=1.02)
     fig.tight_layout()
-    name = "mover_trace.png" if scale is None else f"mover_trace_scale{scale:g}.png"
+    name = "mover_trace.png" if scale is None else f"mover_trace_{scale}.png"
     fig.savefig(out_dir / name, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"[mover] wrote {out_dir / name}")
 
