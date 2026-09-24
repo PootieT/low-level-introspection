@@ -412,11 +412,18 @@ def trace_movers(run, args, out_dir: Path):
         grid = regime.grid
         per_head = {(M, h): [] for M in cand_layers for h in range(n_heads)}
         per_head_t = {(M, h): [] for M in cand_layers for h in range(n_heads)}
+        # attention to t for EVERY head at every grid point. Already computed inside
+        # head_source_contributions and previously discarded; keeping it is what lets
+        # the threshold-vs-static classification cover all heads instead of only the
+        # handful that pass 2 decomposes -- and those are selected BY slope rank, which
+        # is the very variable the classification is meant to be compared against.
+        per_head_alpha_t = {(M, h): [] for M in cand_layers for h in range(n_heads)}
         totals = {M: [] for M in cand_layers}
         preds = []
         for gi in range(len(grid)):
             g_head = {k: [] for k in per_head}
             g_head_t = {k: [] for k in per_head}
+            g_alpha_t = {k: [] for k in per_head}
             g_tot = {M: [] for M in cand_layers}
             g_pred = []
             row0 = 0
@@ -441,18 +448,34 @@ def trace_movers(run, args, out_dir: Path):
                             cap, M, h, a, W_O[M], W_V[M], n_heads, n_kv_heads, head_dim)
                         g_head[(M, h)].append(src.sum(-1))
                         g_head_t[(M, h)].append(src[brows, t_pos])
+                        g_alpha_t[(M, h)].append(alpha[brows, t_pos])
             for k in per_head:
                 per_head[k].append(torch.cat(g_head[k]))
                 per_head_t[k].append(torch.cat(g_head_t[k]))
+                per_head_alpha_t[k].append(torch.cat(g_alpha_t[k]))
             for M in cand_layers:
                 totals[M].append(torch.cat(g_tot[M]))
             preds.append(torch.cat(g_pred))
             print(f"[mover] pass 1 [{regime.name}]: grid {gi + 1}/{len(grid)}")
 
-        rows = []
+        rows, all_dose_rows = [], []
+        # the grid point closest to "no perturbation": offset 0 for `local`, the
+        # neuron's own mean for a global grid. The threshold statistic is measured
+        # against it, since that is where the head sits when nothing unusual happened.
+        centre_gi = int(np.argmin(np.abs(regime.grid - (0.0 if regime.is_local
+                                                        else stats["mean"]))))
         for (M, h), vals in per_head.items():
             slope, r2 = slopes_over_grid(vals, regime.regressor)
             slope_t, r2_t = slopes_over_grid(per_head_t[(M, h)], regime.regressor)
+            alpha_curve = np.array([float(x.mean()) for x in per_head_alpha_t[(M, h)]])
+            contrib_curve = np.array([float(x.mean()) for x in per_head_t[(M, h)]])
+            for gi, vv in enumerate(regime.grid):
+                all_dose_rows.append({
+                    "run": run.config.experiment_name, "regime": regime.name,
+                    "signal_layer": L, "signal_index": i, "layer": M, "head": h,
+                    "rel_depth": M - L, "v": float(vv),
+                    "attn_to_t": alpha_curve[gi], "contribution_at_t": contrib_curve[gi]})
+            a_centre, a_max = float(alpha_curve[centre_gi]), float(alpha_curve.max())
             rows.append({"run": run.config.experiment_name, "signal_layer": L,
                          "signal_index": i, "layer": M, "head": h,
                          "mean_slope": slope, "mean_abs_slope": abs(slope), "mean_r2": r2,
@@ -463,7 +486,16 @@ def trace_movers(run, args, out_dir: Path):
                          # net total. Read it as "is t where this head's v-dependence
                          # lives", not as a share of a positive budget.
                          "frac_slope_from_t": (abs(slope_t) / abs(slope)
-                                               if abs(slope) > 1e-12 else np.nan)})
+                                               if abs(slope) > 1e-12 else np.nan),
+                         "rel_depth": M - L,
+                         # threshold statistics: how much the head's attention to t
+                         # MOVES over the sweep, against where it sits unperturbed.
+                         # ratio >> 1 is a detector switching on; ~1 is static
+                         # attention, whose v-dependence (if any) is OV-mediated.
+                         "attn_t_at_centre": a_centre, "attn_t_max": a_max,
+                         "attn_t_min": float(alpha_curve.min()),
+                         "attn_t_ratio": (a_max / a_centre if a_centre > 1e-9 else np.inf),
+                         "attn_t_delta": a_max - a_centre})
         df = pd.DataFrame(rows).sort_values("mean_abs_slope", ascending=False)
         df["rank"] = np.arange(1, len(df) + 1)
         # A SECOND ranking, by the contribution routed through source position t.
@@ -484,7 +516,8 @@ def trace_movers(run, args, out_dir: Path):
                           np.repeat(regime.regressor, len(dataset)))[0, 1]
         print(f"[sanity] max|sum_h sum_s contribution - o_proj total| = {max(err):.3e} "
               f"(should be ~0) | corr(prediction, injected v) = {e2e:.4f}")
-        return df, max(err), float(e2e), torch.stack(preds, 1)   # preds: [Nexp, grid]
+        return (df, max(err), float(e2e), torch.stack(preds, 1),   # preds: [Nexp, grid]
+                all_dose_rows)
 
     def pass2(regime, heads, why_of):
         """Source-position and origin-component decompositions for selected heads.
@@ -576,11 +609,13 @@ def trace_movers(run, args, out_dir: Path):
 
     # ---- passes 1 and 2, per regime ----
     heads_frames, src_rows, comp_rows, dose_rows, sanity = [], [], [], [], {}
+    all_dose_rows = []
     per_regime_heads = {}
     unperturbed_pred = None
     for rg in regimes:
         print(f"\n[mover] ===== {rg.name} =====")
-        df, max_err, e2e, preds = pass1(rg)
+        df, max_err, e2e, preds, adr = pass1(rg)
+        all_dose_rows += adr
         df.insert(0, "regime", rg.name)
         heads_frames.append(df)
         per_regime_heads[rg.name] = select_heads(df, L, args.top_heads)
@@ -636,6 +671,9 @@ def trace_movers(run, args, out_dir: Path):
     comp_df.to_csv(out_dir / "mover_origin_components.csv", index=False)
     dose_df = pd.DataFrame(dose_rows)
     dose_df.to_csv(out_dir / "mover_attention_vs_v.csv", index=False)
+    # every head above the signal layer, not just the decomposed ones: this is the
+    # frame the cross-run head taxonomy is built from
+    pd.DataFrame(all_dose_rows).to_csv(out_dir / "mover_head_dose_all.csv", index=False)
     _plot_attention_vs_v(run, dose_df, out_dir)
 
     # ---- pass 3: WHERE does each head look, in each regime ----
@@ -702,6 +740,13 @@ def trace_movers(run, args, out_dir: Path):
                     "attn_to_final": float(sums["final"]) / max(1, n_rows_seen)})
     prof_df = pd.DataFrame(prof_rows)
     prof_df.to_csv(out_dir / "mover_attention_profile.csv", index=False)
+
+    # ---- and the same profile for EVERY head, endogenously (taxonomy input) ----
+    print(f"[mover] endogenous attention profile over all {len(cand_layers) * n_heads} "
+          f"heads above layer {L} ...")
+    pd.DataFrame(endogenous_all_head_profile(
+        run, loader, cand_layers, layer_out_tuple, device, L, i)
+    ).to_csv(out_dir / "mover_attention_profile_all_heads.csv", index=False)
     addr_df = pd.DataFrame(addr_rows)
     addr_df.to_csv(out_dir / "mover_attention_base_vs_tuned.csv", index=False)
 
@@ -742,6 +787,45 @@ def trace_movers(run, args, out_dir: Path):
 ATTENTION_BINS = (["BOS"] + [f"t{d:+d}" if d else "t" for d in range(-3, 4)]
                   + [f"final{d:+d}" if d else "final" for d in range(-3, 1)]
                   + ["other_text", "other_prompt"])
+
+
+@torch.no_grad()
+def endogenous_all_head_profile(run, loader, layers, layer_out_tuple, device,
+                                signal_layer, neuron):
+    """
+    Where EVERY head looks with nothing injected, binned like the selected-head
+    profile.
+
+    One pass, no injection: this supplies the static-target label (BOS / final /
+    prompt / text) for the head taxonomy, which the per-head alpha-vs-v curves from
+    pass 1 cannot give. Only the endogenous condition is measured for all heads --
+    the v-dependence is already covered head-by-head by those curves, and repeating
+    the full condition grid over every head would multiply the run by the number of
+    layers for no extra claim.
+    """
+    acc, n_seen = {}, 0
+    for batch in loader():
+        batch = batch.to(device)
+        cap = run_injected_batch(run, batch, None, layers, layer_out_tuple)
+        t = cap["abs_pos"]
+        num_left_pad = (batch["attention_mask"] == 0).sum(dim=1).cpu()
+        n_seen += t.shape[0]
+        for M in layers:
+            probs = cap["attn_probs"][M]                      # [B, heads, seq]
+            for h in range(probs.shape[1]):
+                binned = _attention_bins(probs[:, h, :], t, num_left_pad)
+                key = (M, h)
+                acc[key] = binned if key not in acc else {
+                    k: acc[key][k] + v for k, v in binned.items()}
+    rows = []
+    for (M, h), sums in acc.items():
+        for label, total in sums.items():
+            rows.append({"run": run.config.experiment_name, "signal_layer": signal_layer,
+                         "signal_index": neuron, "layer": M, "head": h,
+                         "rel_depth": M - signal_layer, "condition": "endogenous",
+                         "adapter": "on", "token_bin": label,
+                         "mean_attention": float(total) / max(1, n_seen)})
+    return rows
 
 
 def _attention_bins(alpha, t, num_left_pad):
