@@ -294,10 +294,9 @@ def plot_ood_ladder(frames: dict, out_dir, readout="endogenous", common_only=Tru
     if not corpora:
         print(f"[cmp] no OOD {readout} columns; skipping ladder")
         return
-    order = ["in-domain"] + corpora
     rows = []
     for arm, f in frames.items():
-        for corpus in order:
+        for corpus in ["in-domain"] + corpora:
             col = f"{readout}_corr" if corpus == "in-domain" else f"ood_{corpus}_{readout}"
             if col not in f:
                 continue
@@ -307,6 +306,14 @@ def plot_ood_ladder(frames: dict, out_dir, readout="endogenous", common_only=Tru
             rows.append({"corpus": corpus, "arm": arm, "n": len(vals), "mean": vals.mean(),
                          "se": vals.std(ddof=1) / np.sqrt(len(vals)) if len(vals) > 1 else np.nan})
     df = pd.DataFrame(rows)
+    if df.empty:
+        print(f"[cmp] ladder ({readout}): no data; skipping")
+        return
+    # OOD corpora ordered by DECREASING mean performance (averaged over arms), with
+    # in-domain pinned leftmost as the reference.
+    ood_order = (df[df["corpus"] != "in-domain"].groupby("corpus")["mean"].mean()
+                 .sort_values(ascending=False).index.tolist())
+    order = ["in-domain"] + ood_order
     fig, ax = plt.subplots(figsize=(13, 8))
     for arm, sub in df.groupby("arm"):
         sub = sub.set_index("corpus").reindex(order).reset_index()
@@ -315,15 +322,15 @@ def plot_ood_ladder(frames: dict, out_dir, readout="endogenous", common_only=Tru
         color = arm_colors.get(arm) if arm_colors else None
         ax.errorbar(np.arange(len(order)), sub["mean"], yerr=sub["se"], marker="o",
                     markersize=10, linewidth=2.5, capsize=4, color=color,
-                    label=f"{arm} (n={int(sub['n'].max())})")
+                    label=f"{pretty_arm(arm)} (n={int(sub['n'].max())})")
     ax.set_xticks(np.arange(len(order)))
-    ax.set_xticklabels(order, rotation=20, fontsize=26)
+    ax.set_xticklabels([pretty_corpus(c) for c in order], rotation=20, fontsize=26)
     ax.tick_params(axis="y", labelsize=26)
-    ax.set_ylabel(f"{readout} corr", fontsize=32); ax.set_ylim(-0.1, 1.05)
+    ax.set_ylabel(f"{readout.capitalize()} Correlation", fontsize=32); ax.set_ylim(-0.1, 1.05)
     ax.axhline(0, color="grey", ls="--", lw=1); ax.grid(alpha=0.25)
     ax.legend(fontsize=22)
-    ax.set_title(f"{readout} readout across the corpus ladder (mean ± SE over neurons)",
-                 fontsize=30)
+    # ladder error bars are SE (yerr=se), so the title says SE, not Std
+    ax.set_title(f"OOD {readout.capitalize()} Correlation (Mean ± SE)", fontsize=30)
     fig.tight_layout()
     path = Path(out_dir) / f"ood_ladder_{readout}.png"
     fig.savefig(path, dpi=150); plt.close(fig)
@@ -347,17 +354,31 @@ def pretty_arm(label: str) -> str:
     return label
 
 
+CORPUS_LABELS = {
+    "in-domain": "In-Domain (C4)",
+    "wikipedia": "Wikipedia",
+    "shuffled": "Shuffled (C4)",
+    "c4_zh": "C4 (Chinese)",
+    "c4_bn": "C4 (Bengali)",
+}
+
+
+def pretty_corpus(corpus: str) -> str:
+    """Display label for an OOD corpus key, e.g. 'c4_zh' -> 'C4 (Chinese)'."""
+    return CORPUS_LABELS.get(corpus, corpus.replace("_", " ").title())
+
+
 def pretty_metric(metric: str) -> str:
-    """Short metric name for the colorbar, e.g. interventional_corr ->
-    'Interventional Corr.', ood_<corpus>_endogenous -> 'Endogenous Corr. (<corpus>)'."""
-    readout_names = {"interventional": "Interventional Corr.",
-                     "endogenous": "Endogenous Corr."}
+    """Readable metric name for the colorbar, e.g. interventional_corr ->
+    'Interventional Correlation', ood_<corpus>_endogenous -> 'Endogenous Correlation (<corpus>)'."""
+    readout_names = {"interventional": "Interventional Correlation",
+                     "endogenous": "Endogenous Correlation"}
     if metric in ("interventional_corr", "endogenous_corr"):
         return readout_names[metric.split("_")[0]]
     if metric.startswith("ood_"):
         parts = metric.split("_")
         readout, corpus = parts[-1], "_".join(parts[1:-1])
-        return f"{readout_names.get(readout, readout.title() + ' Corr.')} ({corpus})"
+        return f"{readout_names.get(readout, readout.title() + ' Correlation')} ({corpus})"
     return metric.replace("_", " ").title()
 
 
@@ -381,16 +402,15 @@ def plot_delta_heatmap(merged, metric, label_a, label_b, out_dir):
     # cells are annotated mean ± std (std over the cell's neurons, aggfunc="std")
     hm = sns.heatmap(pivot, cmap="RdBu_r", center=0, vmin=-lim, vmax=lim, annot=annot, fmt="",
                 annot_kws={"size": 20},
-                cbar_kws={"label": f"Paired Diff. {pretty_metric(metric)} (Mean ± Std)"})
+                cbar_kws={"label": f"Paired Diff. {pretty_metric(metric)}\n(Mean ± Std over Neurons)"})
     hm.figure.axes[-1].yaxis.label.set_size(24)  # colorbar label
     hm.figure.axes[-1].tick_params(labelsize=22)  # colorbar ticks
     hm.tick_params(axis="x", labelsize=30)
     hm.tick_params(axis="y", labelsize=30)
-    plt.xlabel("token position", fontsize=38); plt.ylabel("layer", fontsize=38)
-    plt.title(f"{pretty_arm(label_a)} vs {pretty_arm(label_b)}", fontsize=36)
+    plt.xlabel("Token Position", fontsize=38); plt.ylabel("Layer", fontsize=38)
     plt.tight_layout()
     path = Path(out_dir) / f"delta_{metric}_{label_a}_vs_{label_b}.png"
-    plt.savefig(path, dpi=150); plt.close()
+    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     print(f"[cmp] wrote {path}")
 
 

@@ -26,6 +26,19 @@ plt.rcParams.update({
 
 ROOT=Path(__file__).parents[1]
 
+
+def _metric_words(metric: str) -> str:
+    """Readable colorbar name for a sweep metric key, e.g. 'test_corr' ->
+    'Endogenous Correlation', 'intervention_l2_dist' -> 'Interventional L2 Distance'."""
+    quantity = "Correlation" if metric.endswith("corr") else "L2 Distance"
+    if metric.startswith("intervention"):
+        kind = "Interventional"
+    elif metric.startswith("test_pred"):
+        kind = "Predicted Endogenous"
+    else:                                    # test_ / endogenous readout
+        kind = "Endogenous"
+    return f"{kind} {quantity}"
+
 def plot_token_overlap_vs_test_metrics(exp_pattern:str, output_dir:str="single_neuron"):
     data_dirs = sorted(glob.glob(f"{ROOT}/data/{exp_pattern}*"))
     out_dirs = sorted(glob.glob(f"{ROOT}/outputs/runs/{exp_pattern}*"))
@@ -120,18 +133,17 @@ def plot_sweep_eval_metrics(exp_name: str, output_dir:str="single_neuron"):
             fmt="",
             vmin=vmin, vmax=vmax,
             annot_kws={"size": 14},
-            cbar_kws={"label": metric},
+            cbar_kws={"label": f"{_metric_words(metric)}\n(Mean ± Std over Neurons)"},
         )
         hm.figure.axes[-1].yaxis.label.set_size(28)  # colorbar label
         hm.figure.axes[-1].tick_params(labelsize=22)  # colorbar ticks
         hm.tick_params(axis="x", labelsize=30)
         hm.tick_params(axis="y", labelsize=30)
-        plt.xlabel("token position", fontsize=38); plt.ylabel("layer", fontsize=38)
-        plt.title(f"{metric}(X100) across layers and tokens", fontsize=40)
+        plt.xlabel("Token Position", fontsize=38); plt.ylabel("Layer", fontsize=38)
         plt.tight_layout()
         plot_dir = f"{ROOT}/outputs/plots/single_neuron"
         os.makedirs(plot_dir, exist_ok=True)
-        plt.savefig(f"{plot_dir}/sweep_eval_metrics_{metric}.png")
+        plt.savefig(f"{plot_dir}/sweep_eval_metrics_{metric}.png", bbox_inches="tight")
         plt.close()
 
 
@@ -231,18 +243,17 @@ def plot_sweep_eval_metrics_intervention_train(exp_name: str, output_dir:str="si
             fmt="",
             vmin=vmin, vmax=vmax,
             annot_kws={"size": 14},
-            cbar_kws={"label": metric},
+            cbar_kws={"label": f"{_metric_words(metric)}\n(Mean ± Std over Neurons)"},
         )
         hm.figure.axes[-1].yaxis.label.set_size(28)  # colorbar label
         hm.figure.axes[-1].tick_params(labelsize=22)  # colorbar ticks
         hm.tick_params(axis="x", labelsize=30)
         hm.tick_params(axis="y", labelsize=30)
-        plt.xlabel("token position", fontsize=38); plt.ylabel("layer", fontsize=38)
-        plt.title(f"{metric}(X100) across layers and tokens", fontsize=40)
+        plt.xlabel("Token Position", fontsize=38); plt.ylabel("Layer", fontsize=38)
         plt.tight_layout()
         plot_dir = f"{ROOT}/outputs/plots/{output_dir}"
         os.makedirs(plot_dir, exist_ok=True)
-        plt.savefig(f"{plot_dir}/sweep_eval_metrics_{metric}.png")
+        plt.savefig(f"{plot_dir}/sweep_eval_metrics_{metric}.png", bbox_inches="tight")
         plt.close()
 
 
@@ -418,26 +429,28 @@ def plot_endogenous_heatmaps(df: pd.DataFrame, out_dir: str):
         else:
             vals = msub["mean"].dropna()
             scale[metric] = (float(vals.min()), float(vals.max())) if len(vals) else (None, None)
+    quantity = {"corr": "Correlation", "l2_dist": "L2 Distance"}
     for (eval_name, metric), sub in summary.groupby(["eval_type", "metric"]):
         mean_df = sub.pivot(index="layer", columns="position", values="mean")
         se_df = sub.pivot(index="layer", columns="position", values="se")
         annot = mean_df.round(3).astype(str) + "\n±" + se_df.round(3).astype(str)
         vmin, vmax = scale[metric]
+        # these heatmaps annotate ± SE (se_df), so the label says SE, not Std
+        cbar_label = f"{eval_name.capitalize()} {quantity.get(metric, metric)}\n(Mean ± SE over Neurons)"
 
         plt.figure(figsize=[16, 12])
         hm = sns.heatmap(mean_df, annot=annot, fmt="", vmin=vmin, vmax=vmax,
                          annot_kws={"size": 13}, cmap="viridis",
-                         cbar_kws={"label": f"{eval_name} {metric}"})
+                         cbar_kws={"label": cbar_label})
         hm.figure.axes[-1].yaxis.label.set_size(24)
         hm.figure.axes[-1].tick_params(labelsize=18)
         hm.tick_params(axis="x", labelsize=24)
         hm.tick_params(axis="y", labelsize=24)
-        plt.xlabel("token position", fontsize=30)
-        plt.ylabel("layer", fontsize=30)
-        plt.title(f"{eval_name} {metric} (mean±SE over neurons)", fontsize=32)
+        plt.xlabel("Token Position", fontsize=30)
+        plt.ylabel("Layer", fontsize=30)
         plt.tight_layout()
         path = f"{out_dir}/heatmap_{eval_name}_{metric}.png"
-        plt.savefig(path, dpi=150)
+        plt.savefig(path, dpi=150, bbox_inches="tight")
         plt.close()
         print(f"[endo] wrote {path}")
 
@@ -466,7 +479,9 @@ def plot_endogenous_lines(df: pd.DataFrame, out_dir: str, hue: str = "layer"):
             facet_kws={"sharey": False}, height=4.5, aspect=1.4, legend="brief",
         )
         g.set_titles("{col_name}")
-        g.set_axis_labels("token position", "")
+        g.set_axis_labels("Token Position", "")
+        if g.legend is not None:
+            g.legend.set_title(hue_col.capitalize())
         for ax in g.axes.flat:
             if any(m in ax.get_title() for m in RANGE01):
                 ax.set_ylim(-0.05, 1.02)
@@ -517,8 +532,8 @@ def plot_gate_comparison(df_by_gate: dict, out_dir: str, expected_neurons: int =
             sns.lineplot(data=sub, x="position", y="value", hue="layer", palette=palette,
                          marker="o", errorbar="se", ax=ax, legend=(ax is axes.flat[-1]))
             ax.set_title(f"gate {gate}")
-            ax.set_xlabel("token position")
-            ax.set_ylabel(panel)
+            ax.set_xlabel("Token Position")
+            ax.set_ylabel(panel.title())
             if "corr" in panel:
                 ax.set_ylim(-0.1, 1.05)
                 ax.axhline(0, color="grey", ls="--", lw=1)
@@ -529,7 +544,7 @@ def plot_gate_comparison(df_by_gate: dict, out_dir: str, expected_neurons: int =
         last = axes.flat[-1]
         if last.get_visible() and last.get_legend() is not None:
             sns.move_legend(last, "center left", bbox_to_anchor=(1.02, 0.5),
-                            title="layer", frameon=False)
+                            title="Layer", frameon=False)
         fig.suptitle(f"{panel}: gate on vs off (mean ± SE over {expected_neurons} neurons)",
                      y=1.02)
         fig.tight_layout()

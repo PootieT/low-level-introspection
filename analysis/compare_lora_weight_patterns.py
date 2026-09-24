@@ -210,7 +210,7 @@ def plot_profiles_grouped(df, out_dir, group_col="signal_layer", x="rel_depth",
                             color=palette[g], alpha=0.12)
         ax.axvline(0, color="k", ls="--", lw=1, alpha=0.6)
         ax.set_title(module)
-        ax.set_xlabel("layer - signal layer" if x == "rel_depth" else "layer")
+        ax.set_xlabel("Layer - Signal Layer" if x == "rel_depth" else "Layer")
         if value == "frob_norm":
             ax.set_ylabel("||dW||_F (normalized)"); ax.set_ylim(0, 1.05)
         else:
@@ -223,8 +223,8 @@ def plot_profiles_grouped(df, out_dir, group_col="signal_layer", x="rel_depth",
     if empties and handles:
         leg_ax, *rest = empties
         leg_ax.axis("off")
-        leg_ax.legend(handles, labels, loc="center", fontsize=13, title=group_col,
-                      frameon=False)
+        leg_ax.legend(handles, labels, loc="center", fontsize=13,
+                      title=group_col.replace("_", " ").title(), frameon=False)
         for ax in rest:
             ax.set_visible(False)
     else:
@@ -311,8 +311,8 @@ def plot_targeted_heatmaps(cell: pd.DataFrame, out_dir: Path):
             sns.heatmap(piv, ax=ax, annot=annot, fmt="g", annot_kws={"size": 10},
                         cbar=False, yticklabels=(i == 0), **kw)
             ax.set_title(module, fontsize=14)
-            ax.set_xlabel("token position", fontsize=13)
-            ax.set_ylabel("signal layer" if i == 0 else "", fontsize=13)
+            ax.set_xlabel("Token Position", fontsize=13)
+            ax.set_ylabel("Signal Layer" if i == 0 else "", fontsize=13)
             ax.tick_params(axis="y", rotation=0, labelsize=11)   # horizontal -> no overlap
             ax.tick_params(axis="x", labelsize=11)
         # one shared colorbar to the right of the last panel
@@ -346,7 +346,7 @@ def plot_target_vs_random(t: pd.DataFrame, out_dir: Path):
             v = v[v > 0]
             if len(v):
                 ax.hist(np.log10(v), bins=40, alpha=0.6, color=color, label=kind, density=True)
-        ax.set_xlabel("log10 ||dW_i|| / ||W0_i||"); ax.set_ylabel("density")
+        ax.set_xlabel("log10 ||dW_i|| / ||W0_i||"); ax.set_ylabel("Density")
         ax.set_title(f"{module}: update size"); ax.legend(fontsize=9); ax.grid(alpha=0.2)
 
         ax = axes[1, j]
@@ -355,7 +355,7 @@ def plot_target_vs_random(t: pd.DataFrame, out_dir: Path):
             if len(v):
                 ax.hist(v, bins=40, alpha=0.6, color=color, label=kind, density=True)
         ax.axvline(0, color="k", ls="--", lw=1)
-        ax.set_xlabel("cos(dW_i, W0_i)"); ax.set_ylabel("density")
+        ax.set_xlabel("cos(dW_i, W0_i)"); ax.set_ylabel("Density")
         ax.set_title(f"{module}: direction vs base"); ax.legend(fontsize=9); ax.grid(alpha=0.2)
     fig.suptitle("Target neuron vs random untrained indices of the same layer", y=1.01)
     fig.tight_layout()
@@ -385,7 +385,7 @@ def plot_profiles(df, out_dir, x="rel_depth", value="frob_norm"):
             ax.plot(s[x], s[value], marker="o", ms=4, label=cond, color=palette[cond])
         ax.axvline(0, color="k", ls="--", lw=1, alpha=0.6)
         ax.set_title(module)
-        ax.set_xlabel("layer - signal layer" if x == "rel_depth" else "layer")
+        ax.set_xlabel("Layer - Signal Layer" if x == "rel_depth" else "Layer")
         if value == "frob_norm":
             ax.set_ylabel("||dW||_F (normalized)")
             ax.set_ylim(0, 1.05)
@@ -399,7 +399,7 @@ def plot_profiles(df, out_dir, x="rel_depth", value="frob_norm"):
     if empties and handles:
         leg_ax, *rest = empties
         leg_ax.axis("off")
-        leg_ax.legend(handles, labels, loc="center", fontsize=12, title="condition",
+        leg_ax.legend(handles, labels, loc="center", fontsize=12, title="Condition",
                       frameon=False)
         for ax in rest:
             ax.set_visible(False)
