@@ -29,8 +29,8 @@ ROOT=Path(__file__).parents[1]
 
 def _metric_words(metric: str) -> str:
     """Readable colorbar name for a sweep metric key, e.g. 'test_corr' ->
-    'Endogenous Correlation', 'intervention_l2_dist' -> 'Interventional L2 Distance'."""
-    quantity = "Correlation" if metric.endswith("corr") else "L2 Distance"
+    'Endogenous Correlation', 'intervention_l2_dist' -> 'Interventional L2'."""
+    quantity = "Correlation" if metric.endswith("corr") else "L2"
     if metric.startswith("intervention"):
         kind = "Interventional"
     elif metric.startswith("test_pred"):
@@ -429,7 +429,7 @@ def plot_endogenous_heatmaps(df: pd.DataFrame, out_dir: str):
         else:
             vals = msub["mean"].dropna()
             scale[metric] = (float(vals.min()), float(vals.max())) if len(vals) else (None, None)
-    quantity = {"corr": "Correlation", "l2_dist": "L2 Distance"}
+    quantity = {"corr": "Correlation", "l2_dist": "L2"}
     for (eval_name, metric), sub in summary.groupby(["eval_type", "metric"]):
         mean_df = sub.pivot(index="layer", columns="position", values="mean")
         se_df = sub.pivot(index="layer", columns="position", values="se")
@@ -531,7 +531,7 @@ def plot_gate_comparison(df_by_gate: dict, out_dir: str, expected_neurons: int =
                 continue
             sns.lineplot(data=sub, x="position", y="value", hue="layer", palette=palette,
                          marker="o", errorbar="se", ax=ax, legend=(ax is axes.flat[-1]))
-            ax.set_title(f"gate {gate}")
+            ax.set_title(f"LoRA Gate-{gate.capitalize()}")
             ax.set_xlabel("Token Position")
             ax.set_ylabel(panel.title())
             if "corr" in panel:
@@ -545,8 +545,6 @@ def plot_gate_comparison(df_by_gate: dict, out_dir: str, expected_neurons: int =
         if last.get_visible() and last.get_legend() is not None:
             sns.move_legend(last, "center left", bbox_to_anchor=(1.02, 0.5),
                             title="Layer", frameon=False)
-        fig.suptitle(f"{panel}: gate on vs off (mean ± SE over {expected_neurons} neurons)",
-                     y=1.02)
         fig.tight_layout()
         path = Path(out_dir) / f"gate_comparison_{panel.replace(' ', '_')}.png"
         fig.savefig(path, dpi=150, bbox_inches="tight")
