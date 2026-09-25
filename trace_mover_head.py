@@ -747,6 +747,38 @@ def trace_movers(run, args, out_dir: Path):
     pd.DataFrame(endogenous_all_head_profile(
         run, loader, cand_layers, layer_out_tuple, device, L, i)
     ).to_csv(out_dir / "mover_attention_profile_all_heads.csv", index=False)
+
+    # ---- writer vs mover: per-head gain onto the target direction vs the null ----
+    print(f"[mover] endogenous transport gain: {len(cand_layers) * n_heads} heads x "
+          f"(target + cellmates + {N_RANDOM_DIRECTIONS} random directions) ...")
+    tg_rows = endogenous_transport_gain(
+        run, loader, cand_layers, layer_out_tuple, device, W_O, W_V, gammas, w,
+        gamma, eps, n_heads, n_kv_heads, head_dim)
+    pd.DataFrame(tg_rows).to_csv(out_dir / "mover_transport_gain.csv", index=False)
+    tg_sum = summarize_transport_gain(tg_rows)
+    # ov_share: the analytic OV-only gain as a fraction of the MEASURED slope at t at the
+    # operating point (the `local` regime). ~1 means the head transports at fixed
+    # attention; ~0 means its transport is attention moving. Only meaningful where the
+    # direct path is the whole path (rel_depth 1) -- flagged, not dropped, beyond that.
+    local = [rg.name for rg in regimes if rg.is_local]
+    if local and not tg_sum.empty:
+        loc = (heads_df[heads_df["regime"] == local[0]]
+               .set_index(["layer", "head"])["mean_slope_at_t"].rename("slope_at_t_local"))
+        tg_sum = tg_sum.merge(loc.reset_index(), on=["layer", "head"], how="left")
+        tg_sum["ov_share"] = np.where(tg_sum["slope_at_t_local"].abs() > 1e-15,
+                                      tg_sum["gain_target_raw"] / tg_sum["slope_at_t_local"],
+                                      np.nan)
+        tg_sum["ov_share_direct_path"] = tg_sum["rel_depth"] == 1
+    tg_sum.to_csv(out_dir / "mover_transport_summary.csv", index=False)
+    if not tg_sum.empty:
+        # NOT named `top`: that name holds the selected heads, which the meta json
+        # below iterates -- shadowing it with a frame made that loop unpack column names
+        tg_top = tg_sum.reindex(
+            tg_sum["gain_target_raw"].abs().sort_values(ascending=False).index)
+        print("[mover] top heads by endogenous gain on the target column:")
+        print(tg_top.head(6)[["layer", "head", "gain_target_raw", "writer_share",
+                              "z_edit_vs_random", "z_base_vs_random"]].to_string(
+            index=False, float_format=lambda v: f"{v:.3g}"))
     addr_df = pd.DataFrame(addr_rows)
     addr_df.to_csv(out_dir / "mover_attention_base_vs_tuned.csv", index=False)
 
@@ -787,6 +819,158 @@ def trace_movers(run, args, out_dir: Path):
 ATTENTION_BINS = (["BOS"] + [f"t{d:+d}" if d else "t" for d in range(-3, 4)]
                   + [f"final{d:+d}" if d else "final" for d in range(-3, 1)]
                   + ["other_text", "other_prompt"])
+
+
+N_RANDOM_DIRECTIONS = 20
+
+
+@torch.no_grad()
+def endogenous_transport_gain(run, loader, layers, layer_out_tuple, device, W_O, W_V,
+                              gammas, w, gamma_final, eps, n_heads, n_kv_heads, head_dim,
+                              n_random=N_RANDOM_DIRECTIONS):
+    """
+    How strongly each head carries a given DIRECTION written at t to the readout, with
+    nothing injected -- the quantity that separates the writer from the mover.
+
+    For head h at layer M and a direction d written into the residual at t, the direct
+    path to the prediction at frozen attention and frozen norms is
+
+        gain_h(d) = alpha_h(last -> t) * (a . W_O^h W_V^kv (gamma_M * d)) / rms_M(t)
+
+    averaged over examples (a = readout covector). It is linear in d, so it is computed
+    for UNIT directions and the raw gain of a column is its unit gain times its norm.
+
+    Directions:
+      target      the run's trained neuron's effective down_proj column
+      target_base / target_edit
+                  that column split into the base model's part and the LoRA edit -- the
+                  writer is the edit, so its share of a head's gain is the writer's share
+      cellmate    the other neurons of the same (layer, position) cell, same layer's
+                  down_proj: untrained columns, same geometry
+      random      unit vectors in the residual stream: the null for "this head reads
+                  whatever direction happens to be at t"
+
+    Reading it: a head whose unit-gain on the target sits far above its random-direction
+    distribution is ALIGNED to the trained channel -- a signal-specific mover. One whose
+    target gain is typical of random directions is signal-agnostic: it carries whatever
+    is at t, and any selectivity for the target comes from the WRITER making that column
+    large (col_norm), not from the mover. The two are exactly the writer/mover split.
+
+    THIS IS THE OV-MEDIATED PATH ONLY. The full derivative of a head's contribution at t
+    is  alpha * d(OV)/dv  +  OV * d(alpha)/dv,  and this computes the first term. An
+    earlier version of this docstring claimed freezing attention was "nearly exact"
+    endogenously because alpha is small there (~1e-3). That was wrong: small alpha is
+    not small d(alpha)/dv RELATIVE to alpha. Measured on joint_N0.1377_POS-12 at rel_depth
+    1, this gain reproduces the ORDERING of the finite-difference slope almost perfectly
+    (corr 0.997 over 32 heads) but only 4-14% of its MAGNITUDE on the material heads,
+    whose attention to t moves 5-7x across +/-1 sigma. So even at the operating point
+    those heads transport mostly by attention moving, not through a fixed-attention OV
+    path. The ratio of the two is reported as `ov_share` (see trace_movers), which is the
+    threshold-free version of the transporter/grabber distinction.
+
+    Valid as a DIRECT-path gain: at rel_depth 1 no layer sits between the write and the
+    head. Deeper, the write has been read and rewritten by intermediate layers, the
+    direct path is only part of what reaches the head, and agreement with the measured
+    slope breaks down (corr ~0.3 at rel_depth 2, near 0 beyond) -- as it should.
+    """
+    L, i = run.layer, run.index
+    mod = run.base.model.layers[L].mlp.down_proj
+    down = effective_weight(mod)                                                # [H, I]
+    base_w = getattr(mod, "base_layer", mod).weight.detach().float().cpu()
+    cellmates = [int(s.index) for s in run.config.train_signals
+                 if int(s.layer) == L and int(s.index) != i]
+    rng = np.random.RandomState(L * 100003 + i)
+    rand = torch.from_numpy(rng.randn(down.shape[0], n_random)).float()
+    # The target column split into what the base model already wrote and what training
+    # ADDED. The edit is near-orthogonal to the base column (cosine ~0 in the weight
+    # analysis), so it barely changes the column's norm -- a norm ratio cannot see the
+    # writer at all. The gain is linear in the direction, so
+    #   gain(target) == gain(target_base) + gain(target_edit)
+    # exactly, and the edit's share is the writer's share of this head's transport.
+    dirs = [("target", "target", down[:, i]),
+            ("target_base", "target_base", base_w[:, i]),
+            ("target_edit", "target_edit", down[:, i] - base_w[:, i])]
+    dirs += [(f"cellmate_{j}", "cellmate", down[:, j]) for j in cellmates]
+    dirs += [(f"random_{k}", "random", rand[:, k]) for k in range(n_random)]
+    D = torch.stack([d for _, _, d in dirs], 1)                                 # [H, K]
+    norms = D.norm(dim=0)
+    Du = D / norms.clamp(min=1e-12)
+    group = n_heads // n_kv_heads
+
+    sums = {M: torch.zeros(n_heads, D.shape[1]) for M in layers}
+    n_seen = 0
+    for batch in loader():
+        batch = batch.to(device)
+        cap = run_injected_batch(run, batch, None, layers, layer_out_tuple)
+        a = readout_scale(cap["final_resid"], w, gamma_final, eps)              # [B, H]
+        t = cap["abs_pos"]
+        rows = torch.arange(t.shape[0])
+        n_seen += t.shape[0]
+        for M in layers:
+            U = (a @ W_O[M]).view(-1, n_kv_heads, group, head_dim)               # [B,g,j,hd]
+            V = (W_V[M] @ (gammas[M].unsqueeze(1) * Du)).view(n_kv_heads, head_dim, -1)
+            dot = torch.einsum("bgjd,gdk->bgjk", U, V).reshape(U.shape[0], n_heads, -1)
+            x = cap[f"pre_{M}"]
+            rms = x.pow(2).mean(-1).add(eps).sqrt()                              # [B]
+            alpha_t = cap["attn_probs"][M][rows, :, t]                           # [B, heads]
+            sums[M] += (alpha_t.unsqueeze(-1) * dot / rms.view(-1, 1, 1)).sum(0)
+
+    out = []
+    for M in layers:
+        g = sums[M] / max(1, n_seen)                                             # [heads, K]
+        for h in range(n_heads):
+            for k, (name, kind, _) in enumerate(dirs):
+                out.append({"run": run.config.experiment_name, "signal_layer": L,
+                            "signal_index": i, "layer": M, "head": h, "rel_depth": M - L,
+                            "direction": name, "direction_kind": kind,
+                            "col_norm": float(norms[k]), "gain_unit": float(g[h, k]),
+                            "gain_raw": float(g[h, k] * norms[k])})
+    return out
+
+
+def summarize_transport_gain(rows) -> pd.DataFrame:
+    """Per head: target-direction gain against the random null and the cellmates.
+
+    writer_share        gain(target_edit) / gain(target): how much of this head's
+                        transport of the trained neuron rides on the direction TRAINING
+                        added rather than the one the base model already wrote.
+    z_edit_vs_random    is the head's OV aligned to that trained direction, beyond what a
+                        random direction of the same norm gets? High = a signal-specific
+                        mover reading the private wire; ~0 = a signal-agnostic mover that
+                        carries whatever is at t.
+    z_base_vs_random    the same for the base model's own column.
+    """
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    out = []
+    def z(val, rnd, sd):
+        return (abs(val) - rnd.mean()) / sd if sd and sd > 0 else np.nan
+
+    for (M, h), g in df.groupby(["layer", "head"]):
+        tgt = g[g["direction_kind"] == "target"].iloc[0]
+        base = g[g["direction_kind"] == "target_base"].iloc[0]
+        edit = g[g["direction_kind"] == "target_edit"].iloc[0]
+        rnd = g[g["direction_kind"] == "random"]["gain_unit"].abs()
+        cm = g[g["direction_kind"] == "cellmate"]
+        sd = float(rnd.std()) if len(rnd) > 1 else np.nan
+        out.append({"run": tgt["run"], "signal_layer": tgt["signal_layer"],
+                    "signal_index": tgt["signal_index"], "layer": M, "head": h,
+                    "rel_depth": tgt["rel_depth"],
+                    "gain_target_unit": tgt["gain_unit"], "gain_target_raw": tgt["gain_raw"],
+                    "gain_random_unit_abs_mean": float(rnd.mean()) if len(rnd) else np.nan,
+                    "gain_base_raw": base["gain_raw"], "gain_edit_raw": edit["gain_raw"],
+                    "writer_share": (edit["gain_raw"] / tgt["gain_raw"]
+                                     if abs(tgt["gain_raw"]) > 1e-15 else np.nan),
+                    "edit_norm": edit["col_norm"], "base_norm": base["col_norm"],
+                    "z_target_vs_random": z(tgt["gain_unit"], rnd, sd),
+                    "z_edit_vs_random": z(edit["gain_unit"], rnd, sd),
+                    "z_base_vs_random": z(base["gain_unit"], rnd, sd),
+                    "gain_cellmate_unit_abs_mean": (float(cm["gain_unit"].abs().mean())
+                                                    if len(cm) else np.nan),
+                    "gain_cellmate_raw_abs_mean": (float(cm["gain_raw"].abs().mean())
+                                                   if len(cm) else np.nan)})
+    return pd.DataFrame(out)
 
 
 @torch.no_grad()
