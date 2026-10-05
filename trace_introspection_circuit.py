@@ -70,7 +70,7 @@ from src.introspector.analysis_loading import (
     load_run_for_analysis, absolute_positions, layer_output_is_tuple, run_per_locale)
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
 from src.introspector.run_discovery import (
-    add_discovery_args, runs_from_args, resolve_run_action)
+    add_discovery_args, runs_from_args, resolve_run_action, locale_out_dir, locale_tag)
 from src.introspector.regimes import (
     DEFAULT_REGIMES, DEFAULT_LOCAL_DELTA_SIGMA, parse_regimes, zero_offset_index,
     identity_check, power_warning)
@@ -257,6 +257,26 @@ def readout_scale(final_resid, w, gamma, eps):
 def contribution(a, write):
     """Scalar contribution of a residual write to the readout. a,write: [N,H] -> [N]."""
     return (a * write).sum(-1)
+
+
+def effective_weight(module) -> torch.Tensor:
+    """W0 + B@A*scaling for a peft LoRA linear, W0 otherwise.
+
+    Any per-head split has to use the weights the TRAINED model runs. With LoRA on
+    all-linear, `module.weight` on a peft layer returns the BASE weight only, so a
+    head decomposition built from it silently drops the adapter's own o_proj edit
+    (and no longer sums to the attention block's measured write).
+    """
+    base = getattr(module, "base_layer", module)
+    W = base.weight.detach().float()
+    if hasattr(module, "lora_A") and isinstance(module.lora_A, torch.nn.ModuleDict):
+        for adapter, A in module.lora_A.items():
+            B = module.lora_B[adapter]
+            W = W + (B.weight.detach().float() @ A.weight.detach().float()
+                     ) * module.scaling[adapter]
+    # on CPU: every decomposition below runs on CPU captures, and a weight left on the
+    # accelerator turns each einsum into a device mismatch
+    return W.cpu()
 
 
 def per_head_contributions(z_cat, W_O, n_heads, head_dim, a):
@@ -468,7 +488,8 @@ def trace_one_run(run, args, out_dir: Path):
     head_dim = getattr(hf.config, "head_dim", hf.config.hidden_size // n_heads)
     eps = hf.config.rms_norm_eps
     gamma = hf.model.norm.weight.detach().float().cpu()
-    W_O = {L: hf.model.layers[L].self_attn.o_proj.weight.detach().float().cpu()
+    # base + LoRA edit: the head split must use the o_proj the trained model runs
+    W_O = {L: effective_weight(hf.model.layers[L].self_attn.o_proj)
            for L in range(start_layer, n_layers)}
     w = model.regression_head.weight.detach().flatten().float().cpu()
     bias = float(model.regression_head.bias.detach().flatten()[0].cpu())
@@ -615,6 +636,13 @@ def trace_one_run(run, args, out_dir: Path):
       print(f"[sanity] {regime.name}: max|sum(contributions)+bias - prediction| = "
             f"{max_err:.3e} (should be ~0)")
 
+      # per-head split sanity: heads of a layer must sum to that layer's attention write
+      head_err = max(
+          (torch.stack(head_contribs[L], 1).sum(-1) - contribs[f"attn_{L}"]).abs().max().item()
+          for L in range(start_layer, n_layers))
+      print(f"[sanity] {regime.name}: max|sum(head contributions) - attn contribution| = "
+            f"{head_err:.3e} (should be ~0)")
+
       # end-to-end validation: the traced model must still causally read the neuron,
       # i.e. its prediction tracks the swept value.
       from scipy.stats import pearsonr
@@ -714,7 +742,8 @@ def trace_one_run(run, args, out_dir: Path):
       meta_regimes[regime.name] = {
           "kind": regime.kind, "scale": regime.scale, "delta_sigma": regime.delta_sigma,
           "grid": [float(x) for x in regime.grid],
-          "decomposition_max_err": max_err, "e2e_corr_pred_vs_v": float(e2e)}
+          "decomposition_max_err": max_err, "head_split_max_err": head_err,
+          "e2e_corr_pred_vs_v": float(e2e)}
 
     # ---- one combined csv per analysis, regimes side by side ----
     pd.concat(attr_frames, ignore_index=True).to_csv(
@@ -750,6 +779,14 @@ def main():
     run_per_locale(args, runs, "circuit_trace", "decodability.csv",
                    analyze=lambda run, spec, out_dir: trace_one_run(run, args, out_dir),
                    replot=replot_circuit, log="[trace]")
+    # multi-locale runs: one side-by-side head map across the trained signals, from the
+    # per-signal CSVs just written (or cached), to compare which heads carry each signal
+    sweeping = len(runs) > 1 or getattr(args, "group", None) is not None
+    for spec in runs:
+        if spec.is_multi_locale:
+            base = (spec.run_dir / "circuit_trace" if sweeping or not args.output_dir
+                    else Path(args.output_dir))
+            plot_heads_across_locales(spec, base)
 
 def _plot_attribution(attr_df, n_layers, start_layer, inject_layer, out_dir, tag=""):
     order = ["embed"] + [f"attn_{L}" for L in range(n_layers)] + [f"mlp_{L}" for L in range(n_layers)]
@@ -817,14 +854,99 @@ def replot_circuit(spec, out_dir: Path, args) -> bool:
     n_layers = int(max(head_df["layer"].max(), dec_df["layer"].max())) + 1
     n_heads = int(head_df["head"].max()) + 1
     probe_labels = meta.get("probe_labels") or list(dict.fromkeys(dec_df["probe"]))
-    head_mat = (head_df.pivot(index="layer", columns="head", values="mean_slope")
-                .reindex(index=range(start_layer, n_layers), columns=range(n_heads)).to_numpy())
-    dec_mat = (dec_df.pivot(index="layer", columns="probe", values="corr")
-               .reindex(index=range(n_layers), columns=probe_labels).to_numpy())
-    _plot_attribution(attr_df, n_layers, start_layer, inject_layer, out_dir)
-    _plot_heads(head_mat, start_layer, n_layers, n_heads, out_dir)
-    _plot_decodability(dec_mat, probe_labels, n_layers, inject_layer, out_dir)
+    # one figure set per regime, as trace_one_run writes them (the CSVs are long over
+    # regimes; pivoting them unfiltered raises on duplicate (layer, head) entries)
+    for regime in dict.fromkeys(head_df["regime"]):
+        tag = f"_{regime}"
+        h = head_df[head_df["regime"] == regime]
+        d = dec_df[dec_df["regime"] == regime]
+        head_mat = (h.pivot(index="layer", columns="head", values="mean_slope")
+                    .reindex(index=range(start_layer, n_layers), columns=range(n_heads))
+                    .to_numpy())
+        dec_mat = (d.pivot(index="layer", columns="probe", values="corr")
+                   .reindex(index=range(n_layers), columns=probe_labels).to_numpy())
+        _plot_attribution(attr_df[attr_df["regime"] == regime], n_layers, start_layer,
+                          inject_layer, out_dir, tag)
+        _plot_heads(head_mat, start_layer, n_layers, n_heads, out_dir, tag)
+        _plot_decodability(dec_mat, probe_labels, n_layers, inject_layer, out_dir, tag)
     return True
+
+
+def plot_heads_across_locales(spec, base: Path, top_k: int = 5):
+    """
+    Multi-locale runs: the per-head attribution maps of every trained signal side by
+    side, one figure per regime (attribution_heads_by_locale_<regime>.png in `base`).
+
+    Each panel is transposed relative to attribution_heads_*.png (rows = head, columns =
+    layer) so a given head sits on the same row in every panel, and is trimmed to the
+    layers ALL signals can reach (max over signals of start_layer -- a head below a
+    signal's origin layer can't see it). Panels keep their own colour scale: slope
+    magnitudes differ a lot across signal layers, and the question is which heads, not
+    how much. The top-|slope| heads of each panel are boxed, and the last panel gives
+    the pairwise correlation of the trimmed head maps between signals, so "the same heads
+    carry every signal" is a number rather than an impression.
+    """
+    panels = []  # (tag, start_layer, long df)
+    for loc in spec.locales:
+        d = locale_out_dir(base, spec, loc)
+        csv, meta_p = d / "attribution_heads.csv", d / "trace_meta.json"
+        if csv.exists() and meta_p.exists():
+            panels.append((locale_tag(*loc), int(json.loads(meta_p.read_text())["start_layer"]),
+                           pd.read_csv(csv)))
+    if len(panels) < 2:
+        print(f"[trace] cross-locale head plot: {len(panels)} signal(s) traced, need 2 -- skipped")
+        return
+    lo = max(sl for _, sl, _ in panels)
+    hi = min(int(df["layer"].max()) for _, _, df in panels)
+    n_heads = int(max(df["head"].max() for _, _, df in panels)) + 1
+    layers = list(range(lo, hi + 1))
+    regimes = [r for r in dict.fromkeys(panels[0][2]["regime"])
+               if all((df["regime"] == r).any() for _, _, df in panels)]
+    for regime in regimes:
+        mats = [(df[df["regime"] == regime]
+                 .pivot(index="head", columns="layer", values="mean_slope")
+                 .reindex(index=range(n_heads), columns=layers).to_numpy())
+                for _, _, df in panels]
+        tags = [t for t, _, _ in panels]
+        flat = np.stack([m.ravel() for m in mats])
+        corr = np.corrcoef(np.nan_to_num(flat))
+
+        n = len(mats)
+        col_w = max(1.6, 0.45 * len(layers) + 1.0)
+        fig, axes = plt.subplots(
+            1, n + 1, figsize=(col_w * n + 0.6 * n + 2.5, max(5, 0.22 * n_heads)),
+            gridspec_kw={"width_ratios": [1] * n + [max(1.0, 0.35 * n)]})
+        for k, (ax, m, tag) in enumerate(zip(axes[:n], mats, tags)):
+            lim = np.nanmax(np.abs(m)) or 1.0
+            sns.heatmap(m, ax=ax, cmap="coolwarm", center=0, vmin=-lim, vmax=lim,
+                        xticklabels=layers, yticklabels=list(range(n_heads)) if k == 0 else False,
+                        cbar_kws={"label": "slope" if k == n - 1 else None, "shrink": 0.6,
+                                  "pad": 0.02})
+            ax.collections[0].colorbar.ax.tick_params(labelsize=6)
+            ax.tick_params(axis="y", labelsize=6)
+            # box the top-k heads by |slope| within the trimmed window
+            order = np.argsort(np.nan_to_num(np.abs(m)).ravel())[::-1][:top_k]
+            for flat_i in order:
+                h, c = divmod(int(flat_i), len(layers))
+                ax.add_patch(plt.Rectangle((c, h), 1, 1, fill=False, ec="k", lw=1.2))
+            ax.set_title(tag, fontsize=9)
+            ax.set_xlabel("layer")
+            ax.set_ylabel("head" if k == 0 else "")
+        ax = axes[n]
+        sns.heatmap(corr, ax=ax, cmap="viridis", vmin=-1, vmax=1, annot=True, fmt=".2f",
+                    annot_kws={"size": 7}, xticklabels=tags, yticklabels=tags, square=True,
+                    cbar=False)
+        ax.tick_params(labelsize=7)
+        ax.set_title(f"head-map corr\n(layers {lo}-{hi})", fontsize=9)
+        fig.suptitle(f"{spec.name}: per-head attribution to readout, layers {lo}-{hi} "
+                     f"[{regime}] -- boxes = top {top_k} |slope| per signal", fontsize=10)
+        fig.tight_layout()
+        out = base / f"attribution_heads_by_locale_{regime}.png"
+        fig.savefig(out, dpi=150)
+        plt.close(fig)
+        off = corr[~np.eye(n, dtype=bool)]
+        print(f"[trace] wrote {out.name} (layers {lo}-{hi}; head-map corr "
+              f"min {off.min():.2f} / mean {off.mean():.2f})")
 
 
 if __name__ == "__main__":

@@ -102,7 +102,7 @@ from src.introspector.regimes import (
     identity_check, power_warning)
 from src.introspector.training.model import InterventionHook
 from trace_introspection_circuit import (
-    readout_scale, contribution, linfit_slope_r2, capture_live_centres)
+    readout_scale, contribution, linfit_slope_r2, capture_live_centres, effective_weight)
 
 # Source positions are reported relative to t, plus the absolute specials (BOS is
 # Llama's attention sink and takes a large share of every head's mass).
@@ -142,25 +142,6 @@ def parse_args():
 # ======================================================================
 # Effective (LoRA-folded) weights
 # ======================================================================
-def effective_weight(module) -> torch.Tensor:
-    """W0 + B@A*scaling for a peft LoRA linear, W0 otherwise.
-
-    The mover's OV circuit has to be the one the TRAINED model runs. Reading
-    `module.weight` alone silently analyzes the base model's head instead -- which is
-    exactly the difference this script is trying to measure in part 3.
-    """
-    base = getattr(module, "base_layer", module)
-    W = base.weight.detach().float()
-    if hasattr(module, "lora_A") and isinstance(module.lora_A, torch.nn.ModuleDict):
-        for adapter, A in module.lora_A.items():
-            B = module.lora_B[adapter]
-            W = W + (B.weight.detach().float() @ A.weight.detach().float()
-                     ) * module.scaling[adapter]
-    # on CPU: every decomposition below runs on CPU captures, and a weight left on the
-    # accelerator turns each einsum into a device mismatch
-    return W.cpu()
-
-
 # ======================================================================
 # Capture
 # ======================================================================

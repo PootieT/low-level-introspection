@@ -73,7 +73,6 @@ from __future__ import annotations
 
 import json
 import argparse
-from dataclasses import dataclass
 from pathlib import Path
 
 from tqdm import tqdm
@@ -84,20 +83,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.stats import pearsonr
-from torch.utils.data import DataLoader
-from datasets import load_from_disk
 
 from src.introspector.analysis_loading import load_run_for_analysis, run_per_locale
-from src.introspector.dataset_utils import apply_signal_filter
+from src.introspector.head_ablation import (
+    parse_arms, HeadAblator, build_mean_cache, eval_all, successful_train_examples)
 from src.introspector.head_taxonomy import (
     classify_heads, class_members, DEFAULT_ATT_TAU, DEFAULT_STATIC_TAU,
     DEFAULT_FRAC_T_MIN, DEFAULT_T_SHARE_MIN, DEFAULT_TOTAL_SHARE_MIN)
 from src.introspector.run_discovery import (
     add_discovery_args, runs_from_args, resolve_run_action, locale_out_dir)
-
-# token-position buckets the mean is conditioned on
-BUCKETS = ("text", "prompt", "final")
-PAD = -1
 
 # class groups knocked out together. The two unions are the comparisons the prediction
 # is phrased in; the singletons show which sub-class carries it.
@@ -151,240 +145,6 @@ def parse_args():
                    help="Single-run override; a sweep always writes to <run>/head_ablation/.")
     add_discovery_args(p)
     return p.parse_args()
-
-
-# ======================================================================
-# Arms
-# ======================================================================
-@dataclass
-class Arm:
-    name: str
-    scale: float | None      # None = endogenous
-
-    @property
-    def injected(self) -> bool:
-        return self.scale is not None
-
-
-def parse_arms(spec: str) -> list[Arm]:
-    arms = []
-    for tok in (t.strip().lower() for t in spec.split(",")):
-        if not tok:
-            continue
-        if tok in ("endogenous", "endo"):
-            arms.append(Arm("endogenous", None))
-        elif tok.startswith("x"):
-            arms.append(Arm(tok, float(tok[1:])))
-        else:
-            raise SystemExit(f"Unknown arm {tok!r}; use 'endogenous' or 'xN'.")
-    return arms
-
-
-# ======================================================================
-# Head knockout
-# ======================================================================
-def position_buckets(attention_mask: torch.Tensor, region) -> torch.Tensor:
-    """[B, S] bucket index per token: 0 text, 1 prompt, 2 readout, -1 padding.
-
-    `region` is the 0/1 text-vs-prompt mask the collators emit (lora_token_mask when
-    gated, anchor_region_mask when not). The readout is the last position: batches are
-    left-padded, so it is always a real token.
-    """
-    B, S = attention_mask.shape
-    bk = torch.full((B, S), PAD, dtype=torch.long, device=attention_mask.device)
-    real = attention_mask == 1
-    if region is None:
-        bk[real] = 0
-    else:
-        region = region.to(attention_mask.device)
-        bk[real & (region == 0)] = 0
-        bk[real & (region == 1)] = 1
-    bk[:, S - 1] = 2
-    return bk
-
-
-class HeadAblator:
-    """
-    forward_pre hooks on every o_proj that overwrite the selected heads' slices of the
-    concatenated head outputs -- the input o_proj mixes into the residual stream.
-
-    Hooked on o_proj's INPUT so the head's whole write is removed, LoRA delta on
-    o_proj included, and at every position so its indirect effects go with it. With
-    GQA the query heads' outputs are still concatenated per query head, so a slice is
-    exactly one head. Inactive (no heads selected) the hooks return None and cost
-    nothing.
-    """
-
-    def __init__(self, run, n_heads: int, head_dim: int, mode: str = "mean"):
-        self.run, self.n_heads, self.head_dim, self.mode = run, n_heads, head_dim, mode
-        self.active: dict[int, list[int]] = {}
-        self.means: dict[int, torch.Tensor] = {}      # layer -> [3, n_heads*head_dim]
-        self.buckets: torch.Tensor | None = None       # [B, S], set per batch
-        self.handles = []
-        for L, layer in enumerate(run.base.model.layers):
-            self.handles.append(layer.self_attn.o_proj.register_forward_pre_hook(self._hook(L)))
-
-    def set_heads(self, heads):
-        self.active = {}
-        for L, h in heads:
-            self.active.setdefault(int(L), []).append(int(h))
-
-    def _hook(self, layer: int):
-        def pre(_module, args):
-            heads = self.active.get(layer)
-            if not heads or self.buckets is None:
-                return None
-            x = args[0].clone()
-            real = (self.buckets >= 0).unsqueeze(-1)
-            if self.mode == "mean":
-                m = self.means[layer].to(device=x.device, dtype=x.dtype)
-                repl = m[self.buckets.clamp(min=0)]                     # [B, S, D]
-            else:
-                repl = torch.zeros_like(x)
-            for h in heads:
-                sl = slice(h * self.head_dim, (h + 1) * self.head_dim)
-                x[:, :, sl] = torch.where(real, repl[:, :, sl], x[:, :, sl])
-            return (x,) + tuple(args[1:])
-        return pre
-
-    def remove(self):
-        for h in self.handles:
-            h.remove()
-
-
-@torch.no_grad()
-def build_mean_cache(run, dataset, batch_size, n_layers):
-    """Per-layer, per-bucket mean of the o_proj input over `dataset`, endogenously."""
-    sums = {L: None for L in range(n_layers)}
-    counts = {L: torch.zeros(len(BUCKETS)) for L in range(n_layers)}
-    grabbed, handles = {}, []
-
-    def cap(L):
-        def pre(_m, args):
-            grabbed[L] = args[0].detach().float()
-            return None
-        return pre
-
-    for L, layer in enumerate(run.base.model.layers):
-        handles.append(layer.self_attn.o_proj.register_forward_pre_hook(cap(L)))
-    try:
-        for batch in DataLoader(dataset, batch_size=batch_size, collate_fn=run.collator,
-                                shuffle=False):
-            batch = batch.to(run.model.device)
-            region = batch.get("lora_token_mask", batch.get("anchor_region_mask"))
-            bk = position_buckets(batch["attention_mask"], region)
-            run.model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
-                      lora_token_mask=batch.get("lora_token_mask"), do_intervention=False)
-            for L in range(n_layers):
-                x = grabbed[L]                                           # [B, S, D]
-                if sums[L] is None:
-                    sums[L] = torch.zeros(len(BUCKETS), x.shape[-1])
-                for b in range(len(BUCKETS)):
-                    sel = bk == b
-                    if sel.any():
-                        sums[L][b] += x[sel].sum(0).cpu()
-                        counts[L][b] += int(sel.sum())
-    finally:
-        for h in handles:
-            h.remove()
-    return {L: sums[L] / counts[L].clamp(min=1).unsqueeze(-1) for L in range(n_layers)}
-
-
-# ======================================================================
-# Evaluation (mirrors the reported evals)
-# ======================================================================
-@torch.no_grad()
-def eval_arm(run, dataset, arm: Arm, ablator: HeadAblator, batch_size: int) -> float:
-    """corr(prediction, target) for one arm, under whatever heads are currently ablated.
-
-    Same forward as the reported evals: the whole collated batch into the model, the
-    regression head on the last token's final hidden state, and for injected arms the
-    model's OWN intervention path with the sampler re-seeded to config.seed -- so the
-    injected values are identical across every ablation config and to the reported run.
-    """
-    model = run.model
-    model.eval()
-    prev = (model.intervention_distribution, model.intervention_scale)
-    if arm.injected:
-        model.intervention_distribution = "gaussian"
-        model.intervention_scale = arm.scale
-        model.seed_intervention_rng(run.config.seed)
-    head = model.regression_head
-    preds, targets = [], []
-    try:
-        for batch in DataLoader(dataset, batch_size=batch_size, collate_fn=run.collator,
-                                shuffle=False):
-            batch = batch.to(model.device)
-            act = batch.pop("activation")
-            region = batch.get("lora_token_mask", batch.get("anchor_region_mask"))
-            batch.pop("anchor_region_mask", None)   # bookkeeping, not a model input
-            batch.pop("labels", None)               # token labels: an LM loss we do not need
-            ablator.buckets = position_buckets(batch["attention_mask"], region)
-            out = model(**batch, do_intervention=arm.injected, output_hidden_states=True)
-            h = out.hidden_states[-1][:, -1, :]
-            preds.append(head(h.to(device=head.weight.device, dtype=head.weight.dtype))
-                         .squeeze(-1).float().cpu())
-            targets.append(out.intervention_values.float().cpu() if arm.injected
-                           else act.float().cpu())
-    finally:
-        model.intervention_distribution, model.intervention_scale = prev
-        ablator.buckets = None
-    p, t = torch.cat(preds).numpy(), torch.cat(targets).numpy()
-    if np.std(p) < 1e-12 or np.std(t) < 1e-12:
-        return float("nan")
-    return float(pearsonr(p, t)[0])
-
-
-def eval_all(run, dataset, arms, ablator, bs, heads) -> dict:
-    ablator.set_heads(heads)
-    try:
-        return {a.name: eval_arm(run, dataset, a, ablator, bs) for a in arms}
-    finally:
-        ablator.set_heads([])
-
-
-# ======================================================================
-# Mean-cache examples
-# ======================================================================
-def successful_train_examples(run, args):
-    """`--mean-examples` TRAIN rows the model gets right endogenously.
-
-    Train, not test: the mean is a property of the model's normal operation, and taking
-    it from the evaluated rows would let each example's own output leak into the value
-    it is ablated to. Falls back to the lowest-error rows (with a warning) if too few
-    clear the threshold, rather than silently shrinking the cache.
-    """
-    from train_introspector import drop_invalid_positions
-    from trace_introspection_circuit import endogenous_predictions
-    raw = apply_signal_filter(load_from_disk(str(run.config.dataset_cache_dir / "train")),
-                              run.config.signal_filter, "train(mean cache)")
-    if run.is_multi_locale:
-        # the mean a head is ablated TO should come from the distribution being
-        # evaluated -- this signal's rows -- not from a mixture over every signal the
-        # run was trained on
-        raw = raw.filter(lambda ex: int(ex["signal_layer"]) == run.layer
-                         and int(ex["signal_index"]) == run.index)
-    raw = raw.select(range(min(args.mean_scan, len(raw))))
-    ds = raw.map(run.preprocess_fn, remove_columns=raw.column_names)
-    ds = drop_invalid_positions(ds, "train(mean cache)",
-                                run.config.training_config.max_seq_length)
-    bs = args.batch_size or run.config.training_config.eval_batch_size
-    preds, acts = endogenous_predictions(run.model, ds, run.collator, bs)
-    err = (preds - acts).abs().numpy()
-    ok = np.where(err <= args.success_threshold)[0]
-    n_ok = len(ok)
-    if n_ok >= args.mean_examples:
-        idx = ok[:args.mean_examples]
-    else:
-        print(f"[ablate] WARNING: only {n_ok} of {len(err)} scanned train rows are within "
-              f"{args.success_threshold}; using the {args.mean_examples} lowest-error rows "
-              f"instead (raise --mean-scan to keep the threshold)")
-        idx = np.argsort(err)[:args.mean_examples]
-    info = {"n_scanned": int(len(err)), "n_within_threshold": int(n_ok),
-            "n_used": int(len(idx)), "threshold": args.success_threshold,
-            "max_error_used": float(err[idx].max()), "split": "train"}
-    print(f"[ablate] mean cache: {info}")
-    return ds.select(sorted(int(i) for i in idx)), info
 
 
 # ======================================================================
