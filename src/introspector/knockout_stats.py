@@ -171,6 +171,54 @@ def topk_jaccard_null(imp_a: np.ndarray, imp_b: np.ndarray, layers: np.ndarray, 
 
 
 # ======================================================================
+# Mass sets: the heads that carry most of an arm's total drop
+# ======================================================================
+def mass_set(importance: np.ndarray, q: float) -> set:
+    """Smallest set of heads whose POSITIVE drops sum to >= q of the arm's total positive
+    drop, taken in order of drop. Heads whose knockout helps never enter."""
+    pos = np.clip(np.nan_to_num(importance), 0, None)
+    tot = pos.sum()
+    if tot <= 0:
+        return set()
+    order = np.argsort(-pos, kind="stable")
+    n = int(np.searchsorted(np.cumsum(pos[order]) / tot, q - 1e-12) + 1)
+    return set(order[:n].tolist())
+
+
+def overlap_coefficient(a: set, b: set) -> float:
+    """|A & B| / min(|A|, |B|): 1 when the smaller set sits inside the larger."""
+    return len(a & b) / min(len(a), len(b)) if a and b else np.nan
+
+
+def mass_overlap_null(imp_a: np.ndarray, imp_b: np.ndarray, layers: np.ndarray, q: float,
+                      n_perm: int = 1000, seed: int = 0) -> dict:
+    """
+    Overlap coefficient of the two arms' q-mass sets, against a LAYER-MATCHED null (arm
+    B's drops shuffled among heads of the same layer, so depth agreement earns nothing).
+
+    The null matters more here than for top-k: the sets are not size-matched, and when
+    one is large the min-normalized overlap approaches 1 by chance -- at q=0.95 the
+    endogenous set can hold most heads, and the null then sits near 0.7.
+    """
+    A, B = mass_set(imp_a, q), mass_set(imp_b, q)
+    obs = overlap_coefficient(A, B)
+    rng = np.random.default_rng(seed)
+    groups = [np.where(layers == L)[0] for L in np.unique(layers)]
+    null = np.empty(n_perm)
+    for i in range(n_perm):
+        shuf = imp_b.copy()
+        for g in groups:
+            shuf[g] = imp_b[rng.permutation(g)]
+        null[i] = overlap_coefficient(A, mass_set(shuf, q))
+    ok = np.isfinite(null)
+    return {"q": q, "n_a": len(A), "n_b": len(B), "overlap": obs,
+            "null_mean": float(null[ok].mean()) if ok.any() else np.nan,
+            "null_p95": float(np.percentile(null[ok], 95)) if ok.any() else np.nan,
+            "p": (float(((null[ok] >= obs).sum() + 1) / (ok.sum() + 1))
+                  if ok.any() and np.isfinite(obs) else np.nan)}
+
+
+# ======================================================================
 # Cumulative-knockout curves
 # ======================================================================
 def curve_area(drops: np.ndarray) -> float:
@@ -178,9 +226,43 @@ def curve_area(drops: np.ndarray) -> float:
     return float(np.nanmean(drops))
 
 
-def participation_ratio(importance: np.ndarray) -> float:
-    """(sum|s|)^2 / sum s^2 over heads: a threshold-free effective head count."""
-    s = np.abs(np.nan_to_num(importance))
+def transfer_ratios(area: dict, arms: list, random_orders: list) -> dict:
+    """
+    transfer_{b}_to_{a} = area(b's ordering, evaluated on a) / max over the two arms'
+    orderings of their area on a. 1 = b's top heads break a at least as well as a's own
+    ranking does. Normalizing by the BETTER of the two (not by a's own) keeps it in
+    [0, 1]: a's own single-head ranking is not a ceiling -- when a's single drops are tiny
+    and redundant, the other arm's ranking can break a several times faster.
+    `area` is keyed (order_name, arm); random orderings are averaged.
+    """
+    out = {}
+    for a in arms:
+        best = max(area.get((f"by_{b}", a), np.nan) for b in arms)
+        if not np.isfinite(best) or best <= 0:
+            continue
+        for b in arms:
+            if b != a:
+                out[f"transfer_{b}_to_{a}"] = area[(f"by_{b}", a)] / best
+        out[f"transfer_own_to_{a}"] = area[(f"by_{a}", a)] / best
+        if random_orders:
+            out[f"transfer_random_to_{a}"] = float(
+                np.mean([area[(r, a)] for r in random_orders])) / best
+    return out
+
+
+def participation_ratio(importance: np.ndarray, mode: str = "pos") -> float:
+    """(sum s)^2 / sum s^2 over heads: a threshold-free effective head count.
+
+    mode="pos": s = max(drop, 0), the heads whose knockout HURTS -- the same sign
+                convention as every ranking here (top-k sets, cumulative orderings).
+    mode="abs": s = |drop|, also counting heads whose knockout IMPROVES the eval. In the
+                interventional arm those are most heads (removing any head's text-
+                dependent write takes noise out of a prediction whose target ignores the
+                text), so this mode measures how much the eval is touched at all, not how
+                many heads carry it.
+    """
+    x = np.nan_to_num(importance)
+    s = np.clip(x, 0, None) if mode == "pos" else np.abs(x)
     q = (s ** 2).sum()
     return float(s.sum() ** 2 / q) if q > 0 else np.nan
 
@@ -188,3 +270,48 @@ def participation_ratio(importance: np.ndarray) -> float:
 def ranks_desc(importance: np.ndarray) -> np.ndarray:
     """1 = most important."""
     return rankdata(-np.nan_to_num(importance, nan=-np.inf), method="min").astype(int)
+
+
+# ======================================================================
+# Everything that needs only the per-head and curve TABLES
+# ======================================================================
+def agreement_from_tables(ind_df, curves_df, mass_qs=(0.5, 0.8, 0.95), ks=(5, 10, 20),
+                          n_perm: int = 1000, seed: int = 0) -> dict:
+    """
+    The cross-arm metrics computable from head_knockout_individual.csv and
+    head_knockout_curves.csv alone, so the per-run summary and the sweep aggregator
+    compute them identically (and old results can be re-summarized without the GPU).
+
+    Sign convention throughout: importance = -delta, and a head is "important" when its
+    knockout HURTS (positive importance). Top-k sets, mass sets and the cumulative
+    orderings all rank by this signed value; effective head counts are reported both
+    positive-only (the same convention) and on |drop|.
+    """
+    import pandas as pd  # noqa: F401  (tables in, plain dict out)
+    w = ind_df.pivot_table(index=["layer", "head"], columns="arm", values="delta")
+    arms = [a for a in ("endogenous", "x1") if a in w.columns] + \
+           [a for a in w.columns if a not in ("endogenous", "x1")]
+    layers = w.index.get_level_values("layer").to_numpy()
+    imp = {a: -w[a].to_numpy(dtype=float) for a in arms}
+    out = {}
+    for a in arms:
+        out[f"effective_heads_pos_{a}"] = participation_ratio(imp[a], "pos")
+        out[f"effective_heads_abs_{a}"] = participation_ratio(imp[a], "abs")
+        out[f"n_helped_by_knockout_{a}"] = int((imp[a] < 0).sum())
+        for q in mass_qs:
+            out[f"mass{q:g}_size_{a}"] = len(mass_set(imp[a], q))
+    for i, a in enumerate(arms):
+        for b in arms[i + 1:]:
+            out[f"topk_{a}_vs_{b}"] = [
+                topk_jaccard_null(imp[a], imp[b], layers, k, n_perm=n_perm, seed=seed)
+                for k in ks if k < len(layers)]
+            out[f"mass_overlap_{a}_vs_{b}"] = [
+                mass_overlap_null(imp[a], imp[b], layers, q, n_perm=n_perm, seed=seed)
+                for q in mass_qs]
+    if curves_df is not None and len(curves_df):
+        area = {(o, a): curve_area(-g.sort_values("k")["delta"].to_numpy())
+                for (o, a), g in curves_df.groupby(["order_by", "arm"])}
+        out["curve_area"] = {f"{o}|{a}": v for (o, a), v in area.items()}
+        rand = sorted({o for o, _ in area if o.startswith("random")})
+        out.update(transfer_ratios(area, arms, rand))
+    return out

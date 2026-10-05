@@ -64,8 +64,8 @@ from src.introspector.head_ablation import (
     WINDOWS, parse_arms, HeadAblator, build_mean_cache, eval_arm_outputs, safe_corr,
     successful_train_examples)
 from src.introspector.knockout_stats import (
-    knockout_deltas, bootstrap_deltas, bootstrap_summary, split_half, topk_jaccard_null,
-    jaccard, top_k, curve_area, participation_ratio, ranks_desc, rowwise_corr)
+    knockout_deltas, bootstrap_deltas, bootstrap_summary, split_half,
+    jaccard, ranks_desc, rowwise_corr, agreement_from_tables)
 from src.introspector.run_discovery import add_discovery_args, runs_from_args
 from trace_introspection_circuit import endogenous_predictions, select_success_indices
 from analysis.run_catalog import NEURON_RE, POS_RE, KL_RE
@@ -97,6 +97,10 @@ def parse_args():
     p.add_argument("--n-splits", type=int, default=100,
                    help="Random example halvings for split-half reliability.")
     p.add_argument("--topk", type=str, default="5,10,20")
+    p.add_argument("--mass", type=str, default="0.5,0.8,0.95",
+                   help="Mass fractions for the head sets compared across arms: the "
+                        "fewest heads whose positive drops sum to q of the arm's total. "
+                        "The FIRST is the one plotted.")
     p.add_argument("--n-perm", type=int, default=1000,
                    help="Permutations for the layer-matched top-k null.")
     p.add_argument("--batch-size", type=int, default=None,
@@ -112,6 +116,14 @@ def parse_args():
 
 def analysis_name(window: str) -> str:
     return "head_knockout" if window == "t_to_last" else f"head_knockout_{window}"
+
+
+def parse_floats(spec: str) -> list[float]:
+    return [float(x) for x in spec.split(",") if x.strip()]
+
+
+def parse_ints(spec: str) -> list[int]:
+    return [int(x) for x in spec.split(",") if x.strip()]
 
 
 def head_label(L: int, h: int) -> str:
@@ -230,7 +242,6 @@ def knockout_run(run, spec, args, out_dir: Path):
 # Statistics
 # ======================================================================
 def summarize(heads, names, P, p0, tgt, C, orders, args):
-    layers = np.array([L for L, _ in heads])
     rows, imp, sig = [], {}, {}
     for ai, a in enumerate(names):
         base = rowwise_corr(p0[a][None], tgt[a])[0]
@@ -251,17 +262,12 @@ def summarize(heads, names, P, p0, tgt, C, orders, args):
     summary = {"n_heads": len(heads), "n_boot": args.n_boot}
     for a in names:
         summary[f"n_significant_{a}"] = int(sig[a].sum())
-        summary[f"effective_heads_{a}"] = participation_ratio(imp[a])
         summary[f"max_drop_{a}"] = float(np.nanmax(imp[a]))
         summary[f"top_head_{a}"] = head_label(*heads[int(np.nanargmax(imp[a]))])
     summary.update(split_half(P, p0, tgt, n_splits=args.n_splits, seed=args.seed))
     pairs = [(a, b) for i, a in enumerate(names) for b in names[i + 1:]]
-    ks = [int(k) for k in args.topk.split(",") if k.strip()]
     for a, b in pairs:
         summary[f"spearman_{a}_vs_{b}"] = float(spearmanr(imp[a], imp[b])[0])
-        summary[f"topk_{a}_vs_{b}"] = [
-            topk_jaccard_null(imp[a], imp[b], layers, k, n_perm=args.n_perm, seed=args.seed)
-            for k in ks if k < len(heads)]
         sa, sb = set(np.where(sig[a])[0]), set(np.where(sig[b])[0])
         summary[f"significant_jaccard_{a}_vs_{b}"] = jaccard(sa, sb)
         summary[f"significant_overlap_{a}_vs_{b}"] = len(sa & sb)
@@ -278,20 +284,9 @@ def summarize(heads, names, P, p0, tgt, C, orders, args):
                              "corr": corr[k], "baseline": base, "delta": corr[k] - base,
                              "frac_drop": -(corr[k] - base) / base})
     curves_df = pd.DataFrame(crow)
-    area = {}
-    for (oname, a), g in curves_df.groupby(["order_by", "arm"]):
-        area[(oname, a)] = curve_area(-g.sort_values("k")["delta"].to_numpy())
-    summary["curve_area"] = {f"{o}|{a}": v for (o, a), v in area.items()}
-    rand = [o for o in orders if o.startswith("random")]
-    for a in names:
-        own = area.get((f"by_{a}", a), np.nan)
-        for b in names:
-            if b != a:
-                # how much of arm a's own-ranking damage arm b's ranking reproduces
-                summary[f"transfer_{b}_to_{a}"] = area[(f"by_{b}", a)] / own if own > 0 else np.nan
-        if rand:
-            summary[f"transfer_random_to_{a}"] = (
-                float(np.mean([area[(r, a)] for r in rand])) / own if own > 0 else np.nan)
+    summary.update(agreement_from_tables(
+        ind_df, curves_df, mass_qs=parse_floats(args.mass), ks=parse_ints(args.topk),
+        n_perm=args.n_perm, seed=args.seed))
     return ind_df, summary, curves_df
 
 
@@ -299,18 +294,23 @@ def _report(s, names):
     for a in names:
         print(f"[knockout] {a}: {s[f'n_significant_{a}']} significant heads, top "
               f"{s[f'top_head_{a}']} (drop {s[f'max_drop_{a}']:+.4f}), effective heads "
-              f"{s[f'effective_heads_{a}']:.1f}, split-half reliability "
+              f"{s[f'effective_heads_pos_{a}']:.1f} (positive drops) / "
+              f"{s[f'effective_heads_abs_{a}']:.1f} (|drop|), knockout helps "
+              f"{s[f'n_helped_by_knockout_{a}']} of {s['n_heads']}, split-half reliability "
               f"{s[f'reliability_{a}']:.2f}")
     for i, a in enumerate(names):
         for b in names[i + 1:]:
+            mo = ", ".join(f"q={m['q']:g}: {m['n_a']}/{m['n_b']} heads, overlap "
+                           f"{m['overlap']:.2f} (null {m['null_mean']:.2f}, p={m['p']:.3f})"
+                           for m in s[f"mass_overlap_{a}_vs_{b}"])
             tk = ", ".join(f"J@{t['k']}={t['jaccard']:.2f} (null {t['null_mean']:.2f}, "
                            f"p={t['p']:.3f})" for t in s[f"topk_{a}_vs_{b}"])
-            print(f"[knockout] {a} vs {b}: spearman {s[f'spearman_{a}_vs_{b}']:.2f}, "
-                  f"disattenuated {s[f'disattenuated_{a}_vs_{b}']:.2f}; {tk}")
-            print(f"[knockout] transfer: {b}-ranked heads reproduce "
-                  f"{s.get(f'transfer_{b}_to_{a}', np.nan):.2f} of {a}'s own-ranking damage, "
-                  f"{a}-ranked reproduce {s.get(f'transfer_{a}_to_{b}', np.nan):.2f} of "
-                  f"{b}'s (random: {s.get(f'transfer_random_to_{a}', np.nan):.2f} / "
+            print(f"[knockout] {a} vs {b} mass sets: {mo}")
+            print(f"[knockout] {a} vs {b} top-k: {tk}")
+            print(f"[knockout] transfer (vs the better ranking): {b}-ranked on {a} "
+                  f"{s.get(f'transfer_{b}_to_{a}', np.nan):.2f}, {a}-ranked on {b} "
+                  f"{s.get(f'transfer_{a}_to_{b}', np.nan):.2f} (random "
+                  f"{s.get(f'transfer_random_to_{a}', np.nan):.2f} / "
                   f"{s.get(f'transfer_random_to_{b}', np.nan):.2f})")
 
 
@@ -390,7 +390,7 @@ def _plot_agreement(title, ind_df, s, pair, out_dir):
     x, y = -w[("delta", a)].astype(float), -w[("delta", b)].astype(float)
     sig_any = w[("significant", a)].astype(bool) | w[("significant", b)].astype(bool)
     layers = w.index.get_level_values("layer")
-    fig, ax = plt.subplots(figsize=(4.6, 4.2))
+    fig, ax = plt.subplots(figsize=(4.6, 5.0))
     sc = ax.scatter(x, y, c=layers, cmap="viridis", s=np.where(sig_any, 22, 8),
                     edgecolors=np.where(sig_any, "k", "none"), linewidths=0.5)
     fig.colorbar(sc, ax=ax, label="Layer")
@@ -407,14 +407,19 @@ def _plot_agreement(title, ind_df, s, pair, out_dir):
            f"Reliability: {arm_label(a)} {s[f'reliability_{a}']:.2f}, "
            f"{arm_label(b)} {s[f'reliability_{b}']:.2f}")
     if t10:
-        txt += f"\nTop-10 Jaccard {t10['jaccard']:.2f} (Layer-Matched Null {t10['null_mean']:.2f})"
-    ax.text(0.02, 0.98, txt, transform=ax.transAxes, va="top", fontsize=7,
-            bbox=dict(fc="white", ec="0.8", alpha=0.9))
+        txt += f"\nTop-10 Jaccard {t10['jaccard']:.2f} (Random Layer-Matched Heads {t10['null_mean']:.2f})"
+    mo = (s.get(f"mass_overlap_{a}_vs_{b}") or [None])[0]
+    if mo:
+        txt += (f"\n{100 * mo['q']:g}%-Mass Sets ({mo['n_a']} / {mo['n_b']} Heads): Overlap "
+                f"{mo['overlap']:.2f} (Random Layer-Matched Heads {mo['null_mean']:.2f})")
+    # below the axes: inside, it covers whichever corner the top heads land in
+    ax.text(0.0, -0.2, txt, transform=ax.transAxes, va="top", ha="left", fontsize=7,
+            bbox=dict(fc="white", ec="0.8"))
     ax.set_xlabel(f"Correlation Drop ({arm_label(a)})")
     ax.set_ylabel(f"Correlation Drop ({arm_label(b)})")
     ax.set_title(title, fontsize=8)
     fig.tight_layout()
-    fig.savefig(out_dir / "head_knockout_agreement.png", dpi=150)
+    fig.savefig(out_dir / "head_knockout_agreement.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -449,11 +454,22 @@ def _plot_curves(title, curves_df, names, out_dir):
 
 
 def replot_knockout(spec, out_dir: Path, args) -> bool:
+    """Redraw from cache, first refreshing the table-derived summary metrics (mass-set
+    overlap, effective heads, transfer) so results computed under older definitions
+    pick up the current ones without re-running the knockouts."""
     i, c, s = (out_dir / "head_knockout_individual.csv", out_dir / "head_knockout_curves.csv",
                out_dir / "head_knockout_summary.json")
     if not (i.exists() and c.exists() and s.exists()):
         return False
-    plot_all(spec.name, pd.read_csv(i), pd.read_csv(c), json.loads(s.read_text()), out_dir)
+    ind_df, curves_df, summary = pd.read_csv(i), pd.read_csv(c), json.loads(s.read_text())
+    for stale in [k for k in summary if k.startswith("effective_heads_") and
+                  not k.startswith(("effective_heads_pos_", "effective_heads_abs_"))]:
+        summary.pop(stale)
+    summary.update(agreement_from_tables(
+        ind_df, curves_df, mass_qs=parse_floats(args.mass), ks=parse_ints(args.topk),
+        n_perm=args.n_perm, seed=args.seed))
+    s.write_text(json.dumps(summary, indent=2))
+    plot_all(spec.name, ind_df, curves_df, summary, out_dir)
     return True
 
 
