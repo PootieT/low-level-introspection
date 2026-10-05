@@ -76,6 +76,7 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
+from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import torch
@@ -86,13 +87,13 @@ from scipy.stats import pearsonr
 from torch.utils.data import DataLoader
 from datasets import load_from_disk
 
-from src.introspector.analysis_loading import load_run_for_analysis
+from src.introspector.analysis_loading import load_run_for_analysis, run_per_locale
 from src.introspector.dataset_utils import apply_signal_filter
 from src.introspector.head_taxonomy import (
     classify_heads, class_members, DEFAULT_ATT_TAU, DEFAULT_STATIC_TAU,
     DEFAULT_FRAC_T_MIN, DEFAULT_T_SHARE_MIN, DEFAULT_TOTAL_SHARE_MIN)
 from src.introspector.run_discovery import (
-    add_discovery_args, runs_from_args, resolve_run_action)
+    add_discovery_args, runs_from_args, resolve_run_action, locale_out_dir)
 
 # token-position buckets the mean is conditioned on
 BUCKETS = ("text", "prompt", "final")
@@ -357,6 +358,12 @@ def successful_train_examples(run, args):
     from trace_introspection_circuit import endogenous_predictions
     raw = apply_signal_filter(load_from_disk(str(run.config.dataset_cache_dir / "train")),
                               run.config.signal_filter, "train(mean cache)")
+    if run.is_multi_locale:
+        # the mean a head is ablated TO should come from the distribution being
+        # evaluated -- this signal's rows -- not from a mixture over every signal the
+        # run was trained on
+        raw = raw.filter(lambda ex: int(ex["signal_layer"]) == run.layer
+                         and int(ex["signal_index"]) == run.index)
     raw = raw.select(range(min(args.mean_scan, len(raw))))
     ds = raw.map(run.preprocess_fn, remove_columns=raw.column_names)
     ds = drop_invalid_positions(ds, "train(mean cache)",
@@ -383,15 +390,37 @@ def successful_train_examples(run, args):
 # ======================================================================
 # Main measurement
 # ======================================================================
-def reported_metrics(run_dir: Path) -> dict:
-    """The run's own reported numbers, for the baseline check."""
+def reported_metrics(run_dir: Path, locale=None) -> dict:
+    """The run's own reported numbers, for the baseline check.
+
+    For a multi-locale run the metrics JSONs are POOLED over every trained signal, which
+    no single-locale view can reproduce (and pooling inflates corr with between-signal
+    variance anyway). The saved PREDICTION CSVs carry signal_layer/signal_index, so the
+    per-signal number is recomputed from them instead.
+    """
     out = {}
-    e = run_dir / "endogenous_test_metrics_endogenous.json"
-    i = run_dir / "interventional_test_metrics_gaussian.json"
-    if e.exists():
-        out["endogenous"] = json.loads(e.read_text()).get("corr")
-    if i.exists():
-        out["x1"] = json.loads(i.read_text()).get("test", {}).get("corr")
+    if locale is None:
+        e = run_dir / "endogenous_test_metrics_endogenous.json"
+        i = run_dir / "interventional_test_metrics_gaussian.json"
+        if e.exists():
+            out["endogenous"] = json.loads(e.read_text()).get("corr")
+        if i.exists():
+            out["x1"] = json.loads(i.read_text()).get("test", {}).get("corr")
+        return out
+    _, L, idx = locale
+    for key, fname, target in (("endogenous", "endogenous_test_predictions_endogenous.csv",
+                                "activation"),
+                               ("x1", "interventional_test_predictions_gaussian.csv",
+                                "injected")):
+        f = run_dir / fname
+        if not f.exists():
+            continue
+        df = pd.read_csv(f)
+        if not {"signal_layer", "signal_index", target}.issubset(df.columns):
+            continue
+        d = df[(df["signal_layer"] == L) & (df["signal_index"] == idx)]
+        if len(d) > 2 and d["predictions"].std() > 0 and d[target].std() > 0:
+            out[key] = float(pearsonr(d["predictions"], d[target])[0])
     return out
 
 
@@ -403,7 +432,10 @@ def ablate_run(run, spec, args, out_dir: Path):
     arms = parse_arms(args.arms)
 
     # ---- classes, from the mover trace ----
-    mover_dir = Path(args.mover_dir) if args.mover_dir else spec.run_dir / "mover_trace"
+    # a multi-locale run's mover trace is per signal, in mover_trace/<signal>/
+    mover_dir = (Path(args.mover_dir) if args.mover_dir else
+                 locale_out_dir(spec.run_dir / "mover_trace", spec,
+                                (run.signal_type, run.layer, run.index)))
     heads_csv = mover_dir / "mover_heads.csv"
     if not heads_csv.exists():
         raise SystemExit(f"{heads_csv} not found -- run trace_mover_head.py on this run "
@@ -430,7 +462,8 @@ def ablate_run(run, spec, args, out_dir: Path):
         # ---- baseline, and the check that it IS the reported run ----
         base = eval_all(run, dataset, arms, ablator, bs, [])
         print(f"[ablate] baseline: " + ", ".join(f"{k}={v:.4f}" for k, v in base.items()))
-        reported = reported_metrics(spec.run_dir)
+        this_locale = (run.signal_type, run.layer, run.index) if run.is_multi_locale else None
+        reported = reported_metrics(spec.run_dir, this_locale)
         full_split = args.n_eval is None
         for k, v in reported.items():
             if k in base and v is not None:
@@ -439,6 +472,13 @@ def ablate_run(run, spec, args, out_dir: Path):
                 # reported as "OK" just because it happens to land close
                 if not full_split:
                     flag = "(subset; not comparable)"
+                elif this_locale is not None and k != "endogenous":
+                    # the reported run drew its injected values sequentially over ALL
+                    # signals' rows; re-seeding over this signal's rows alone draws a
+                    # different (equally distributed) sequence, so agreement is only
+                    # statistical here. Endogenous involves no draws and must match.
+                    flag = ("(per-signal re-draw; statistically comparable only)"
+                            if gap < 0.05 else "LARGE GAP -- check before interpreting")
                 elif gap < 0.01:
                     flag = "OK"
                 else:
@@ -449,7 +489,7 @@ def ablate_run(run, spec, args, out_dir: Path):
 
         # ---- class groups + a size-matched random control ----
         group_rows = []
-        for gname, members in GROUPS.items():
+        for gname, members in tqdm(GROUPS.items()):
             heads = class_members(classes, members)
             if not heads:
                 continue
@@ -466,7 +506,7 @@ def ablate_run(run, spec, args, out_dir: Path):
         inert = class_members(classes, "inert")
         sizes = sorted({len(class_members(classes, m)) for m in GROUPS.values()} - {0, 1})
         rng = np.random.RandomState(args.seed + 1000 * run.layer + run.index)
-        for k_ctrl in sizes:
+        for k_ctrl in tqdm(sizes):
             if len(inert) < k_ctrl:
                 continue
             pick = [inert[j] for j in rng.choice(len(inert), size=k_ctrl, replace=False)]
@@ -488,7 +528,7 @@ def ablate_run(run, spec, args, out_dir: Path):
         cand = classes[classes["head_class"] != "inert"].sort_values("best_rank")
         cand = cand.head(args.max_individual)
         ind_rows = []
-        for n, r in enumerate(cand.itertuples(), 1):
+        for n, r in tqdm(enumerate(cand.itertuples(), 1)):
             res = eval_all(run, dataset, arms, ablator, bs, [(r.layer, r.head)])
             for a in arms:
                 ind_rows.append({"layer": int(r.layer), "head": int(r.head),
@@ -528,7 +568,9 @@ def ablate_run(run, spec, args, out_dir: Path):
         json.dump({"run": run.config.experiment_name, "checkpoint": str(run.checkpoint),
                    "signal": f"N{run.layer}.{run.index}", "ablation": args.ablation,
                    "arms": [a.name for a in arms], "baseline": base,
-                   "reported": reported_metrics(spec.run_dir),
+                   "reported": reported_metrics(
+                       spec.run_dir,
+                       (run.signal_type, run.layer, run.index) if run.is_multi_locale else None),
                    "n_eval": len(dataset), "full_split": args.n_eval is None,
                    "mean_cache": mean_info, "mover_dir": str(mover_dir),
                    "class_counts": classes["head_class"].value_counts().to_dict()},
@@ -595,27 +637,9 @@ def main():
     runs = runs_from_args(args)
     if not runs:
         raise SystemExit("No runs with checkpoints matched.")
-    sweeping = len(runs) > 1 or args.group is not None
-    for k, spec in enumerate(runs, 1):
-        out_dir = ((args.output_dir or (spec.run_dir / "head_ablation")) if not sweeping
-                   else spec.run_dir / "head_ablation")
-        action = resolve_run_action(args, out_dir / "head_ablation_meta.json")
-        if action == "skip":
-            print(f"[ablate] [{k}/{len(runs)}] {spec.name}: results exist, skipping")
-            continue
-        if action == "replot":
-            if replot_ablation(spec, out_dir, args):
-                print(f"[ablate] [{k}/{len(runs)}] {spec.name}: re-plotted from cache")
-                continue
-        out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"\n[ablate] ===== [{k}/{len(runs)}] {spec.name} ({spec.cell}) =====")
-        run = load_run_for_analysis(spec.config, checkpoint=args.checkpoint or spec.checkpoint())
-        try:
-            ablate_run(run, spec, args, out_dir)
-        finally:
-            del run
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+    run_per_locale(args, runs, "head_ablation", "head_ablation_meta.json",
+                   analyze=lambda run, spec, out_dir: ablate_run(run, spec, args, out_dir),
+                   replot=replot_ablation, log="[ablate]")
 
 
 if __name__ == "__main__":

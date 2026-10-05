@@ -67,7 +67,7 @@ import seaborn as sns
 
 from src.introspector.config import ExperimentConfig
 from src.introspector.analysis_loading import (
-    load_run_for_analysis, absolute_positions, layer_output_is_tuple)
+    load_run_for_analysis, absolute_positions, layer_output_is_tuple, run_per_locale)
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
 from src.introspector.run_discovery import (
     add_discovery_args, runs_from_args, resolve_run_action)
@@ -189,6 +189,13 @@ def load_model_and_data(config: ExperimentConfig, checkpoint: Path):
     has its adapter disabled over the input text -- i.e. at the origin token).
     """
     run = load_run_for_analysis(config, checkpoint=checkpoint)
+    if run.is_multi_locale:
+        # this tuple has no way to say which signal it is about, and its dataset holds
+        # every signal's rows -- use load_run_for_analysis(...).for_locale(...) instead
+        raise ValueError(
+            f"{run.config.experiment_name} was trained on {len(run.locales)} signals; "
+            f"load_model_and_data returns one mixed test split. Use "
+            f"load_run_for_analysis(...).for_locale(locale) per signal.")
     return (run.model, run.tokenizer, run.dataset, run.raw, run.collator, run.signal_ranges)
 
 
@@ -735,37 +742,14 @@ def main():
     args = parse_args()
     if args.seed is not None:
         torch.manual_seed(args.seed)
-
     runs = runs_from_args(args)
     if not runs:
         raise SystemExit("No runs with checkpoints matched.")
-    sweeping = len(runs) > 1 or args.group is not None
-    for k, spec in enumerate(runs, 1):
-        # a sweep writes into each run's own directory, so results stay next to the run
-        # they describe and the aggregator can find them by globbing run dirs
-        out_dir = ((args.output_dir or (spec.run_dir / "circuit_trace")) if not sweeping
-                   else spec.run_dir / "circuit_trace")
-        action = resolve_run_action(args, out_dir / "decodability.csv")
-        if action == "skip":
-            print(f"[trace] [{k}/{len(runs)}] {spec.name}: results exist, skipping")
-            continue
-        if action == "replot":
-            if replot_circuit(spec, out_dir, args):
-                print(f"[trace] [{k}/{len(runs)}] {spec.name}: re-plotted from cache")
-                continue
-            print(f"[trace] [{k}/{len(runs)}] {spec.name}: cache incomplete, recomputing")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"\n[trace] ===== [{k}/{len(runs)}] {spec.name} ({spec.cell}) =====")
-        run = load_run_for_analysis(spec.config, checkpoint=args.checkpoint or spec.checkpoint())
-        try:
-            trace_one_run(run, args, out_dir)
-        finally:
-            # a sweep loads one model per run; without this the previous run's weights
-            # stay resident and the second checkpoint OOMs on a single GPU
-            del run
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
+    # per run, per trained signal: a multi-locale run is traced once per signal into
+    # <run>/circuit_trace/<signal>/, sharing one model load (see run_per_locale)
+    run_per_locale(args, runs, "circuit_trace", "decodability.csv",
+                   analyze=lambda run, spec, out_dir: trace_one_run(run, args, out_dir),
+                   replot=replot_circuit, log="[trace]")
 
 def _plot_attribution(attr_df, n_layers, start_layer, inject_layer, out_dir, tag=""):
     order = ["embed"] + [f"attn_{L}" for L in range(n_layers)] + [f"mlp_{L}" for L in range(n_layers)]

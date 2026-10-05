@@ -420,10 +420,19 @@ def plot_profiles(df, out_dir, x="rel_depth", value="frob_norm"):
 
 
 def conditions_from_runs(runs) -> list[dict]:
-    """RunSpecs -> the condition dicts this script has always taken."""
-    return [dict(label=r.name, group=r.group, run=r.name, layer=r.layer,
-                 neuron=r.index, pos=r.position, ckpt=r.checkpoint(required=False))
-            for r in runs]
+    """RunSpecs -> the condition dicts this script has always taken.
+
+    One condition per TRAINED SIGNAL: a multi-locale run (neuron / layer generalization
+    sweeps) edited one down_proj column per signal, and each is its own targeted-column
+    test. Reading only the first would report one of N edits as the run's.
+    """
+    out = []
+    for r in runs:
+        for stype, layer, index in (r.locales or [(r.signal_type, r.layer, r.index)]):
+            label = r.name if not r.is_multi_locale else f"{r.name} [N{layer}.{index}]"
+            out.append(dict(label=label, group=r.group, run=r.name, layer=layer,
+                            neuron=index, pos=r.position, ckpt=r.checkpoint(required=False)))
+    return out
 
 
 def plot_profiles_from_df(df, out_dir, group_profiles=None):
@@ -545,10 +554,10 @@ if __name__ == "__main__":
                    help="Skip the targeted-column test (which needs base weights).")
     p.add_argument("--no-per-checkpoint", action="store_true",
                    help="Skip the per-checkpoint heatmap/lineplot from plot_lora_weight_pattern.")
-    p.add_argument("--from-cache", action="store_true",
-                   help="Re-draw every figure from a previous run's cached CSVs in --out-dir "
-                        "(or the group's default plot dir) -- no checkpoints or base model "
-                        "loaded. For iterating on plot styling.")
+    # p.add_argument("--from-cache", action="store_true",
+    #                help="Re-draw every figure from a previous run's cached CSVs in --out-dir "
+    #                     "(or the group's default plot dir) -- no checkpoints or base model "
+    #                     "loaded. For iterating on plot styling.")
     p.add_argument("--n-random", type=int, default=DEFAULT_N_RANDOM,
                    help="Untrained indices of the signal layer measured alongside the target "
                         "as the baseline distribution (0 disables).")

@@ -88,7 +88,8 @@ import matplotlib.pyplot as plt
 from scipy.stats import pearsonr
 from torch.utils.data import DataLoader
 
-from src.introspector.analysis_loading import load_run_for_analysis, absolute_positions
+from src.introspector.analysis_loading import (
+    load_run_for_analysis, absolute_positions, run_per_locale)
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
 from src.introspector.run_discovery import add_discovery_args, runs_from_args, resolve_run_action
 from src.introspector.training.model import InterventionHook
@@ -578,28 +579,9 @@ def main():
     runs = runs_from_args(args)
     if not runs:
         raise SystemExit("No runs with checkpoints matched.")
-    sweeping = len(runs) > 1 or args.group is not None
-    for k, spec in enumerate(runs, 1):
-        out_dir = ((args.output_dir or (spec.run_dir / "injection_specificity")) if not sweeping
-                   else spec.run_dir / "injection_specificity")
-        action = resolve_run_action(args, out_dir / "injection_specificity.csv")
-        if action == "skip":
-            print(f"[spec] [{k}/{len(runs)}] {spec.name}: results exist, skipping")
-            continue
-        if action == "replot":
-            if replot_specificity(spec, out_dir, args):
-                print(f"[spec] [{k}/{len(runs)}] {spec.name}: re-plotted from cache")
-                continue
-            print(f"[spec] [{k}/{len(runs)}] {spec.name}: cache incomplete, recomputing")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"\n[spec] ===== [{k}/{len(runs)}] {spec.name} ({spec.cell}) =====")
-        run = load_run_for_analysis(spec.config, checkpoint=args.checkpoint or spec.checkpoint())
-        try:
-            score_run(run, args, out_dir)
-        finally:
-            del run
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+    run_per_locale(args, runs, "injection_specificity", "injection_specificity.csv",
+                   analyze=lambda run, spec, out_dir: score_run(run, args, out_dir),
+                   replot=replot_specificity, log="[spec]")
 
 
 if __name__ == "__main__":

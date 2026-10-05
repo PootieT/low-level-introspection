@@ -32,7 +32,9 @@ included -- an fp32 forward is a different model, and a separate experiment.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import random
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -42,7 +44,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import ExperimentConfig
 from .dataset_utils import apply_signal_filter
-from .run_discovery import find_checkpoint, resolve_locale
+from .run_discovery import find_checkpoint, resolve_locales, locale_tag, plan_locales
 from .training.collator import LoRAGatingCollator
 from .training.model import (
     IntrospectionRegressionModel,
@@ -68,6 +70,36 @@ class LoadedRun:
     layer: int
     index: int
     preprocess_fn: Callable
+    # every signal the run was trained on; `layer`/`index` above are the one this
+    # object is currently VIEWING (see for_locale)
+    locales: list = field(default_factory=list)
+
+    @property
+    def is_multi_locale(self) -> bool:
+        return len(self.locales) > 1
+
+    @property
+    def tag(self) -> str:
+        return locale_tag(self.signal_type, self.layer, self.index)
+
+    def for_locale(self, locale) -> "LoadedRun":
+        """A view of this run restricted to ONE trained signal, sharing the model.
+
+        A multi-locale run is analyzed as one pass per trained signal. Loading the model
+        once per signal would cost a full load each time (a hundred of them for the
+        largest neuron-sweep run), so the view shares the model, tokenizer and collator
+        and only narrows the test split to that signal's rows and re-points
+        `layer`/`index` -- which is all the single-locale analyses read.
+        """
+        stype, L, i = locale
+        keep = lambda ex: int(ex["signal_layer"]) == L and int(ex["signal_index"]) == i
+        ds = self.dataset.filter(keep)
+        raw = self.raw.filter(keep)
+        if len(ds) == 0:
+            raise ValueError(f"{self.config.experiment_name}: no test rows for "
+                             f"{locale_tag(stype, L, i)} -- the test split was built with "
+                             f"a different signal set than the run trained on")
+        return replace(self, dataset=ds, raw=raw, signal_type=stype, layer=L, index=i)
 
     @property
     def base(self):
@@ -78,6 +110,15 @@ class LoadedRun:
     def stats(self) -> dict:
         """Empirical activation stats of THIS run's neuron (min/max/mean/std)."""
         return self.signal_ranges[(self.layer, self.index)]
+
+
+def _row_seed(ex) -> int:
+    """Stable per-row seed from the row's identity. hashlib, not hash(): Python's
+    str hash is salted per process, which would reintroduce exactly the
+    run-to-run nondeterminism this exists to remove."""
+    key = (f"{ex['text']}|{ex['signal_type']}|{ex['signal_layer']}|"
+           f"{ex['signal_index']}|{ex['token_position']}")
+    return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:16], 16)
 
 
 def compute_signal_ranges(raw) -> dict:
@@ -165,7 +206,10 @@ def load_run_for_analysis(
                          f"regression head (config.use_regressor must be True).")
     run_dir = Path(config.output_dir) / config.experiment_name
     checkpoint = Path(checkpoint) if checkpoint else find_checkpoint(run_dir)
-    signal_type, layer, index = resolve_locale(config)
+    locales = resolve_locales(config)
+    # the first signal is only the INITIAL view; multi-locale callers iterate
+    # for_locale over `locales` rather than treating this as "the" locale
+    signal_type, layer, index = locales[0]
 
     # ---- tokenizer (the separator is part of the trained vocabulary) ----
     tokenizer = AutoTokenizer.from_pretrained(config.model_name, local_files_only=local_files_only)
@@ -185,12 +229,25 @@ def load_run_for_analysis(
         raw = raw.select(range(max_examples))
 
     def preprocess(ex):
-        out = preprocess_example(
-            ex, tokenizer=tokenizer,
-            prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
-            max_length=config.training_config.max_seq_length,
-            return_frozen_input_len=True, return_position_valid=True,
-            for_prediction=True)
+        # The prompt template is picked by prompts.py with the GLOBAL, unseeded
+        # random.choice, so which template a row gets depended on how many rows were
+        # mapped before it -- and on the process's entropy-seeded RNG. Two invocations
+        # of the same analysis on the same run gave different prompts, and a multi-
+        # locale run (15k interleaved rows) prompted a given example differently from
+        # the single-locale run (3k filtered rows): 1 of 10 rows matched. Seeding the
+        # draw from the row's own identity makes each row's prompt a fixed property of
+        # the row. The global RNG is restored afterwards, so nothing else sees a change.
+        state = random.getstate()
+        random.seed(_row_seed(ex))
+        try:
+            out = preprocess_example(
+                ex, tokenizer=tokenizer,
+                prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
+                max_length=config.training_config.max_seq_length,
+                return_frozen_input_len=True, return_position_valid=True,
+                for_prediction=True)
+        finally:
+            random.setstate(state)
         out["token_position"] = ex["token_position"]
         out["signal_layer"] = ex["signal_layer"]
         out["signal_index"] = ex["signal_index"]
@@ -231,4 +288,53 @@ def load_run_for_analysis(
 
     return LoadedRun(config=config, checkpoint=checkpoint, model=model, tokenizer=tokenizer,
                      collator=collator, dataset=dataset, raw=raw, signal_ranges=signal_ranges,
-                     signal_type=signal_type, layer=layer, index=index, preprocess_fn=preprocess)
+                     signal_type=signal_type, layer=layer, index=index, preprocess_fn=preprocess,
+                     locales=locales)
+
+
+def run_per_locale(args, runs, analysis_name: str, sentinel: str, analyze,
+                   replot=None, log: str = "[run]"):
+    """
+    The loop every circuit analysis runs: for each run, for each of its trained
+    signals, compute into <run>/<analysis_name>/[<signal>/].
+
+    A single-locale run behaves exactly as before (results directly in
+    <run>/<analysis_name>/). A multi-locale run -- one readout trained on several
+    signals, as in the neuron and layer generalization sweeps -- is analyzed once per
+    trained signal, each into its own subdirectory, with the model LOADED ONCE and
+    shared across them (LoadedRun.for_locale).
+
+    Why every analysis goes through here rather than keeping its own loop: before this
+    existed, multi-locale runs failed to load at all. Once loading succeeds, a script
+    that still used the run's FIRST signal would inject there while evaluating rows that
+    name every other signal -- a silently wrong result rather than an error. One loop
+    means no script can be left half-converted.
+
+    `analyze(run_view, spec_view, out_dir)` does the actual work for one locale.
+    """
+    import torch
+    sweeping = len(runs) > 1 or getattr(args, "group", None) is not None
+    for k, spec in enumerate(runs, 1):
+        base = ((getattr(args, "output_dir", None) or spec.run_dir / analysis_name)
+                if not sweeping else spec.run_dir / analysis_name)
+        todo = plan_locales(spec, base, sentinel, args, replot, log)
+        if not todo:
+            continue
+        extra = (f" -- {len(todo)} of {len(spec.locales)} trained signals"
+                 if spec.is_multi_locale else "")
+        print(f"\n{log} ===== [{k}/{len(runs)}] {spec.name} ({spec.cell}){extra} =====")
+        run = load_run_for_analysis(spec.config,
+                                    checkpoint=getattr(args, "checkpoint", None) or spec.checkpoint())
+        try:
+            for loc, out_dir in todo:
+                view = run.for_locale(loc) if spec.is_multi_locale else run
+                out_dir.mkdir(parents=True, exist_ok=True)
+                if spec.is_multi_locale:
+                    print(f"\n{log} --- signal {view.tag}: {len(view.dataset)} test rows ---")
+                analyze(view, spec.for_locale(loc), out_dir)
+        finally:
+            # a sweep loads one model per run; without this the previous run's weights
+            # stay resident and the next checkpoint OOMs on a single GPU
+            del run
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()

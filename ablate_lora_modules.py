@@ -41,6 +41,7 @@ import json
 import argparse
 from pathlib import Path
 
+from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import torch
@@ -51,7 +52,7 @@ import seaborn as sns
 from torch.utils.data import DataLoader
 
 from src.introspector.config import ExperimentConfig
-from src.introspector.analysis_loading import load_run_for_analysis
+from src.introspector.analysis_loading import load_run_for_analysis, run_per_locale
 from src.introspector.run_discovery import add_discovery_args, runs_from_args, resolve_run_action
 from trace_introspection_circuit import endogenous_predictions, select_success_indices
 
@@ -187,30 +188,9 @@ def main():
     runs = runs_from_args(args)
     if not runs:
         raise SystemExit("No runs with checkpoints matched.")
-    sweeping = len(runs) > 1 or args.group is not None
-    for k, spec in enumerate(runs, 1):
-        out_dir = ((args.output_dir or (spec.run_dir / "lora_ablation")) if not sweeping
-                   else spec.run_dir / "lora_ablation")
-        action = resolve_run_action(args, out_dir / "lora_ablation.csv")
-        if action == "skip":
-            print(f"[ablate] [{k}/{len(runs)}] {spec.name}: results exist, skipping")
-            continue
-        if action == "replot":
-            if replot_ablation(spec, out_dir, args):
-                print(f"[ablate] [{k}/{len(runs)}] {spec.name}: re-plotted from cache")
-                continue
-            print(f"[ablate] [{k}/{len(runs)}] {spec.name}: cache incomplete, recomputing")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"\n[ablate] ===== [{k}/{len(runs)}] {spec.name} ({spec.cell}) =====")
-        run = load_run_for_analysis(spec.config,
-                                    checkpoint=args.checkpoint or spec.checkpoint())
-        try:
-            ablate_one_run(run, args, out_dir)
-        finally:
-            del run
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
+    run_per_locale(args, runs, "lora_ablation", "lora_ablation.csv",
+                   analyze=lambda run, spec, out_dir: ablate_one_run(run, args, out_dir),
+                   replot=replot_ablation, log="[ablate]")
 
 def ablate_one_run(run, args, out_dir: Path):
     config, checkpoint = run.config, run.checkpoint

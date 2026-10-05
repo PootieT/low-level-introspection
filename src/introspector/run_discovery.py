@@ -39,12 +39,12 @@ from __future__ import annotations
 import os
 import glob
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional
 
 from .config import ExperimentConfig
-from .dataset_utils import parse_signal_filter
+from .dataset_utils import parse_signal_filter, parse_signal_filters
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_ROOT = REPO_ROOT / "experiment_configs"
@@ -67,6 +67,23 @@ class RunSpec:
     position: Optional[int]         # fixed token selector; None for a random range
     position_range: Optional[tuple[int, int]] = None
     extra: dict[str, Any] = field(default_factory=dict)
+    # EVERY signal the run was trained on, as (type, layer, index). A single-locale run
+    # has one, and `layer`/`index` above are it. A multi-locale run (the neuron and layer
+    # generalization sweeps train one readout on several signals) has several, and
+    # `layer`/`index` are only its FIRST -- analyses iterate `locales` instead, one pass
+    # per trained signal, and must never read `layer`/`index` as "the" locale.
+    locales: list[tuple[str, int, int]] = field(default_factory=list)
+
+    @property
+    def is_multi_locale(self) -> bool:
+        return len(self.locales) > 1
+
+    def for_locale(self, locale) -> "RunSpec":
+        """This run re-pointed at one of its trained signals. `locales` is kept whole, so
+        the view still knows it belongs to a multi-locale run (which decides where its
+        results are written)."""
+        stype, layer, index = locale
+        return replace(self, signal_type=stype, layer=layer, index=index)
 
     @property
     def label(self) -> str:
@@ -80,6 +97,8 @@ class RunSpec:
         """The (layer, position) cell this run belongs to -- the aggregation key.
         Neurons vary WITHIN a cell, which is what gives every cell its error bar."""
         pos = self.position if self.position is not None else self.position_range
+        if self.is_multi_locale:
+            return f"multi[{len(self.locales)}]/pos{pos}"
         return f"L{self.layer}/pos{pos}"
 
     def checkpoint(self, required: bool = True) -> Optional[Path]:
@@ -107,27 +126,63 @@ def find_checkpoint(run_dir: Path, required: bool = True) -> Optional[Path]:
     return max(ckpts, key=step)
 
 
-def resolve_locale(config: ExperimentConfig) -> tuple[str, int, int]:
-    """(signal_type, layer, index) this run reports on.
+def resolve_locales(config: ExperimentConfig) -> list[tuple[str, int, int]]:
+    """Every (signal_type, layer, index) this run was trained on, in config order.
 
-    signal_filter wins: a grid run's train_signals is the whole shared CELL (5
-    neurons) and only the filter says which one this run trained. Refuses a
-    multi-signal run rather than picking one, since every analysis downstream
-    assumes a single locale.
+    signal_filter wins when set: a grid run's train_signals is the whole shared CELL (5
+    neurons) and only the filter says which one this run trained -- and a comma list
+    there is how a multi-neuron run trains a subset of a shared cache. Otherwise the
+    run trained on all of train_signals.
     """
     if config.signal_filter:
-        if "," in config.signal_filter:
-            raise ValueError(
-                f"{config.experiment_name}: signal_filter {config.signal_filter!r} names "
-                f"several signals; the single-locale analyses do not apply to it.")
-        f = parse_signal_filter(config.signal_filter)
-        return f["signal_type"], f["signal_layer"], f["signal_index"]
-    if len(config.train_signals) == 1:
-        s = config.train_signals[0]
-        return s.type, s.layer, s.index
+        return [(f["signal_type"], f["signal_layer"], f["signal_index"])
+                for f in parse_signal_filters(config.signal_filter)]
+    return [(s.type, s.layer, s.index) for s in config.train_signals]
+
+
+def resolve_locale(config: ExperimentConfig) -> tuple[str, int, int]:
+    """The ONE (signal_type, layer, index) of a single-locale run.
+
+    Refuses a multi-locale run rather than silently picking its first signal: a caller
+    that needs exactly one locale and gets several has a bug, and reporting the first
+    signal as "the" locale would hide it. Multi-locale-aware code uses
+    resolve_locales and iterates.
+    """
+    locs = resolve_locales(config)
+    if len(locs) == 1:
+        return locs[0]
     raise ValueError(
-        f"{config.experiment_name}: {len(config.train_signals)} train signals and no "
-        f"signal_filter; cannot resolve a single locale.")
+        f"{config.experiment_name}: {len(locs)} trained signals; this caller needs a "
+        f"single locale. Iterate resolve_locales() instead.")
+
+
+def locale_tag(signal_type: str, layer: int, index: int) -> str:
+    """'N4.520' -- the per-locale subdirectory name for a multi-locale run."""
+    code = {"mlp": "N", "attention_score": "A", "residual_stream": "R", "sae": "S"}
+    return f"{code.get(signal_type, 'X')}{layer}.{index}"
+
+
+def locale_out_dir(base: Path, spec: "RunSpec", locale) -> Path:
+    """Where one locale's results go: `base` itself for a single-locale run (so every
+    existing grid result stays where it is), `base/<tag>` for a multi-locale run."""
+    return Path(base) / locale_tag(*locale) if spec.is_multi_locale else Path(base)
+
+
+def select_locales(spec: "RunSpec", selector: Optional[str]) -> list[tuple[str, int, int]]:
+    """Restrict a run's locales: None/'all' = every one, an int K = the first K (config
+    order), or a comma list of signal specs ('N4.520,N4.1216') = exactly those."""
+    locs = spec.locales
+    if not selector or selector == "all":
+        return locs
+    if selector.isdigit():
+        return locs[:int(selector)]
+    wanted = {(f["signal_type"], f["signal_layer"], f["signal_index"])
+              for f in parse_signal_filters(selector)}
+    missing = wanted - set(locs)
+    if missing:
+        print(f"[runs] {spec.name}: --locales names {len(missing)} signal(s) the run was "
+              f"not trained on, ignored: {sorted(missing)[:5]}")
+    return [l for l in locs if l in wanted]
 
 
 def resolve_position(config: ExperimentConfig) -> tuple[Optional[int], Optional[tuple[int, int]]]:
@@ -146,7 +201,10 @@ def load_run(config_path: Path, output_root: Optional[Path] = None) -> RunSpec:
     """Build a RunSpec from one experiment config."""
     config_path = Path(config_path)
     config = ExperimentConfig.model_validate_json(config_path.read_text())
-    stype, layer, index = resolve_locale(config)
+    locales = resolve_locales(config)
+    if not locales:
+        raise ValueError(f"{config.experiment_name}: no trained signals")
+    stype, layer, index = locales[0]
     pos, pos_range = resolve_position(config)
     # config.output_dir is the GROUP directory the run was written under; honour an
     # override so results synced to a different root can be analyzed in place.
@@ -160,7 +218,7 @@ def load_run(config_path: Path, output_root: Optional[Path] = None) -> RunSpec:
         config=config,
         run_dir=base / config.experiment_name,
         signal_type=stype, layer=layer, index=index,
-        position=pos, position_range=pos_range,
+        position=pos, position_range=pos_range, locales=locales,
     )
 
 
@@ -264,6 +322,11 @@ def add_discovery_args(parser):
                         help="Total array tasks (default: $SGE_TASK_LAST).")
     parser.add_argument("--skip-existing", action="store_true",
                         help="Skip runs whose result file already exists.")
+    parser.add_argument("--locales", type=str, default=None,
+                        help="For MULTI-locale runs (several trained signals), which to "
+                             "analyze: 'all' (default), an integer K for the first K, or a "
+                             "comma list of signal specs like 'N4.520,N4.1216'. Each one "
+                             "is analyzed separately into <run>/<analysis>/<signal>/.")
     parser.add_argument("--from-cache", action="store_true",
                         help="For each run: if its cached results exist, skip the slow "
                              "recompute and just regenerate the plots from those cached "
@@ -285,6 +348,32 @@ def resolve_run_action(args, sentinel: Path) -> str:
     if getattr(args, "skip_existing", False) and exists:
         return "skip"
     return "compute"
+
+
+def plan_locales(spec: RunSpec, base_dir: Path, sentinel: str, args, replot=None,
+                 log: str = "[run]") -> list[tuple[tuple, Path]]:
+    """[(locale, out_dir), ...] still to COMPUTE for this run, after --locales,
+    --skip-existing and --from-cache have had their say, locale by locale.
+
+    Decided per locale rather than per run, so a multi-locale run that died halfway
+    resumes at the first missing locale instead of recomputing (or skipping) all of
+    them. An empty list means the model need not be loaded at all.
+    """
+    todo = []
+    for loc in select_locales(spec, getattr(args, "locales", None)):
+        out_dir = locale_out_dir(base_dir, spec, loc)
+        label = spec.name + (f" [{locale_tag(*loc)}]" if spec.is_multi_locale else "")
+        action = resolve_run_action(args, out_dir / sentinel)
+        if action == "skip":
+            print(f"{log} {label}: results exist, skipping")
+            continue
+        if action == "replot" and replot is not None:
+            if replot(spec.for_locale(loc), out_dir, args):
+                print(f"{log} {label}: re-plotted from cache")
+                continue
+            print(f"{log} {label}: cache incomplete, recomputing")
+        todo.append((loc, out_dir))
+    return todo
 
 
 def runs_from_args(args, require_checkpoint: bool = True) -> list[RunSpec]:

@@ -94,7 +94,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 
 from src.introspector.analysis_loading import (
-    load_run_for_analysis, absolute_positions, layer_output_is_tuple)
+    load_run_for_analysis, absolute_positions, layer_output_is_tuple, run_per_locale)
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
 from src.introspector.run_discovery import add_discovery_args, runs_from_args, resolve_run_action
 from src.introspector.regimes import (
@@ -1285,28 +1285,9 @@ def main():
     runs = runs_from_args(args)
     if not runs:
         raise SystemExit("No runs with checkpoints matched.")
-    sweeping = len(runs) > 1 or args.group is not None
-    for k, spec in enumerate(runs, 1):
-        out_dir = ((args.output_dir or (spec.run_dir / "mover_trace")) if not sweeping
-                   else spec.run_dir / "mover_trace")
-        action = resolve_run_action(args, out_dir / "mover_heads.csv")
-        if action == "skip":
-            print(f"[mover] [{k}/{len(runs)}] {spec.name}: results exist, skipping")
-            continue
-        if action == "replot":
-            if replot_mover(spec, out_dir, args):
-                print(f"[mover] [{k}/{len(runs)}] {spec.name}: re-plotted from cache")
-                continue
-            print(f"[mover] [{k}/{len(runs)}] {spec.name}: cache incomplete, recomputing")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"\n[mover] ===== [{k}/{len(runs)}] {spec.name} ({spec.cell}) =====")
-        run = load_run_for_analysis(spec.config, checkpoint=args.checkpoint or spec.checkpoint())
-        try:
-            trace_movers(run, args, out_dir)
-        finally:
-            del run
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+    run_per_locale(args, runs, "mover_trace", "mover_heads.csv",
+                   analyze=lambda run, spec, out_dir: trace_movers(run, args, out_dir),
+                   replot=replot_mover, log="[mover]")
 
 
 if __name__ == "__main__":
