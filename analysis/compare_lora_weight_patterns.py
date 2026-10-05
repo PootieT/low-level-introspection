@@ -240,6 +240,54 @@ def plot_profiles_grouped(df, out_dir, group_col="signal_layer", x="rel_depth",
     print(f"[lora] wrote {path}")
 
 
+COMPACT_MODULES = {"q_proj": "Attention Q Proj.", "down_proj": "MLP Down Proj."}
+
+
+def plot_profiles_compact(df, out_dir, group_col="signal_layer", x="rel_depth",
+                          value="frob"):
+    """Paper main-text version of plot_profiles_grouped: only q_proj and down_proj on
+    one row, a separate legend column, no suptitle, and formal labels throughout."""
+    modules = [m for m in COMPACT_MODULES if m in set(df["module"])]
+    if not modules:
+        return
+    groups = sorted(df[group_col].dropna().unique())
+    palette = dict(zip(groups, sns.color_palette("viridis", len(groups))))
+    group_name = group_col.replace("_", " ").title()
+    fig, axes = plt.subplots(1, len(modules) + 1, figsize=(5.2 * len(modules) + 1.8, 4.6),
+                             gridspec_kw={"width_ratios": [1] * len(modules) + [0.35]})
+    for i, (ax, module) in enumerate(zip(axes, modules)):
+        sub = df[df["module"] == module]
+        for g in groups:
+            s = (sub[sub[group_col] == g].groupby(x)[value]
+                 .agg(["mean", "std"]).reset_index().sort_values(x))
+            label = f"{int(g)}" if float(g).is_integer() else f"{g}"
+            ax.plot(s[x], s["mean"], marker="o", ms=4, lw=1.8, label=label, color=palette[g])
+            ax.fill_between(s[x], s["mean"] - s["std"].fillna(0), s["mean"] + s["std"].fillna(0),
+                            color=palette[g], alpha=0.12)
+        ax.axvline(0, color="k", ls="--", lw=1, alpha=0.6)
+        ax.set_title(COMPACT_MODULES[module], fontsize=18)
+        ax.set_xlabel("Layer − Signal Layer" if x == "rel_depth" else "Layer", fontsize=16)
+        if i == 0:
+            ax.set_ylabel(r"$\|\Delta W\|_F$" + (" (Normalized)" if value == "frob_norm" else ""),
+                          fontsize=16)
+        if value == "frob_norm":
+            ax.set_ylim(0, 1.05)
+        else:
+            ax.set_yscale("log")
+        ax.tick_params(labelsize=13)
+        ax.grid(alpha=0.25)
+    leg_ax = axes[-1]
+    leg_ax.axis("off")
+    handles, labels = axes[0].get_legend_handles_labels()
+    leg_ax.legend(handles, labels, loc="center left", fontsize=13, title=group_name,
+                  title_fontsize=14, frameon=False)
+    fig.tight_layout()
+    suffix = "" if value == "frob_norm" else "_abs"
+    path = Path(out_dir) / f"lora_profile{suffix}_by_{x}_grouped_{group_col}_compact.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight"); plt.close(fig)
+    print(f"[lora] wrote {path}")
+
+
 def aggregate_targeted(t: pd.DataFrame, out_dir: Path):
     """
     Per (layer, position, module): the target's numbers against the random-index
@@ -447,6 +495,9 @@ def plot_profiles_from_df(df, out_dir, group_profiles=None):
             if df[by].nunique() > 1:
                 plot_profiles_grouped(df, out_dir, group_col=by, x="rel_depth")
                 plot_profiles_grouped(df, out_dir, group_col=by, x="rel_depth", value="frob")
+                if by == "signal_layer":
+                    # paper main-text version of the absolute profile (q_proj + down_proj)
+                    plot_profiles_compact(df, out_dir, group_col=by, x="rel_depth", value="frob")
     else:
         for x in ("rel_depth", "layer"):
             plot_profiles(df, out_dir, x=x)
