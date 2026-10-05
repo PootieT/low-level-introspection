@@ -68,6 +68,7 @@ from src.introspector.knockout_stats import (
     jaccard, top_k, curve_area, participation_ratio, ranks_desc, rowwise_corr)
 from src.introspector.run_discovery import add_discovery_args, runs_from_args
 from trace_introspection_circuit import endogenous_predictions, select_success_indices
+from analysis.run_catalog import NEURON_RE, POS_RE, KL_RE
 
 
 def parse_args():
@@ -316,15 +317,45 @@ def _report(s, names):
 # ======================================================================
 # Plots
 # ======================================================================
+def arm_label(arm: str) -> str:
+    """Display name of an evaluation arm."""
+    if arm == "endogenous":
+        return "Endogenous"
+    if arm == "x1":
+        return "Interventional"
+    return f"Interventional ({arm})" if arm.startswith("x") else arm.capitalize()
+
+
+def run_title(name: str, signal: str | None = None) -> str:
+    """'joint_N12.1235_POS-12_..._kl0.1_...' -> 'Joint Loss (KL=0.1), Neuron Activation,
+    L=12, i=1235, t=-12'. `signal` (e.g. 'N12.1235') overrides the name's neuron, which
+    a multi-locale run's name does not carry. Unparseable pieces are left out."""
+    parts = []
+    kl = KL_RE.search(name)
+    kl_txt = None if not kl else ("Unanchored" if kl["kl"] == "none" else f"KL={kl['kl']}")
+    if name.startswith("joint"):
+        parts.append(f"Joint Loss ({kl_txt})" if kl_txt else "Joint Loss")
+    elif kl_txt:
+        parts.append(kl_txt)
+    n = NEURON_RE.search(signal or "") or NEURON_RE.search(name)
+    if n:
+        parts.append(f"Neuron Activation, L={n['layer']}, i={n['index']}")
+    pz = POS_RE.search(name)
+    if pz:
+        parts.append(f"t={pz['pos']}")
+    return ", ".join(parts) or name
+
+
 def plot_all(name, ind_df, curves_df, summary, out_dir: Path):
     names = list(dict.fromkeys(ind_df["arm"]))
-    _plot_maps(name, ind_df, names, out_dir)
+    title = run_title(name, summary.get("signal"))
+    _plot_maps(title, ind_df, names, out_dir)
     if len(names) >= 2:
-        _plot_agreement(name, ind_df, summary, names[:2], out_dir)
-    _plot_curves(name, curves_df, names, out_dir)
+        _plot_agreement(title, ind_df, summary, names[:2], out_dir)
+    _plot_curves(title, curves_df, names, out_dir)
 
 
-def _plot_maps(name, ind_df, names, out_dir):
+def _plot_maps(title, ind_df, names, out_dir):
     """Drop per head (layer x head), one panel per arm, significant heads dotted."""
     layers = sorted(ind_df["layer"].unique())
     n_heads = int(ind_df["head"].max()) + 1
@@ -337,21 +368,22 @@ def _plot_maps(name, ind_df, names, out_dir):
         lim = np.nanmax(np.abs(m)) or 1.0
         sns.heatmap(m, ax=ax, cmap="coolwarm", center=0, vmin=-lim, vmax=lim,
                     yticklabels=layers, xticklabels=list(range(n_heads)),
-                    cbar_kws={"label": "corr drop", "pad": 0.01})
+                    cbar_kws={"label": "Correlation Drop", "pad": 0.01})
         s = d[d["significant"]]
         ax.scatter(s["head"] + 0.5, s["layer"].map({L: i for i, L in enumerate(layers)}) + 0.5,
                    s=6, c="k", marker="o")
         base = d["baseline"].iloc[0]
-        ax.set_title(f"{a} (baseline corr {base:.3f}; dot = 95% CI excludes 0)", fontsize=9)
-        ax.set_ylabel("layer"); ax.tick_params(labelsize=6)
-    axes[-1, 0].set_xlabel("head")
-    fig.suptitle(f"Single-head knockout: drop in corr -- {name}", fontsize=9)
+        ax.set_title(f"{arm_label(a)} (Baseline Correlation {base:.3f}; "
+                     f"Dot = 95% CI Excludes 0)", fontsize=9)
+        ax.set_ylabel("Layer"); ax.tick_params(labelsize=6)
+    axes[-1, 0].set_xlabel("Head")
+    fig.suptitle(title, fontsize=9)
     fig.tight_layout()
     fig.savefig(out_dir / "head_knockout_maps.png", dpi=150)
     plt.close(fig)
 
 
-def _plot_agreement(name, ind_df, s, pair, out_dir):
+def _plot_agreement(title, ind_df, s, pair, out_dir):
     a, b = pair
     w = ind_df.pivot_table(index=["layer", "head"], columns="arm",
                            values=["delta", "significant"], aggfunc="first")
@@ -361,28 +393,32 @@ def _plot_agreement(name, ind_df, s, pair, out_dir):
     fig, ax = plt.subplots(figsize=(4.6, 4.2))
     sc = ax.scatter(x, y, c=layers, cmap="viridis", s=np.where(sig_any, 22, 8),
                     edgecolors=np.where(sig_any, "k", "none"), linewidths=0.5)
-    fig.colorbar(sc, ax=ax, label="layer")
+    fig.colorbar(sc, ax=ax, label="Layer")
     ax.axhline(0, color="k", lw=0.5); ax.axvline(0, color="k", lw=0.5)
     for (L, h) in pd.concat([x.nlargest(4), y.nlargest(4)]).index.unique():
         ax.annotate(head_label(L, h), (x[(L, h)], y[(L, h)]), fontsize=6,
                     xytext=(3, 3), textcoords="offset points")
     tk = {t["k"]: t for t in s.get(f"topk_{a}_vs_{b}", [])}
     t10 = tk.get(10)
-    txt = (f"spearman {s[f'spearman_{a}_vs_{b}']:.2f} "
-           f"(disattenuated {s[f'disattenuated_{a}_vs_{b}']:.2f})\n"
-           f"reliability {a} {s[f'reliability_{a}']:.2f}, {b} {s[f'reliability_{b}']:.2f}")
+    dis = s.get(f"disattenuated_{a}_vs_{b}")
+    dis_txt = (f"Disattenuated {dis:.2f}" if dis is not None and np.isfinite(dis)
+               else "Disattenuated n/a: Split-Half < 0.2")
+    txt = (f"Spearman {s[f'spearman_{a}_vs_{b}']:.2f} ({dis_txt})\n"
+           f"Reliability: {arm_label(a)} {s[f'reliability_{a}']:.2f}, "
+           f"{arm_label(b)} {s[f'reliability_{b}']:.2f}")
     if t10:
-        txt += f"\ntop-10 Jaccard {t10['jaccard']:.2f} (layer-matched null {t10['null_mean']:.2f})"
+        txt += f"\nTop-10 Jaccard {t10['jaccard']:.2f} (Layer-Matched Null {t10['null_mean']:.2f})"
     ax.text(0.02, 0.98, txt, transform=ax.transAxes, va="top", fontsize=7,
             bbox=dict(fc="white", ec="0.8", alpha=0.9))
-    ax.set_xlabel(f"corr drop, {a}"); ax.set_ylabel(f"corr drop, {b}")
-    ax.set_title(f"Head importance: {a} vs {b}\n{name}", fontsize=8)
+    ax.set_xlabel(f"Correlation Drop ({arm_label(a)})")
+    ax.set_ylabel(f"Correlation Drop ({arm_label(b)})")
+    ax.set_title(title, fontsize=8)
     fig.tight_layout()
     fig.savefig(out_dir / "head_knockout_agreement.png", dpi=150)
     plt.close(fig)
 
 
-def _plot_curves(name, curves_df, names, out_dir):
+def _plot_curves(title, curves_df, names, out_dir):
     fig, axes = plt.subplots(1, len(names), figsize=(1 + 3.6 * len(names), 3.3),
                              squeeze=False, sharey=False)
     palette = {f"by_{a}": c for a, c in zip(names, ("#c0392b", "#2471a3", "#27ae60"))}
@@ -392,19 +428,21 @@ def _plot_curves(name, curves_df, names, out_dir):
         for oname, g in rand.groupby("order_by"):
             g = g.sort_values("k")
             ax.plot([0] + g["k"].tolist(), [0] + (-g["delta"]).tolist(), color="0.7",
-                    lw=0.8, label="random order" if oname == "random0" else None)
+                    lw=0.8, label="Random Order" if oname == "random0" else None)
         for oname in palette:
             g = d[d["order_by"] == oname].sort_values("k")
             if len(g):
                 ax.plot([0] + g["k"].tolist(), [0] + (-g["delta"]).tolist(), "o-", ms=2.5,
-                        color=palette[oname], label=f"ranked by {oname[3:]}")
+                        color=palette[oname], label=f"Ranked by {arm_label(oname[3:])}")
         ax.axhline(0, color="k", lw=0.6)
-        ax.set_title(f"evaluated on {a}", fontsize=9)
-        ax.set_xlabel("heads knocked out (cumulative)", fontsize=8)
+        # drop grows DOWNWARD: knocking out more heads reads as the curve falling
+        ax.invert_yaxis()
+        ax.set_title(arm_label(a), fontsize=9)
+        ax.set_xlabel("Heads Knocked Out (Cumulative)", fontsize=8)
         ax.tick_params(labelsize=7); ax.grid(alpha=0.25)
-    axes[0, 0].set_ylabel("corr drop", fontsize=8)
+    axes[0, 0].set_ylabel("Correlation Drop", fontsize=8)
     axes[0, 0].legend(fontsize=7)
-    fig.suptitle(f"Does one arm's ranking break the other arm? -- {name}", fontsize=9, y=1.02)
+    fig.suptitle(title, fontsize=9, y=1.02)
     fig.tight_layout()
     fig.savefig(out_dir / "head_knockout_curves.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
