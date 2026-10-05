@@ -423,6 +423,36 @@ def plot_delta_heatmap(merged, metric, label_a, label_b, out_dir):
     print(f"[cmp] wrote {path}")
 
 
+def plot_arm_heatmap(df, metric, label, out_dir):
+    """Absolute per-(layer, position) heatmap of ONE arm's metric (not a difference),
+    mean ± std over the cell's neurons -- what the arm scores on its own, so the delta
+    maps can be read against the levels they came from."""
+    if metric not in df:
+        return
+    sub = df[[*KEY, metric]].dropna()
+    if sub.empty:
+        return
+    mean = sub.pivot_table(index="layer", columns="position", values=metric, aggfunc="mean")
+    std = sub.pivot_table(index="layer", columns="position", values=metric, aggfunc="std")
+    annot = mean.round(2).astype(str) + "\n±" + std.round(2).fillna(0).astype(str)
+    # correlations live in [0, 1] -> fixed viridis scale so arms are comparable; other
+    # metrics (e.g. l2) get a data-driven magma scale.
+    is_corr = metric.endswith("corr")
+    kw = dict(cmap="viridis", vmin=0, vmax=1) if is_corr else dict(cmap="magma")
+    plt.figure(figsize=(2.0 * mean.shape[1] + 5, 1.1 * mean.shape[0] + 4))
+    hm = sns.heatmap(mean, annot=annot, fmt="", annot_kws={"size": 20},
+                     cbar_kws={"label": f"{pretty_metric(metric)}\n(Mean ± Std over Neurons)"}, **kw)
+    hm.figure.axes[-1].yaxis.label.set_size(24)  # colorbar label
+    hm.figure.axes[-1].tick_params(labelsize=22)  # colorbar ticks
+    hm.tick_params(axis="x", labelsize=30)
+    hm.tick_params(axis="y", labelsize=30)
+    plt.xlabel("Token Position", fontsize=38); plt.ylabel("Layer", fontsize=38)
+    plt.tight_layout()
+    path = Path(out_dir) / f"heatmap_{label}_{metric}.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
+    print(f"[cmp] wrote {path}")
+
+
 def main(arms: dict, out_dir, pairs=None, model=None):
     """
     arms:  {label: {"group": ..., "filters": {...}}}
@@ -479,6 +509,13 @@ def main(arms: dict, out_dir, pairs=None, model=None):
     if tables:
         pd.concat(tables, ignore_index=True).to_csv(Path(out_dir) / "paired_summary.csv",
                                                     index=False)
+    # the joint arms' absolute (layer, position) maps on their own, so the joint results
+    # can be read without reference to SFT
+    for label, f in frames.items():
+        if not label.startswith("joint"):
+            continue
+        for m in ("interventional_corr", "endogenous_corr"):
+            plot_arm_heatmap(f, m, label, out_dir)
     # one color per arm, shared by both readouts so their legends line up
     arm_colors = {arm: c for arm, c in zip(frames, plt.get_cmap("tab10").colors)}
     # order corpora by endogenous performance, then reuse that x-order for the
