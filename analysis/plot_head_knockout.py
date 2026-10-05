@@ -137,61 +137,97 @@ def load(args):
 # ======================================================================
 # Per-run agreement against locale
 # ======================================================================
-def agreement_by_locale(runs: pd.DataFrame, k: int, q: float, out: Path):
+def _agreement_panels(k: int, q: float) -> list:
     qs = f"{q:g}"
-    panels = [
-        (f"Top-Head Overlap ({100 * q:g}% Mass)",
+    rnd = "Random Layer-Matched Heads"
+    return [
+        (f"Top-Head Overlap Coefficient\n({100 * q:g}% Mass)",
          [(f"mass{qs}_overlap", "Observed", "#c0392b"),
-          (f"mass{qs}_null", "Random Layer-Matched Heads", "#bdc3c7")], (-0.05, 1.05)),
+          (f"mass{qs}_null", rnd, "#bdc3c7")], (-0.05, 1.05)),
         (f"Top-{k} Jaccard", [(f"jaccard_top{k}", "Observed", "#2471a3"),
-                              (f"null_top{k}", "Random Layer-Matched Heads", "#bdc3c7")], (-0.05, 1.05)),
+                              (f"null_top{k}", rnd, "#bdc3c7")], (-0.05, 1.05)),
         ("Transfer Ratio", [(f"transfer_{A}_to_{B}", f"{LABEL[A]}-Ranked, on {LABEL[B]}", "#c0392b"),
                             (f"transfer_{B}_to_{A}", f"{LABEL[B]}-Ranked, on {LABEL[A]}", "#2471a3"),
                             (f"transfer_random_to_{B}", f"Random, on {LABEL[B]}", "#bdc3c7")],
          (-0.05, 1.05)),
-        ("Effective Heads (Positive Drops)",
+        ("Effective Heads\n(Positive Drops)",
          [(f"effective_heads_pos_{A}", LABEL[A], "#c0392b"),
           (f"effective_heads_pos_{B}", LABEL[B], "#2471a3")], None),
-        ("Effective Heads (|Drop|)",
+        ("Effective Heads\n(|Drop|)",
          [(f"effective_heads_abs_{A}", LABEL[A], "#c0392b"),
           (f"effective_heads_abs_{B}", LABEL[B], "#2471a3")], None),
     ]
-    xs = [("signal_layer", "Signal Layer"), ("position", "Token Position")]
+
+
+# font sizes: the combined overview figure vs the per-axis figures meant for the paper
+FONTS_OVERVIEW = {"title": 10, "label": 11, "tick": 9, "legend": 7, "point": 8, "median": 200}
+FONTS_PAPER = {"title": 18, "label": 18, "tick": 16, "legend": 15, "point": 30, "median": 500}
+
+
+def _draw_row(axes, runs, xcol, xlabel, panels, fonts, titles=True, legends=True,
+              legend_below=False, one_line_titles=False, seed=0):
+    """One row of panels: every run a point (jittered), the median a bar."""
+    rng = np.random.default_rng(seed)
+    levels = sorted(runs[xcol].unique())
+    pos = {v: i for i, v in enumerate(levels)}
+    for ax, (title, series, ylim) in zip(axes, panels):
+        width = 0.8 / len(series)
+        for si, (col, label, color) in enumerate(series):
+            if col not in runs:
+                continue
+            off = (si - (len(series) - 1) / 2) * width
+            x = runs[xcol].map(pos) + off
+            ax.scatter(x + rng.uniform(-width / 4, width / 4, len(x)), runs[col],
+                       s=fonts["point"], color=color, alpha=0.5, label=label)
+            med = runs.groupby(xcol)[col].median()
+            ax.scatter([pos[v] + off for v in med.index], med.values, marker="_",
+                       s=fonts["median"], color=color, linewidths=2.5)
+        ax.set_xticks(range(len(levels)), levels)
+        ax.set_xlabel(xlabel, fontsize=fonts["label"])
+        ax.tick_params(labelsize=fonts["tick"])
+        if titles:
+            ax.set_title(title.replace("\n", " ") if one_line_titles else title,
+                         fontsize=fonts["title"])
+        if ylim is not None:
+            # bounded metrics: fixed axis so one outlier cannot set the scale
+            ax.set_ylim(*ylim)
+            ax.axhline(0, color="k", lw=0.5)
+        ax.grid(alpha=0.25)
+        if legends:
+            if legend_below:
+                # below the axes, so a larger legend never sits on the points
+                ax.legend(fontsize=fonts["legend"], loc="upper center",
+                          bbox_to_anchor=(0.5, -0.3), frameon=False, markerscale=1.5)
+            else:
+                ax.legend(fontsize=fonts["legend"], loc="best")
+
+
+def agreement_by_locale(runs: pd.DataFrame, k: int, q: float, out: Path):
+    """The overview (both locale axes as two rows) plus one figure per locale axis."""
+    panels = _agreement_panels(k, q)
+    xs = [("signal_layer", "Signal Layer", "knockout_agreement_by_signal_layer.png"),
+          ("position", "Token Position", "knockout_agreement_by_position.png")]
+
     fig, axes = plt.subplots(len(xs), len(panels), figsize=(4.0 * len(panels), 3.3 * len(xs)),
                              squeeze=False)
-    rng = np.random.default_rng(0)
-    for r, (xcol, xlabel) in enumerate(xs):
-        levels = sorted(runs[xcol].unique())
-        pos = {v: i for i, v in enumerate(levels)}
-        for c, (title, series, ylim) in enumerate(panels):
-            ax = axes[r, c]
-            width = 0.8 / len(series)
-            for si, (col, label, color) in enumerate(series):
-                if col not in runs:
-                    continue
-                off = (si - (len(series) - 1) / 2) * width
-                x = runs[xcol].map(pos) + off
-                ax.scatter(x + rng.uniform(-width / 4, width / 4, len(x)), runs[col],
-                           s=8, color=color, alpha=0.5, label=label)
-                med = runs.groupby(xcol)[col].median()
-                ax.scatter([pos[v] + off for v in med.index], med.values, marker="_",
-                           s=200, color=color, linewidths=2)
-            ax.set_xticks(range(len(levels)), levels)
-            ax.set_xlabel(xlabel)
-            if r == 0:
-                ax.set_title(title, fontsize=10)
-            if ylim is not None:
-                # bounded metrics: fixed axis so one outlier cannot set the scale
-                ax.set_ylim(*ylim)
-                ax.axhline(0, color="k", lw=0.5)
-            ax.grid(alpha=0.25)
-            if r == 0:
-                ax.legend(fontsize=7, loc="best")
+    for r, (xcol, xlabel, _) in enumerate(xs):
+        _draw_row(axes[r], runs, xcol, xlabel, panels, FONTS_OVERVIEW,
+                  titles=r == 0, legends=r == 0, one_line_titles=True)
     fig.suptitle("Endogenous vs Interventional Head Importance, per Run (Bar = Median)",
                  y=1.01)
     fig.tight_layout()
     fig.savefig(out / "knockout_agreement_by_locale.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+    for xcol, xlabel, fname in xs:
+        fig, axes = plt.subplots(1, len(panels), figsize=(4.6 * len(panels), 6.2),
+                                 squeeze=False)
+        _draw_row(axes[0], runs, xcol, xlabel, panels, FONTS_PAPER, legend_below=True)
+        # explicit margins: tight_layout shrinks the axes to make room for the legends
+        # below them, which squashes the plots; bbox_inches="tight" trims the rest
+        fig.subplots_adjust(left=0.04, right=0.99, top=0.86, bottom=0.36, wspace=0.32)
+        fig.savefig(out / fname, dpi=200, bbox_inches="tight")
+        plt.close(fig)
 
 
 def pooled_table(runs: pd.DataFrame, k: int, q: float) -> pd.DataFrame:
