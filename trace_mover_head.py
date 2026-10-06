@@ -96,7 +96,8 @@ from torch.utils.data import DataLoader
 from src.introspector.analysis_loading import (
     load_run_for_analysis, absolute_positions, layer_output_is_tuple, run_per_locale)
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
-from src.introspector.run_discovery import add_discovery_args, runs_from_args, resolve_run_action
+from src.introspector.run_discovery import (
+    add_discovery_args, runs_from_args, resolve_run_action, locale_out_dir)
 from src.introspector.regimes import (
     DEFAULT_REGIMES, DEFAULT_LOCAL_DELTA_SIGMA, parse_regimes, zero_offset_index,
     identity_check, power_warning)
@@ -132,6 +133,16 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=16,
                    help="Attention probabilities are [B, heads, seq, seq] per layer, so "
                         "this is smaller than the eval default.")
+    p.add_argument("--heads-from-knockout", action="store_true",
+                   help="Instead of the full trace, redraw the attention-vs-v and "
+                        "attention-profile figures for the top --top-heads heads PER ARM of "
+                        "score_head_knockout.py (largest single-knockout drop), into "
+                        "*_knockout.{csv,png} next to the mover-trace outputs. Attention "
+                        "vs v is read from mover_head_dose_all.csv (run the full trace "
+                        "first); only the attention profile needs the GPU.")
+    p.add_argument("--knockout-dir", type=Path, default=None,
+                   help="Where the head_knockout outputs are (default: "
+                        "<run>/head_knockout, per signal for multi-locale runs).")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output-dir", type=Path, default=None,
                    help="Single-run override; a sweep always writes to <run>/mover_trace/.")
@@ -326,22 +337,11 @@ def slopes_over_grid(values, grid):
     return float(np.mean(slopes)), float(np.mean(r2s))
 
 
-def trace_movers(run, args, out_dir: Path):
-    cfg = run.base.config
-    device = run.model.device
-    n_layers, n_heads = cfg.num_hidden_layers, cfg.num_attention_heads
-    n_kv_heads = getattr(cfg, "num_key_value_heads", n_heads)
-    head_dim = getattr(cfg, "head_dim", cfg.hidden_size // n_heads)
-    eps = cfg.rms_norm_eps
-    gamma = run.base.model.norm.weight.detach().float().cpu()
-    w = run.model.regression_head.weight.detach().flatten().float().cpu()
+def prepare_inputs(run, args):
+    """Examples, loader, injection regimes, live centres (for `local`) and the injection
+    dtype -- shared by the full trace and the knockout-head attention profile, so both
+    measure on the same examples under the same regimes."""
     L, i = run.layer, run.index
-    layer_out_tuple = layer_output_is_tuple(run.model)
-
-    # eager attention is what makes output_attentions return real probabilities
-    prev_impl = getattr(cfg, "_attn_implementation", None)
-    cfg._attn_implementation = "eager"
-
     dataset = run.dataset.select(range(min(args.n_examples, len(run.dataset))))
     loader = lambda: DataLoader(dataset, batch_size=args.batch_size,
                                 collate_fn=run.collator, shuffle=False)
@@ -373,6 +373,27 @@ def trace_movers(run, args, out_dir: Path):
               f"mean={centres.mean():.4f} std={centres.std():.4f} "
               f"(cached-column mean={stats['mean']:.4f} std={stats['std']:.4f})")
     inject_dtype = next(run.model.parameters()).dtype
+    return dataset, loader, regimes, centres, inject_dtype, train_scale
+
+
+def trace_movers(run, args, out_dir: Path):
+    cfg = run.base.config
+    device = run.model.device
+    n_layers, n_heads = cfg.num_hidden_layers, cfg.num_attention_heads
+    n_kv_heads = getattr(cfg, "num_key_value_heads", n_heads)
+    head_dim = getattr(cfg, "head_dim", cfg.hidden_size // n_heads)
+    eps = cfg.rms_norm_eps
+    gamma = run.base.model.norm.weight.detach().float().cpu()
+    w = run.model.regression_head.weight.detach().flatten().float().cpu()
+    L, i = run.layer, run.index
+    layer_out_tuple = layer_output_is_tuple(run.model)
+
+    # eager attention is what makes output_attentions return real probabilities
+    prev_impl = getattr(cfg, "_attn_implementation", None)
+    cfg._attn_implementation = "eager"
+
+    dataset, loader, regimes, centres, inject_dtype, train_scale = prepare_inputs(run, args)
+    stats = run.stats
 
     # ---- shared setup ----
     # a head at layer M reads the residual BEFORE that layer's MLP writes, so a mover
@@ -672,53 +693,9 @@ def trace_movers(run, args, out_dir: Path):
     # every other head's share of t collapses to ~0, while the grid-averaged figure has
     # four layer-1 heads sitting near 0.42 each. A single endpoint therefore describes
     # the endpoint, not the regime, and disagreed with pass 2's own numbers.
-    conditions = [("endogenous", None)] + [(rg.name, rg) for rg in regimes]
-    prof_rows, addr_rows = [], []
-    for disable in (False, True):
-        for cond_name, cond_regime in conditions:
-            acc = {(int(M), int(h)): None for M, h in top_heads}
-            n_rows_seen = 0
-            n_points = 1 if cond_regime is None else len(cond_regime.grid)
-            for gi in range(n_points):
-                row0 = 0
-                for batch in loader():
-                    batch = batch.to(device)
-                    nrow = batch["input_ids"].shape[0]
-                    if cond_regime is None:
-                        inj = None
-                    else:
-                        inj = cond_regime.values_for(
-                            None if not cond_regime.is_local else centres[row0:row0 + nrow],
-                            gi)
-                        if torch.is_tensor(inj):
-                            inj = inj.to(dtype=inject_dtype)
-                    row0 += nrow
-                    cap = run_injected_batch(run, batch, inj, sorted({M for M, _ in top_heads}),
-                                             layer_out_tuple, disable_adapter=disable)
-                    t = cap["abs_pos"]
-                    num_left_pad = (batch["attention_mask"] == 0).sum(dim=1).cpu()
-                    n_rows_seen += t.shape[0]
-                    for (M, h) in acc:
-                        alpha = cap["attn_probs"][M][:, h, :]
-                        binned = _attention_bins(alpha, t, num_left_pad)
-                        acc[(M, h)] = binned if acc[(M, h)] is None else {
-                            k: acc[(M, h)][k] + v for k, v in binned.items()}
-            for (M, h), sums in acc.items():
-                for label, total in sums.items():
-                    prof_rows.append({
-                        "run": run.config.experiment_name, "layer": M, "head": h,
-                        "selected_as": why_of.get((M, h), ""),
-                        "adapter": "off" if disable else "on", "condition": cond_name,
-                        "injected": cond_regime is not None, "token_bin": label,
-                        "mean_attention": float(total) / max(1, n_rows_seen)})
-                addr_rows.append({
-                    "run": run.config.experiment_name, "layer": M, "head": h,
-                    "selected_as": why_of.get((M, h), ""),
-                    "adapter": "off" if disable else "on", "condition": cond_name,
-                    "injected": cond_regime is not None,
-                    "attn_to_t": float(sums["t"]) / max(1, n_rows_seen),
-                    "attn_to_bos": float(sums["BOS"]) / max(1, n_rows_seen),
-                    "attn_to_final": float(sums["final"]) / max(1, n_rows_seen)})
+    prof_rows, addr_rows = measure_attention_profile(
+        run, top_heads, why_of, loader, regimes, centres, inject_dtype, layer_out_tuple,
+        device)
     prof_df = pd.DataFrame(prof_rows)
     prof_df.to_csv(out_dir / "mover_attention_profile.csv", index=False)
 
@@ -791,6 +768,63 @@ def trace_movers(run, args, out_dir: Path):
     if prev_impl is not None:
         cfg._attn_implementation = prev_impl
     print(f"[mover] wrote {out_dir}")
+
+
+@torch.no_grad()
+def measure_attention_profile(run, heads, why_of, loader, regimes, centres, inject_dtype,
+                              layer_out_tuple, device):
+    """Pass 3: where each head in `heads` looks from the readout, endogenously and in
+    every regime (grid-averaged), adapter on and off. Returns (profile rows over token
+    bins, per-head addressing rows). Needs eager attention (set by the caller)."""
+    top_heads = heads
+    conditions = [("endogenous", None)] + [(rg.name, rg) for rg in regimes]
+    prof_rows, addr_rows = [], []
+    for disable in (False, True):
+        for cond_name, cond_regime in conditions:
+            acc = {(int(M), int(h)): None for M, h in top_heads}
+            n_rows_seen = 0
+            n_points = 1 if cond_regime is None else len(cond_regime.grid)
+            for gi in range(n_points):
+                row0 = 0
+                for batch in loader():
+                    batch = batch.to(device)
+                    nrow = batch["input_ids"].shape[0]
+                    if cond_regime is None:
+                        inj = None
+                    else:
+                        inj = cond_regime.values_for(
+                            None if not cond_regime.is_local else centres[row0:row0 + nrow],
+                            gi)
+                        if torch.is_tensor(inj):
+                            inj = inj.to(dtype=inject_dtype)
+                    row0 += nrow
+                    cap = run_injected_batch(run, batch, inj, sorted({M for M, _ in top_heads}),
+                                             layer_out_tuple, disable_adapter=disable)
+                    t = cap["abs_pos"]
+                    num_left_pad = (batch["attention_mask"] == 0).sum(dim=1).cpu()
+                    n_rows_seen += t.shape[0]
+                    for (M, h) in acc:
+                        alpha = cap["attn_probs"][M][:, h, :]
+                        binned = _attention_bins(alpha, t, num_left_pad)
+                        acc[(M, h)] = binned if acc[(M, h)] is None else {
+                            k: acc[(M, h)][k] + v for k, v in binned.items()}
+            for (M, h), sums in acc.items():
+                for label, total in sums.items():
+                    prof_rows.append({
+                        "run": run.config.experiment_name, "layer": M, "head": h,
+                        "selected_as": why_of.get((M, h), ""),
+                        "adapter": "off" if disable else "on", "condition": cond_name,
+                        "injected": cond_regime is not None, "token_bin": label,
+                        "mean_attention": float(total) / max(1, n_rows_seen)})
+                addr_rows.append({
+                    "run": run.config.experiment_name, "layer": M, "head": h,
+                    "selected_as": why_of.get((M, h), ""),
+                    "adapter": "off" if disable else "on", "condition": cond_name,
+                    "injected": cond_regime is not None,
+                    "attn_to_t": float(sums["t"]) / max(1, n_rows_seen),
+                    "attn_to_bos": float(sums["BOS"]) / max(1, n_rows_seen),
+                    "attn_to_final": float(sums["final"]) / max(1, n_rows_seen)})
+    return prof_rows, addr_rows
 
 
 # Token bins the attention profile is reported over. BOS is absolute (Llama's
@@ -1058,7 +1092,7 @@ def _head_label(L, h, why=""):
     return f"L{int(L)}h{int(h)}{why}"
 
 
-def _plot_attention_vs_v(run, dose_df, out_dir):
+def _plot_attention_vs_v(run, dose_df, out_dir, suffix=""):
     """Attention to t as a function of the injected value, per head, per scale.
 
     This is the graded-vs-threshold test. A head that routes the value should show
@@ -1087,12 +1121,12 @@ def _plot_attention_vs_v(run, dose_df, out_dir):
                  "attention to the introspected token vs the value injected there",
                  fontsize=9, y=1.04)
     fig.tight_layout()
-    path = out_dir / "mover_attention_vs_v.png"
+    path = out_dir / f"mover_attention_vs_v{suffix}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"[mover] wrote {path}")
 
 
-def _plot_attention_profile(run, prof_df, out_dir):
+def _plot_attention_profile(run, prof_df, out_dir, suffix="", heads_desc="the movers"):
     """Where each selected head looks, per regime: heads x token bins, one panel per
     condition, adapter ON. Attention is averaged over the dose-response grid, so a
     cell is what the head does across the regime rather than at one saturating endpoint.
@@ -1136,9 +1170,9 @@ def _plot_attention_profile(run, prof_df, out_dir):
             ax.axvline(bins.index("t") - 0.5, color="cyan", lw=0.8)
             ax.axvline(bins.index("t") + 0.5, color="cyan", lw=0.8)
     fig.colorbar(im, ax=axes.ravel().tolist(), label="mean attention from readout", pad=0.02)
-    fig.suptitle(f"Where the movers look, by regime -- {run.config.experiment_name}",
+    fig.suptitle(f"Where {heads_desc} look, by regime -- {run.config.experiment_name}",
                  fontsize=9, y=1.02)
-    path = out_dir / "mover_attention_profile.png"
+    path = out_dir / f"mover_attention_profile{suffix}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"[mover] wrote {path}")
 
@@ -1260,12 +1294,113 @@ def replot_mover(spec, out_dir: Path, args) -> bool:
     return True
 
 
+# ======================================================================
+# Knockout-selected heads
+# ======================================================================
+KNOCKOUT_ARM_WHY = {"endogenous": "top endogenous", "x1": "top interventional"}
+KNOCKOUT_SUFFIX = "_knockout"
+
+
+def knockout_dir_for(run, spec, args) -> Path:
+    if args.knockout_dir:
+        return Path(args.knockout_dir)
+    return locale_out_dir(spec.run_dir / "head_knockout", spec,
+                          (run.signal_type, run.layer, run.index))
+
+
+def select_knockout_heads(ko_df: pd.DataFrame, top_k: int):
+    """[((layer, head), why)]: each arm's top_k heads by single-knockout drop (rank 1 =
+    largest drop; heads whose knockout helps rank last). A head in both arms' top_k is
+    labelled 'top both', so the figure shows the overlap directly."""
+    arms_of = {}
+    best = {}
+    for arm, g in ko_df.groupby("arm", sort=False):
+        for r in g.nsmallest(top_k, "rank").itertuples():
+            k = (int(r.layer), int(r.head))
+            arms_of.setdefault(k, []).append(arm)
+            best[k] = min(best.get(k, np.inf), int(r.rank))
+    out = []
+    for k in sorted(arms_of, key=lambda k: (best[k], k)):
+        arms = arms_of[k]
+        why = "top both" if len(arms) > 1 else KNOCKOUT_ARM_WHY.get(arms[0], f"top {arms[0]}")
+        out.append((k, why))
+    return out
+
+
+def _knockout_dose(out_dir: Path, heads_why) -> pd.DataFrame | None:
+    """Attention to t vs v for the selected heads, from the full trace's every-head
+    dose table -- no forward passes needed."""
+    p = out_dir / "mover_head_dose_all.csv"
+    if not p.exists():
+        print(f"[mover] {p.name} not found -- run the full mover trace first for the "
+              f"attention-vs-v figure")
+        return None
+    why_of = dict(heads_why)
+    d = pd.read_csv(p)
+    keys = list(zip(d["layer"].astype(int), d["head"].astype(int)))
+    d = d[[k in why_of for k in keys]].copy()
+    d["selected_as"] = [why_of[(int(L_), int(h_))] for L_, h_ in zip(d["layer"], d["head"])]
+    return d
+
+
+def trace_knockout_heads(run, spec, args, out_dir: Path):
+    """Attention-vs-v and attention-profile figures for the head_knockout top heads."""
+    ko_csv = knockout_dir_for(run, spec, args) / "head_knockout_individual.csv"
+    if not ko_csv.exists():
+        raise SystemExit(f"{ko_csv} not found -- run score_head_knockout.py first")
+    sel = select_knockout_heads(pd.read_csv(ko_csv), args.top_heads)
+    heads, why_of = [k for k, _ in sel], dict(sel)
+    print("[mover] knockout-selected heads: " +
+          ", ".join(_head_label(M, h, w) for (M, h), w in sel))
+
+    dose = _knockout_dose(out_dir, sel)
+    if dose is not None:
+        dose.to_csv(out_dir / f"mover_attention_vs_v{KNOCKOUT_SUFFIX}.csv", index=False)
+        _plot_attention_vs_v(run, dose, out_dir, suffix=KNOCKOUT_SUFFIX)
+
+    cfg = run.base.config
+    prev_impl = getattr(cfg, "_attn_implementation", None)
+    cfg._attn_implementation = "eager"      # output_attentions needs real probabilities
+    try:
+        _, loader, regimes, centres, inject_dtype, _ = prepare_inputs(run, args)
+        prof_rows, addr_rows = measure_attention_profile(
+            run, heads, why_of, loader, regimes, centres, inject_dtype,
+            layer_output_is_tuple(run.model), run.model.device)
+    finally:
+        if prev_impl is not None:
+            cfg._attn_implementation = prev_impl
+    pd.DataFrame(addr_rows).to_csv(
+        out_dir / f"mover_attention_base_vs_tuned{KNOCKOUT_SUFFIX}.csv", index=False)
+    prof_df = pd.DataFrame(prof_rows)
+    prof_df.to_csv(out_dir / f"mover_attention_profile{KNOCKOUT_SUFFIX}.csv", index=False)
+    _plot_attention_profile(run, prof_df, out_dir, suffix=KNOCKOUT_SUFFIX,
+                            heads_desc="the top knockout heads")
+
+
+def replot_knockout_heads(spec, out_dir: Path, args) -> bool:
+    prof = out_dir / f"mover_attention_profile{KNOCKOUT_SUFFIX}.csv"
+    if not prof.exists():
+        return False
+    dose = out_dir / f"mover_attention_vs_v{KNOCKOUT_SUFFIX}.csv"
+    if dose.exists():
+        _plot_attention_vs_v(spec, pd.read_csv(dose), out_dir, suffix=KNOCKOUT_SUFFIX)
+    _plot_attention_profile(spec, pd.read_csv(prof), out_dir, suffix=KNOCKOUT_SUFFIX,
+                            heads_desc="the top knockout heads")
+    return True
+
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
     runs = runs_from_args(args)
     if not runs:
         raise SystemExit("No runs with checkpoints matched.")
+    if args.heads_from_knockout:
+        run_per_locale(args, runs, "mover_trace", f"mover_attention_profile{KNOCKOUT_SUFFIX}.csv",
+                       analyze=lambda run, spec, out_dir: trace_knockout_heads(
+                           run, spec, args, out_dir),
+                       replot=replot_knockout_heads, log="[mover]")
+        return
     run_per_locale(args, runs, "mover_trace", "mover_heads.csv",
                    analyze=lambda run, spec, out_dir: trace_movers(run, args, out_dir),
                    replot=replot_mover, log="[mover]")

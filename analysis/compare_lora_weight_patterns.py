@@ -253,8 +253,8 @@ def plot_profiles_compact(df, out_dir, group_col="signal_layer", x="rel_depth",
     groups = sorted(df[group_col].dropna().unique())
     palette = dict(zip(groups, sns.color_palette("viridis", len(groups))))
     group_name = group_col.replace("_", " ").title()
-    fig, axes = plt.subplots(1, len(modules) + 1, figsize=(5.2 * len(modules) + 1.8, 4.6),
-                             gridspec_kw={"width_ratios": [1] * len(modules) + [0.35]})
+    fig, axes = plt.subplots(1, len(modules), figsize=(5.2 * len(modules), 4.6), squeeze=False)
+    axes = axes[0]
     for i, (ax, module) in enumerate(zip(axes, modules)):
         sub = df[df["module"] == module]
         for g in groups:
@@ -265,22 +265,24 @@ def plot_profiles_compact(df, out_dir, group_col="signal_layer", x="rel_depth",
             ax.fill_between(s[x], s["mean"] - s["std"].fillna(0), s["mean"] + s["std"].fillna(0),
                             color=palette[g], alpha=0.12)
         ax.axvline(0, color="k", ls="--", lw=1, alpha=0.6)
-        ax.set_title(COMPACT_MODULES[module], fontsize=18)
-        ax.set_xlabel("Layer − Signal Layer" if x == "rel_depth" else "Layer", fontsize=16)
+        ax.set_title(COMPACT_MODULES[module], fontsize=20)
+        ax.set_xlabel("Layer − Signal Layer" if x == "rel_depth" else "Layer", fontsize=19)
         if i == 0:
             ax.set_ylabel(r"$\|\Delta W\|_F$" + (" (Normalized)" if value == "frob_norm" else ""),
-                          fontsize=16)
+                          fontsize=19)
         if value == "frob_norm":
             ax.set_ylim(0, 1.05)
         else:
             ax.set_yscale("log")
-        ax.tick_params(labelsize=13)
+        # which="both": on a log axis the in-between labels (2x10^-1, 3x10^-1, ...) are
+        # MINOR ticks, and a major-only setting leaves them at the default size
+        ax.tick_params(which="both", labelsize=15)
         ax.grid(alpha=0.25)
-    leg_ax = axes[-1]
-    leg_ax.axis("off")
+    # legend hugging the last panel, rather than in its own blank column
     handles, labels = axes[0].get_legend_handles_labels()
-    leg_ax.legend(handles, labels, loc="center left", fontsize=13, title=group_name,
-                  title_fontsize=14, frameon=False)
+    axes[-1].legend(handles, labels, loc="center left", bbox_to_anchor=(1.02, 0.5),
+                    fontsize=14, title=group_name, title_fontsize=15, frameon=False,
+                    borderaxespad=0.0)
     fig.tight_layout()
     suffix = "" if value == "frob_norm" else "_abs"
     path = Path(out_dir) / f"lora_profile{suffix}_by_{x}_grouped_{group_col}_compact.png"
