@@ -69,6 +69,7 @@ def preprocess_example(
     detection=False,
     detection_active_word="active",
     detection_inactive_word="inactive",
+    separator=INTROSPECTION_SEPARATOR,
 ):
     """
     preprocess dataset for training or prediction
@@ -81,6 +82,10 @@ def preprocess_example(
         introspected token. Opt-in: it is an extra column, and callers that map with
         remove_columns=<original> would otherwise hand it to the collator as a model kwarg.
     :param for_prediction: if True, do not suffix the target activation, and left-pad the batches
+    :param separator: what sits between the text and the introspection prompt. Trained
+        runs use the added special token; the untrained prompt baseline
+        (score_prompt_baseline.py) passes plain text, because to a model that never
+        trained on it the special token is a random, frozen embedding.
     :return:
     """
     introspection_prompt = prompt_fn(
@@ -90,7 +95,7 @@ def preprocess_example(
         token=example["token"],
         token_index=example["token_position"],
     )
-    full_prompt = f"{example['text']} {INTROSPECTION_SEPARATOR}{introspection_prompt}"
+    full_prompt = f"{example['text']} {separator}{introspection_prompt}"
 
     if detection:
         # binary readout for sparse features: the feature is active iff its
