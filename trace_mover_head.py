@@ -1116,11 +1116,16 @@ def _plot_attention_vs_v(run, dose_df, out_dir, suffix=""):
         ax.grid(alpha=0.25)
         ax.set_title(sc, fontsize=9); ax.tick_params(labelsize=8)
     axes.flat[0].set_ylabel("attention: readout -> t", fontsize=9)
-    axes.flat[-1].legend(fontsize=6, ncol=2)
     fig.suptitle("Graded routing or threshold detection?\n"
                  "attention to the introspected token vs the value injected there",
                  fontsize=9, y=1.04)
     fig.tight_layout()
+    # below the panels: head labels carry their selection reason (and, for knockout
+    # heads, their drops), which is too long for a legend inside an axis
+    handles, labels = axes.flat[-1].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.0),
+               ncol=2 if max(map(len, labels), default=0) < 60 else 1, fontsize=7,
+               frameon=False)
     path = out_dir / f"mover_attention_vs_v{suffix}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"[mover] wrote {path}")
@@ -1308,10 +1313,18 @@ def knockout_dir_for(run, spec, args) -> Path:
                           (run.signal_type, run.layer, run.index))
 
 
+KNOCKOUT_ARM_SHORT = {"endogenous": "Endo", "x1": "Interv"}
+
+
 def select_knockout_heads(ko_df: pd.DataFrame, top_k: int):
     """[((layer, head), why)]: each arm's top_k heads by single-knockout drop (rank 1 =
     largest drop; heads whose knockout helps rank last). A head in both arms' top_k is
-    labelled 'top both', so the figure shows the overlap directly."""
+    labelled 'top both', so the figure shows the overlap directly.
+
+    `why` also carries the head's importance in EVERY arm -- its correlation drop when
+    knocked out alone and its rank among the run's heads -- e.g.
+    'top both; drop Endo 0.351 (#1), Interv 0.031 (#3)', so a head picked for one arm
+    shows how much the other arm cares about it too."""
     arms_of = {}
     best = {}
     for arm, g in ko_df.groupby("arm", sort=False):
@@ -1319,11 +1332,16 @@ def select_knockout_heads(ko_df: pd.DataFrame, top_k: int):
             k = (int(r.layer), int(r.head))
             arms_of.setdefault(k, []).append(arm)
             best[k] = min(best.get(k, np.inf), int(r.rank))
+    stats = {(int(r.layer), int(r.head), r.arm): (-float(r.delta), int(r.rank))
+             for r in ko_df.itertuples()}
+    arm_order = list(dict.fromkeys(ko_df["arm"]))
     out = []
     for k in sorted(arms_of, key=lambda k: (best[k], k)):
         arms = arms_of[k]
         why = "top both" if len(arms) > 1 else KNOCKOUT_ARM_WHY.get(arms[0], f"top {arms[0]}")
-        out.append((k, why))
+        imp = ", ".join(f"{KNOCKOUT_ARM_SHORT.get(a, a)} {stats[(*k, a)][0]:.3f} "
+                        f"(#{stats[(*k, a)][1]})" for a in arm_order if (*k, a) in stats)
+        out.append((k, f"{why}; drop {imp}"))
     return out
 
 
