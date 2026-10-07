@@ -10,8 +10,14 @@ pairing, the OOD ladder and the heatmaps are that script's own functions:
 
   prompt_endo    ridge on the true activation           (head-only analogue of SFT)
   prompt_joint   ridge on the grid's joint objective    (the joint recipe, LoRA lr=0)
+  prompt_verbal  the number the model WRITES in its k_max-token continuation, parsed
+                 as a float -- no probe at all. corr is over the rows that parse
+                 (parse rate is reported), and is NaN when every row writes the same
+                 number; those runs drop out of the mean rather than counting as 0.
 
-read at --k (default 0, the trained head's own readout position).
+The probe arms are read at --k (default 0, the trained head's own readout position).
+The verbal arm has no OOD scores (the OOD pass scores the probes), so it is left out of
+the ladder.
 
 Reads, per <baseline-root>/prompt_<signal>_POS<p>/:
   prompt_baseline_by_k.csv     the (prompt, probe, pool, k) table
@@ -24,9 +30,10 @@ Writes to --out-dir (default outputs/plots/prompt_baseline):
   baseline_by_k_all.csv                   every row of every run
   corr_vs_k.png / corr_vs_k_summary.csv   mean +- SE over runs, per (probe, pool), with
                                           the trained arms and the no-prompt control as
-                                          reference lines (on the SAME runs)
+                                          reference lines (on the SAME runs), and the
+                                          verbal readout as a star at k_max
   corr_vs_k_by_layer.png                  each metric from the probe aimed at it
-  heatmap_prompt_{endo,joint}_<metric>.png
+  heatmap_prompt_{endo,joint,verbal}_<metric>.png
   paired_summary.csv                      trained arm minus baseline arm, within neuron
   ood_ladder_{endogenous,interventional}.{png,csv}
   verbal_summary.csv
@@ -72,7 +79,8 @@ _pretty_arm = cmp.pretty_arm
 def pretty_arm(label: str) -> str:
     if label.startswith("prompt_"):
         return {"prompt_endo": "Prompted (Endo Probe)",
-                "prompt_joint": "Prompted (Joint Probe)"}.get(label, label)
+                "prompt_joint": "Prompted (Joint Probe)",
+                "prompt_verbal": "Prompted (Verbal, No Probe)"}.get(label, label)
     return _pretty_arm(label)
 
 
@@ -147,6 +155,33 @@ def baseline_arm(root: Path, by_k: pd.DataFrame, probe: str, k: int, pool: str) 
     return pd.DataFrame(rows)
 
 
+def verbal_arm(root: Path):
+    """The verbal readout as an arm: per run, corr of the parsed number with the true
+    activation (endogenous) and with the injected value (interventional)."""
+    rows = []
+    for d, spec in _run_dirs(root):
+        f = d / "verbal_report.json"
+        if not f.exists():
+            continue
+        rep = json.loads(f.read_text())
+        rows.append({"group": root.name, "run": d.name, "layer": int(spec["layer"]),
+                     "index": int(spec["index"]), "neuron": f"N{spec['layer']}.{spec['index']}",
+                     "position": int(spec["position"]), "k_max": max(spec["k_values"]),
+                     "endogenous_corr": rep.get("endogenous", {}).get("corr"),
+                     "interventional_corr": rep.get("interventional", {}).get("corr"),
+                     "parse_rate_endogenous": rep.get("endogenous", {}).get("parse_rate"),
+                     "parse_rate_interventional": rep.get("interventional", {}).get("parse_rate")})
+    if not rows:
+        print("[base] no verbal reports; no verbal arm")
+        return None
+    df = pd.DataFrame(rows)
+    n_nan = int(df["endogenous_corr"].isna().sum())
+    if n_nan:
+        print(f"[base] verbal: {n_nan}/{len(df)} runs have undefined endogenous corr "
+              f"(the model wrote one number for every row); excluded from means")
+    return df
+
+
 def load_trained_arms() -> dict:
     frames = {}
     for label, spec in TRAINED_ARMS.items():
@@ -166,10 +201,11 @@ def _mean_se(v):
     return (v.mean(), v.std(ddof=1) / np.sqrt(len(v)) if len(v) > 1 else np.nan, len(v))
 
 
-def plot_corr_vs_k(by_k, trained, out_dir):
+def plot_corr_vs_k(by_k, trained, out_dir, verbal=None):
     """Mean +- SE over runs vs k. Reference lines (trained arms, no-prompt control) are
     averaged over the SAME runs as the curves, so a line is never lifted by cells the
-    baseline does not have."""
+    baseline does not have. The verbal readout is a star at k_max: the number it parses
+    comes from the whole k_max-token continuation."""
     tmpl = by_k[by_k["prompt"] == "templated"]
     runs = set(map(tuple, tmpl[KEY].drop_duplicates().values))
     rows = []
@@ -202,6 +238,14 @@ def plot_corr_vs_k(by_k, trained, out_dir):
         for (label, ref), color in zip(refs.items(), plt.get_cmap("Greys")(np.linspace(0.45, 0.9, 4))):
             ax.axhline(ref[metric], color=color, linestyle=":", linewidth=2.5,
                        label=f"{pretty_arm(label)} (n={ref['n']})")
+        if verbal is not None and len(verbal):
+            v = verbal[[tuple(r) in runs for r in verbal[KEY].values]]
+            col = "endogenous_corr" if metric == "endo_corr" else "interventional_corr"
+            m, se, n = _mean_se(v[col])
+            k_max = int(v["k_max"].max())
+            ax.errorbar([xpos.get(k_max, len(ks) - 1)], [m], yerr=[se], marker="*",
+                        markersize=24, color="k", capsize=4, linestyle="none", zorder=6,
+                        label=f"verbal: written number, no probe (n={n})")
         for probe, g in ctrl.groupby("probe"):
             ax.scatter([xpos[0]], [g[metric].mean()], marker="X", s=220, zorder=5,
                        color=PROBE_COLORS[probe], edgecolor="k",
@@ -321,13 +365,16 @@ def main():
 
     arms = {f"prompt_{p}": baseline_arm(args.baseline_root, by_k, p, args.k, args.pool)
             for p in BASELINE_PROBES if p in set(by_k["probe"])}
+    verbal = verbal_arm(args.baseline_root)
+    if verbal is not None:
+        arms["prompt_verbal"] = verbal
     missing = {label: report_missing(f, label, expected_grid(model="llama321b"), model="llama321b")
                for label, f in arms.items()}
     with open(out_dir / "missing_runs.json", "w") as f:
         json.dump({k: [list(m) for m in v] for k, v in missing.items()}, f, indent=2)
 
     trained = load_trained_arms()
-    plot_corr_vs_k(by_k, trained, out_dir)
+    plot_corr_vs_k(by_k, trained, out_dir, verbal=verbal)
     plot_corr_vs_k_by_layer(by_k, out_dir, pool=args.pool)
     for label, f in arms.items():
         for m in ("interventional_corr", "endogenous_corr"):
@@ -358,7 +405,7 @@ def main():
     if tables:
         pd.concat(tables, ignore_index=True).to_csv(out_dir / "paired_summary.csv", index=False)
 
-    frames = {**trained, **arms}
+    frames = {**trained, **{a: f for a, f in arms.items() if a != "prompt_verbal"}}
     arm_colors = {a: c for a, c in zip(frames, plt.get_cmap("tab10").colors)}
     endo_order = plot_ood_ladder(frames, out_dir, readout="endogenous", arm_colors=arm_colors)
     plot_ood_ladder(frames, out_dir, readout="interventional", arm_colors=arm_colors,
