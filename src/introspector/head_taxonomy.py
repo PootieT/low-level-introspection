@@ -232,3 +232,41 @@ def class_members(classified: pd.DataFrame, classes) -> list[tuple[int, int]]:
         classes = [classes]
     sub = classified[classified["head_class"].isin(classes)]
     return [(int(L), int(h)) for L, h in zip(sub["layer"], sub["head"])]
+
+
+# ======================================================================
+# Gating shape of an attention-vs-injection curve
+# ======================================================================
+GATING_SHAPES = ("not gating", "1-way", "2-way")
+
+
+def gating_shape(v, attn, tau: float = DEFAULT_STATIC_TAU) -> dict:
+    """
+    Classify how a head's attention to t responds to the injected value, from its
+    (v, attention) curve over one regime's grid (normally x10, where the injection is
+    anomalous).
+
+    Measured as RISES relative to the grid point nearest the curve's centre (the
+    neuron's own mean for a global grid), separately on each side:
+        rise_lo = max attention at v < centre  - attention at centre
+        rise_hi = max attention at v > centre  - attention at centre
+    and a side GATES when its rise is >= tau:
+        not gating   neither side      (flat: attention does not respond)
+        1-way        one side          (L-shaped / sigmoid: switches on for one sign)
+        2-way        both sides        (U-shaped: switches on for any large |v|)
+
+    Rises only, as in attn_t_delta: a monotonic sigmoid sits partway up at the centre,
+    so it DROPS on one side and rises on the other -- counting any change would call
+    it 2-way. The default tau is the taxonomy's static threshold, i.e. "not gating"
+    means the same thing as "static" there.
+    """
+    v, attn = np.asarray(v, float), np.asarray(attn, float)
+    order = np.argsort(v)
+    v, attn = v[order], attn[order]
+    ci = int(np.argmin(np.abs(v - np.median(v))))
+    a_c = attn[ci]
+    rise_lo = float((attn[:ci] - a_c).max()) if ci > 0 else 0.0
+    rise_hi = float((attn[ci + 1:] - a_c).max()) if ci < len(v) - 1 else 0.0
+    n_sides = int(rise_lo >= tau) + int(rise_hi >= tau)
+    return {"attn_at_centre": float(a_c), "rise_lo": rise_lo, "rise_hi": rise_hi,
+            "shape": GATING_SHAPES[n_sides]}

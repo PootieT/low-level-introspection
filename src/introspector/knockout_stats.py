@@ -315,3 +315,31 @@ def agreement_from_tables(ind_df, curves_df, mass_qs=(0.5, 0.8, 0.95), ks=(5, 10
         rand = sorted({o for o, _ in area if o.startswith("random")})
         out.update(transfer_ratios(area, arms, rand))
     return out
+
+
+# ======================================================================
+# Which arms' top-k a head belongs to
+# ======================================================================
+TOP_CATEGORIES = ("top endogenous only", "top both", "top interventional only")
+
+
+def top_k_arms(ko_df, k: int) -> dict:
+    """{(layer, head): [arms]} for every head in at least one arm's top k by single-
+    knockout drop (rank 1 = largest drop, so heads whose knockout helps never enter)."""
+    out = {}
+    for arm, g in ko_df.groupby("arm", sort=False):
+        for r in g.nsmallest(k, "rank").itertuples():
+            out.setdefault((int(r.layer), int(r.head)), []).append(arm)
+    return out
+
+
+def top_category(arms) -> str:
+    """'top endogenous only' / 'top both' / 'top interventional only' / 'other'."""
+    s = set(arms or ())
+    if {"endogenous", "x1"} <= s:
+        return "top both"
+    if "endogenous" in s:
+        return "top endogenous only"
+    if "x1" in s:
+        return "top interventional only"
+    return "other"

@@ -102,6 +102,7 @@ from src.introspector.regimes import (
     DEFAULT_REGIMES, DEFAULT_LOCAL_DELTA_SIGMA, parse_regimes, zero_offset_index,
     identity_check, power_warning)
 from src.introspector.training.model import InterventionHook
+from src.introspector.knockout_stats import top_k_arms
 from trace_introspection_circuit import (
     readout_scale, contribution, linfit_slope_r2, capture_live_centres, effective_weight)
 
@@ -1325,15 +1326,10 @@ def select_knockout_heads(ko_df: pd.DataFrame, top_k: int):
     knocked out alone and its rank among the run's heads -- e.g.
     'top both; drop Endo 0.351 (#1), Interv 0.031 (#3)', so a head picked for one arm
     shows how much the other arm cares about it too."""
-    arms_of = {}
-    best = {}
-    for arm, g in ko_df.groupby("arm", sort=False):
-        for r in g.nsmallest(top_k, "rank").itertuples():
-            k = (int(r.layer), int(r.head))
-            arms_of.setdefault(k, []).append(arm)
-            best[k] = min(best.get(k, np.inf), int(r.rank))
+    arms_of = top_k_arms(ko_df, top_k)
     stats = {(int(r.layer), int(r.head), r.arm): (-float(r.delta), int(r.rank))
              for r in ko_df.itertuples()}
+    best = {k: min(stats[(*k, a)][1] for a in arms) for k, arms in arms_of.items()}
     arm_order = list(dict.fromkeys(ko_df["arm"]))
     out = []
     for k in sorted(arms_of, key=lambda k: (best[k], k)):
