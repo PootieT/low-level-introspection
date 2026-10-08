@@ -282,9 +282,9 @@ def paired_stats(merged, metric, label_a, label_b, min_activation_std=1e-6):
             "frac_a_higher": float((d > 0).mean())}
 
 
-def plot_ood_ladder(frames: dict, out_dir, readout="endogenous", common_only=True,
-                    arm_colors=None, corpus_order=None):
-    """Every arm across the corpus ladder, mean ± SE over neurons.
+def ood_ladder_table(frames: dict, readout="endogenous", common_only=True):
+    """Per (corpus, arm): mean ± SE over neurons of one readout across the corpus ladder,
+    or None if there is nothing to plot.
 
     common_only restricts to runs present in ALL arms, so a line is not lifted by a
     cell another arm never finished. The dropped count is printed."""
@@ -314,40 +314,60 @@ def plot_ood_ladder(frames: dict, out_dir, readout="endogenous", common_only=Tru
     if df.empty:
         print(f"[cmp] ladder ({readout}): no data; skipping")
         return None
-    if corpus_order is not None:
-        # reuse a shared order (from the endogenous plot) so both readouts line up;
-        # keep only corpora present here, appending any extras by their own performance.
-        order = [c for c in corpus_order if c in set(df["corpus"])]
-        extra = (df[(~df["corpus"].isin(order)) & (df["corpus"] != "in-domain")]
-                 .groupby("corpus")["mean"].mean().sort_values(ascending=False).index.tolist())
-        order = order + extra
-    else:
-        # OOD corpora ordered by DECREASING mean performance (averaged over arms), with
-        # in-domain pinned leftmost as the reference.
-        ood_order = (df[df["corpus"] != "in-domain"].groupby("corpus")["mean"].mean()
-                     .sort_values(ascending=False).index.tolist())
-        order = ["in-domain"] + ood_order
-    fig, ax = plt.subplots(figsize=(13, 8))
-    for arm, sub in df.groupby("arm"):
-        sub = sub.set_index("corpus").reindex(order).reset_index()
-        # arm_colors keeps each arm the same color in BOTH the endogenous and
-        # interventional figures, so the two eval settings are read off one legend.
-        color = arm_colors.get(arm) if arm_colors else None
-        ax.errorbar(np.arange(len(order)), sub["mean"], yerr=sub["se"], marker="o",
-                    markersize=10, linewidth=2.5, capsize=4, color=color,
-                    label=f"{pretty_arm(arm)} (n={int(sub['n'].max())})")
-    ax.set_xticks(np.arange(len(order)))
-    ax.set_xticklabels([pretty_corpus(c) for c in order], rotation=20, fontsize=26)
-    ax.tick_params(axis="y", labelsize=26)
-    ax.set_ylabel(f"{readout.capitalize()} Correlation", fontsize=32); ax.set_ylim(-0.1, 1.05)
-    ax.axhline(0, color="grey", ls="--", lw=1); ax.grid(alpha=0.25)
-    ax.legend(fontsize=22)
-    # ladder error bars are SE (yerr=se), so the title says SE, not Std
-    ax.set_title(f"OOD {readout.capitalize()} Correlation (Mean ± SE)", fontsize=30)
+    return df
+
+
+def plot_ood_ladders(frames: dict, out_dir, arm_colors=None, common_only=True):
+    """Both readouts across the corpus ladder in ONE figure: endogenous left,
+    interventional right, shared y. Error bars are mean ± SE over neurons.
+
+    The x-order is set by the endogenous panel -- in-domain pinned leftmost, then OOD
+    corpora by decreasing endogenous performance (averaged over arms) -- and reused for
+    the interventional panel so the two line up column-for-column."""
+    tables = {}
+    for readout in ("endogenous", "interventional"):
+        t = ood_ladder_table(frames, readout, common_only)
+        if t is not None:
+            tables[readout] = t
+            t.to_csv(Path(out_dir) / f"ood_ladder_{readout}.csv", index=False)
+    if not tables:
+        return None
+    ref = tables.get("endogenous", next(iter(tables.values())))
+    order = ["in-domain"] + (ref[ref["corpus"] != "in-domain"].groupby("corpus")["mean"].mean()
+                             .sort_values(ascending=False).index.tolist())
+    # any corpus present only in the other readout goes last, by its own performance
+    for t in tables.values():
+        extra = (t[~t["corpus"].isin(order)].groupby("corpus")["mean"].mean()
+                 .sort_values(ascending=False).index.tolist())
+        order += extra
+
+    fig, axes = plt.subplots(1, 2, figsize=(24, 8.5), sharey=True)
+    for ax, readout in zip(axes, ("endogenous", "interventional")):
+        ax.set_title(f"OOD {readout.capitalize()}", fontsize=30)
+        ax.set_xticks(np.arange(len(order)))
+        ax.set_xticklabels([pretty_corpus(c) for c in order], rotation=20, fontsize=26)
+        ax.tick_params(axis="y", labelsize=26)
+        ax.axhline(0, color="grey", ls="--", lw=1); ax.grid(alpha=0.25)
+        df = tables.get(readout)
+        if df is None:
+            continue
+        for arm, sub in df.groupby("arm"):
+            sub = sub.set_index("corpus").reindex(order).reset_index()
+            # arm_colors keeps each arm one colour in both panels, so one legend serves
+            color = arm_colors.get(arm) if arm_colors else None
+            ax.errorbar(np.arange(len(order)), sub["mean"], yerr=sub["se"], marker="o",
+                        markersize=10, linewidth=2.5, capsize=4, color=color,
+                        label=f"{pretty_arm(arm)} (n={int(sub['n'].max())})")
+    axes[0].set_ylabel("Correlation", fontsize=32)
+    axes[0].set_ylim(-0.1, 1.05)
+    # one legend, on the right panel (or the left if the right has nothing)
+    for ax in axes[::-1]:
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=22)
+            break
     fig.tight_layout()
-    path = Path(out_dir) / f"ood_ladder_{readout}.png"
-    fig.savefig(path, dpi=150); plt.close(fig)
-    df.to_csv(Path(out_dir) / f"ood_ladder_{readout}.csv", index=False)
+    path = Path(out_dir) / "ood_ladder.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"[cmp] wrote {path}")
     return order
 
@@ -430,7 +450,7 @@ def plot_delta_heatmap(merged, metric, label_a, label_b, out_dir, lim=None):
     if lim is None:
         lim = float(np.nanmax(np.abs(mean.to_numpy()))) or 1.0
     # cells are annotated mean ± std (std over the cell's neurons, aggfunc="std")
-    title = f"Neuron Paired Diff. {pretty_metric(metric)}\n(Mean ± Std over Neurons)"
+    title = f"Neuron Paired Diff. {pretty_metric(metric)}"
     path = Path(out_dir) / f"delta_{metric}_{label_a}_vs_{label_b}.png"
     draw_layer_position_heatmap(mean, std, title, path, vmin=-lim, vmax=lim,
                                 cmap="RdBu_r", center=0)
@@ -451,7 +471,7 @@ def plot_arm_heatmap(df, metric, label, out_dir):
     # correlations get the SFT maps' fixed [0, 1] viridis scale, which also makes the
     # endogenous and interventional maps share one colorbar
     vmin, vmax = (0, 1) if metric.endswith("corr") else (None, None)
-    title = f"Neuron {pretty_metric(metric)}\n(Mean ± Std over Neurons)"
+    title = f"Neuron {pretty_metric(metric)}"
     path = Path(out_dir) / f"heatmap_{label}_{metric}.png"
     draw_layer_position_heatmap(mean, std, title, path, vmin=vmin, vmax=vmax)
     print(f"[cmp] wrote {path}")
@@ -523,13 +543,9 @@ def main(arms: dict, out_dir, pairs=None, model=None):
             continue
         for m in ("interventional_corr", "endogenous_corr"):
             plot_arm_heatmap(f, m, label, out_dir)
-    # one color per arm, shared by both readouts so their legends line up
+    # one color per arm, shared by both readout panels so one legend serves both
     arm_colors = {arm: c for arm, c in zip(frames, plt.get_cmap("tab10").colors)}
-    # order corpora by endogenous performance, then reuse that x-order for the
-    # interventional ladder so the two figures line up column-for-column.
-    endo_order = plot_ood_ladder(frames, out_dir, readout="endogenous", arm_colors=arm_colors)
-    plot_ood_ladder(frames, out_dir, readout="interventional", arm_colors=arm_colors,
-                    corpus_order=endo_order)
+    plot_ood_ladders(frames, out_dir, arm_colors=arm_colors)
     return frames, tables
 
 

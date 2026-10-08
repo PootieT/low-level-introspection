@@ -445,8 +445,8 @@ def draw_layer_position_heatmap(mean_df: pd.DataFrame, spread_df: pd.DataFrame, 
 
 
 def plot_endogenous_heatmaps(df: pd.DataFrame, out_dir: str):
-    """One heatmap per (eval, metric): layer x position, annotated mean±SE over the
-    cell's neurons."""
+    """One heatmap per (eval, metric): layer x position, annotated mean ± std over the
+    cell's neurons (std, not SE -- matching the SFT-vs-joint heatmaps)."""
     os.makedirs(out_dir, exist_ok=True)
     summary = summarize_endogenous_sweep(df)
     summary.to_csv(f"{out_dir}/sweep_summary.csv", index=False)
@@ -463,13 +463,12 @@ def plot_endogenous_heatmaps(df: pd.DataFrame, out_dir: str):
     quantity = {"corr": "Correlation", "l2_dist": "L2"}
     for (eval_name, metric), sub in summary.groupby(["eval_type", "metric"]):
         mean_df = sub.pivot(index="layer", columns="position", values="mean")
-        se_df = sub.pivot(index="layer", columns="position", values="se")
+        # ± is the std across the cell's neurons (summarize_endogenous_sweep, ddof=1)
+        std_df = sub.pivot(index="layer", columns="position", values="std")
         vmin, vmax = scale[metric]
-        # these heatmaps annotate ± SE (se_df), so the title says SE, not Std
-        title = (f"Neuron {eval_name.capitalize()} {quantity.get(metric, metric)}\n"
-                 f"(Mean ± SE over Neurons)")
+        title = f"Neuron {eval_name.capitalize()} {quantity.get(metric, metric)}"
         path = f"{out_dir}/heatmap_{eval_name}_{metric}.png"
-        draw_layer_position_heatmap(mean_df, se_df, title, path, vmin=vmin, vmax=vmax)
+        draw_layer_position_heatmap(mean_df, std_df, title, path, vmin=vmin, vmax=vmax)
         print(f"[endo] wrote {path}")
 
 

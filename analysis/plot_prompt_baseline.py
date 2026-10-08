@@ -58,7 +58,7 @@ import matplotlib.pyplot as plt
 import compare_sft_vs_joint as cmp     # also applies the shared poster rcParams
 from compare_sft_vs_joint import (
     KEY, ROOT, expected_grid, load_group, pair, paired_stats, plot_arm_heatmap,
-    plot_delta_heatmap, plot_ood_ladder, report_missing,
+    plot_delta_heatmap, plot_ood_ladders, report_missing,
 )
 
 TRAINED_ARMS = {
@@ -407,9 +407,7 @@ def main():
 
     frames = {**trained, **{a: f for a, f in arms.items() if a != "prompt_verbal"}}
     arm_colors = {a: c for a, c in zip(frames, plt.get_cmap("tab10").colors)}
-    endo_order = plot_ood_ladder(frames, out_dir, readout="endogenous", arm_colors=arm_colors)
-    plot_ood_ladder(frames, out_dir, readout="interventional", arm_colors=arm_colors,
-                    corpus_order=endo_order)
+    plot_ood_ladders(frames, out_dir, arm_colors=arm_colors)
 
     verbal_summary(args.baseline_root, out_dir)
     plot_learning_curve(args.baseline_root, args.lc_root, out_dir)
