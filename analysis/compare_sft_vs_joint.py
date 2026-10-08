@@ -341,12 +341,16 @@ def plot_ood_ladders(frames: dict, out_dir, arm_colors=None, common_only=True):
                  .sort_values(ascending=False).index.tolist())
         order += extra
 
-    fig, axes = plt.subplots(1, 2, figsize=(24, 8.5), sharey=True)
+    # font sizes match the length/layer/neuron generalization figures. Tick labels are
+    # unrotated two-liners ("In-Domain\n(C4)"): rotated ones hang sideways into the gap
+    # between the panels and force it wide.
+    fig, axes = plt.subplots(1, 2, figsize=(18, 6.5), sharey=True)
+    xticklabels = [pretty_corpus(c).replace(" (", "\n(") for c in order]
     for ax, readout in zip(axes, ("endogenous", "interventional")):
-        ax.set_title(f"OOD {readout.capitalize()}", fontsize=30)
+        ax.set_title(f"OOD {readout.capitalize()}", fontsize=28)
         ax.set_xticks(np.arange(len(order)))
-        ax.set_xticklabels([pretty_corpus(c) for c in order], rotation=20, fontsize=26)
-        ax.tick_params(axis="y", labelsize=26)
+        ax.set_xticklabels(xticklabels, fontsize=22)
+        ax.tick_params(axis="y", labelsize=22)
         ax.axhline(0, color="grey", ls="--", lw=1); ax.grid(alpha=0.25)
         df = tables.get(readout)
         if df is None:
@@ -357,14 +361,17 @@ def plot_ood_ladders(frames: dict, out_dir, arm_colors=None, common_only=True):
             color = arm_colors.get(arm) if arm_colors else None
             ax.errorbar(np.arange(len(order)), sub["mean"], yerr=sub["se"], marker="o",
                         markersize=10, linewidth=2.5, capsize=4, color=color,
-                        label=f"{pretty_arm(arm)} (n={int(sub['n'].max())})")
-    axes[0].set_ylabel("Correlation", fontsize=32)
+                        label=pretty_arm(arm))
+            # n kept out of the legend (identical across arms under common_only); report it
+            print(f"[cmp] ladder ({readout}) {pretty_arm(arm)}: n={int(sub['n'].max())} runs")
+    axes[0].set_ylabel("Correlation", fontsize=26)
     axes[0].set_ylim(-0.1, 1.05)
-    # one legend, on the right panel (or the left if the right has nothing)
-    for ax in axes[::-1]:
-        if ax.get_legend_handles_labels()[0]:
-            ax.legend(fontsize=22)
-            break
+    # one legend, bottom-left of the endogenous panel (the right panel's handles if the
+    # left one has no data -- colours are shared, so either panel's handles fit)
+    handles, labels = next((ax.get_legend_handles_labels() for ax in axes
+                            if ax.get_legend_handles_labels()[0]), ([], []))
+    if handles:
+        axes[0].legend(handles, labels, loc="lower left", fontsize=17, framealpha=0.9)
     fig.tight_layout()
     path = Path(out_dir) / "ood_ladder.png"
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
@@ -389,9 +396,9 @@ def pretty_arm(label: str) -> str:
 
 
 CORPUS_LABELS = {
-    "in-domain": "In-Domain (C4)",
-    "wikipedia": "Wikipedia",
-    "shuffled": "Shuffled (C4)",
+    "in-domain": "C4 (ID)",
+    "wikipedia": "Wiki",
+    "shuffled": "C4 (Shuf.)",
     "c4_zh": "C4 (Chinese)",
     "c4_bn": "C4 (Bengali)",
 }
