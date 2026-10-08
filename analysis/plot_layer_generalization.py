@@ -49,6 +49,9 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import seaborn as sns
 
+sys.path.insert(0, str(Path(__file__).parent))
+from plot_neuron_generalization import series_style_handles  # noqa: E402  (same legend)
+
 plt.rcParams.update({
     "font.size": 14, "axes.titlesize": 16, "axes.labelsize": 15,
     "xtick.labelsize": 12, "ytick.labelsize": 12,
@@ -182,9 +185,9 @@ def plot_unseen_by_n(ps: pd.DataFrame, out_dir):
         rpl = int(more["rows_per_locale"].iloc[0]) // 1000
         m = pd.concat([m, agg(more, f"{rpl}k per layer")], ignore_index=True)
     m.to_csv(Path(out_dir) / "unseen_by_n.csv", index=False)
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.4), sharey=True)
     colours = {"300k total (scaling)": "#1f77b4"}
-    for ax, et in zip(axes, EVAL_TYPES):
+    for ax, et in zip(axes, EVAL_TYPES):                   # endogenous first
         for series in m["series"].unique():
             colour = colours.get(series, "#d62728")
             for lbl in ("seen", "unseen"):
@@ -193,16 +196,19 @@ def plot_unseen_by_n(ps: pd.DataFrame, out_dir):
                 if q.empty:
                     continue
                 ax.errorbar(q["n_layers"], q["corr_macro"], yerr=q["corr_std"].fillna(0),
-                            ms=7, capsize=3, lw=1.8, color=colour, **STYLE[lbl],
-                            label=f"{series}, {lbl}")
+                            ms=9, capsize=3, lw=1.8, color=colour, **STYLE[lbl])
         ax.set_xscale("log", base=2)
         ax.axhline(0, color="k", lw=0.9, alpha=0.4)
-        ax.set_xlabel("layers trained (300k rows total)")
-        ax.set_title(et)
-        ax.legend(fontsize=10)
-    axes[0].set_ylabel("macro corr over layers")
+        ax.set_xlabel("Layers Trained", fontsize=26)
+        ax.set_title(et.capitalize(), fontsize=28)
+        ax.tick_params(labelsize=22)
+    axes[0].set_ylabel("Macro Correlation\nover Layers", fontsize=26)
+    # compact legend, in the right panel only: colour = data budget, style = seen/unseen
+    handles = series_style_handles(
+        [(series, colours.get(series, "#d62728")) for series in m["series"].unique()], STYLE)
+    axes[-1].legend(handles=handles, ncol=2, fontsize=16, loc="best", framealpha=0.9)
     fig.tight_layout()
-    fig.savefig(Path(out_dir) / "unseen_by_n.png", dpi=150)
+    fig.savefig(Path(out_dir) / "unseen_by_n.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
     return m
 

@@ -203,9 +203,19 @@ def _draw(ax, s, color, label, train_len, size=34):
                zorder=3)
 
 
-def _single_legend(axes):
+def _dot_handle(color, label):
+    """Legend entry as line + solid dot. The curves' labelled artist is an errorbar
+    with no marker (the dots are separate scatters), whose own legend glyph is a bare
+    error bar that reads as a cross."""
+    return plt.Line2D([], [], color=color, marker="o", ms=9, lw=1.8, label=label)
+
+
+def _single_legend(axes, handles=None):
     """One legend, on the right-hand panel (falling back to the first panel that has
     labelled lines), instead of a copy on every panel."""
+    if handles:
+        list(axes)[-1].legend(handles=handles, fontsize=16)
+        return
     for ax in list(axes)[::-1]:
         if ax.get_legend_handles_labels()[0]:
             ax.legend(fontsize=16)
@@ -331,20 +341,21 @@ def plot_ceiling(b: pd.DataFrame, out_dir):
     if d.empty:
         return
     fig, axes = plt.subplots(1, 2, figsize=(13, 5.4), sharey=True)
+    # one colour per training length across BOTH panels, so the single legend fits both
+    tls_all = sorted(d["train_len"].unique())
+    colors = dict(zip(tls_all, sns.color_palette("mako", len(tls_all))))
     for ax, et in zip(axes, ("endogenous", "interventional")):   # endogenous first
         sub = d[d["eval_type"] == et]
-        tls = sorted(sub["train_len"].unique())
-        colors = dict(zip(tls, sns.color_palette("mako", len(tls))))
-        for tl in tls:
+        for tl in sorted(sub["train_len"].unique()):
             s = _agg(sub[sub["train_len"] == tl], ["max_distance"]).sort_values("max_distance")
             _draw(ax, s, colors[tl], f"Train Len {tl}", tl, size=70)
         ax.set_xscale("log", base=2)
         ax.axhline(0, color="k", lw=0.8, alpha=0.4)
-        ax.set_title(et.capitalize(), fontsize=25)
-        ax.set_xlabel("Distance from Readout", fontsize=23)
-        ax.tick_params(labelsize=19)
-    axes[0].set_ylabel("Correlation", fontsize=23)
-    _single_legend(axes)
+        ax.set_title(et.capitalize(), fontsize=28)
+        ax.set_xlabel("Distance from Readout", fontsize=26)
+        ax.tick_params(labelsize=22)
+    axes[0].set_ylabel("Correlation", fontsize=26)
+    _single_legend(axes, [_dot_handle(colors[tl], f"Train Len {tl}") for tl in tls_all])
     fig.tight_layout()
     fig.savefig(Path(out_dir) / "ceiling_diagonal.png", dpi=150)
     plt.close(fig)
@@ -545,24 +556,31 @@ def plot_relative_generalization(pooled: pd.DataFrame, out_dir):
     allv = pd.concat(tables.values())
     lo = max(-110, float(np.nanmin(allv["mean_pct"] - allv["std_pct"].fillna(0))) - 5)
     hi = max(15, float(np.nanpercentile(allv["mean_pct"], 95)) + 10)
+    # one colour per training length across BOTH panels, so the single legend fits both
+    tls_all = sorted(allv["train_len"].unique())
+    colors = dict(zip(tls_all, sns.color_palette("mako", len(tls_all))))
     for ax, et in zip(axes, ("endogenous", "interventional")):   # endogenous first
         g = tables.get(et)
         ax.axhline(0, color="k", lw=0.9, alpha=0.5)
         ax.set_xscale("log", base=2)
-        ax.set_xlabel("Eval Length / Train Length", fontsize=23)
-        ax.set_title(et.capitalize(), fontsize=25)
-        ax.tick_params(labelsize=19)
+        ax.set_xlabel("Eval Length / Train Length", fontsize=26)
+        ax.set_title(et.capitalize(), fontsize=28)
+        ax.tick_params(labelsize=22)
         if g is None:
             continue
-        tls = sorted(g["train_len"].unique())
-        colors = dict(zip(tls, sns.color_palette("mako", len(tls))))
-        for tl in tls:
+        for tl in sorted(g["train_len"].unique()):
             q = g[g["train_len"] == tl].sort_values("ratio")
+            c = colors[tl]
             ax.errorbar(q["ratio"], q["mean_pct"], yerr=q["std_pct"].fillna(0),
-                        marker="o", ms=9, capsize=3, lw=1.8, color=colors[tl],
-                        label=f"Train Len {tl}")
-    axes[0].set_ylabel("Relative Corr. Drop (%)", fontsize=23)   # shared y: left only
-    _single_legend(axes)
+                        marker="", capsize=3, lw=1.8, color=c)
+            # solid = in-distribution (eval at the training length), hollow = longer than
+            # anything seen in training -- the same encoding as the ceiling plot
+            ind = q["ratio"] == 1
+            ax.plot(q.loc[ind, "ratio"], q.loc[ind, "mean_pct"], "o", ms=9, color=c, zorder=3)
+            ax.plot(q.loc[~ind, "ratio"], q.loc[~ind, "mean_pct"], "o", ms=9,
+                    mfc="white", mec=c, mew=1.8, zorder=3)
+    axes[0].set_ylabel("Relative Corr. Drop (%)", fontsize=26)   # shared y: left only
+    _single_legend(axes, [_dot_handle(colors[tl], f"Train Len {tl}") for tl in tls_all])
     # one shared scale so the two panels are directly comparable; points outside are
     # still in the CSVs and are counted here rather than dropped
     outside = int(((allv["mean_pct"] < lo) | (allv["mean_pct"] > hi)).sum())

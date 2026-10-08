@@ -67,6 +67,19 @@ EVAL_TYPES = ("endogenous", "interventional")
 # in a legend where a cross or a dash pattern does not.
 STYLE = {"seen":   dict(marker="o", ls="-"),
          "unseen": dict(marker="o", ls=":", mfc="none", mew=1.8)}
+
+
+def series_style_handles(series_colours, style=STYLE):
+    """Compact legend: one entry per data series (colour) plus Seen / Unseen (line
+    style + filled/hollow marker), instead of every series x split combination -- 4
+    short entries fit inside a panel where 4 long ones do not. 'k' series names become
+    'K' and the '(scaling)' tag is dropped."""
+    handles = [plt.Line2D([], [], color=c, marker="o", ms=9, lw=1.8,
+                          label=s.replace(" (scaling)", "").title())
+               for s, c in series_colours]
+    handles += [plt.Line2D([], [], color="k", ms=9, lw=1.8, label=lbl.capitalize(),
+                           **style[lbl]) for lbl in ("seen", "unseen")]
+    return handles
 # "single", not "null": pandas reads the literal string "null" back from any CSV as NaN
 LEGACY_GROUP = {"A": "scaling", "B": "single"}
 
@@ -499,25 +512,28 @@ def plot_data30k(ps: pd.DataFrame, out_dir, rpn: int = 30_000):
     m = pd.concat([a, b], ignore_index=True)
     m.to_csv(Path(out_dir) / "data30k_vs_scaling.csv", index=False)
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
-    for ax, et in zip(axes, EVAL_TYPES):
-        for series, colour in (("300k total (scaling)", "#1f77b4"), (f"{rpn // 1000}k per neuron", "#d62728")):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.4), sharey=True)
+    series_colours = (("300k total (scaling)", "#1f77b4"), (f"{rpn // 1000}k per neuron", "#d62728"))
+    for ax, et in zip(axes, EVAL_TYPES):                   # endogenous first
+        for series, colour in series_colours:
             for lbl in ("seen", "unseen"):
                 q = m[(m["eval_type"] == et) & (m["series"] == series) &
                       (m["arm_label"] == lbl)].sort_values("n_neurons")
                 if q.empty:
                     continue
                 ax.errorbar(q["n_neurons"], q["corr_macro"], yerr=q["corr_std"].fillna(0),
-                            ms=7, capsize=3, lw=1.8, color=colour, **STYLE[lbl],
-                            label=f"{series}, {lbl}")
+                            ms=9, capsize=3, lw=1.8, color=colour, **STYLE[lbl])
         ax.set_xscale("log", base=10)
         ax.axhline(0, color="k", lw=0.9, alpha=0.4)
-        ax.set_xlabel("neurons trained")
-        ax.set_title(et)
-        ax.legend(fontsize=8)
-    axes[0].set_ylabel("macro corr over neurons")
+        ax.set_xlabel("Neurons Trained", fontsize=26)
+        ax.set_title(et.capitalize(), fontsize=28)
+        ax.tick_params(labelsize=22)
+    axes[0].set_ylabel("Macro Correlation\nover Neurons", fontsize=26)
+    # compact legend, in the right panel only: colour = data budget, style = seen/unseen
+    axes[-1].legend(handles=series_style_handles(series_colours, STYLE), ncol=2,
+                    fontsize=16, loc="best", framealpha=0.9)
     fig.tight_layout()
-    fig.savefig(Path(out_dir) / "data30k_vs_scaling.png", dpi=150)
+    fig.savefig(Path(out_dir) / "data30k_vs_scaling.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
     return m
 
