@@ -181,14 +181,14 @@ def _agg(b: pd.DataFrame, by: list[str]) -> pd.DataFrame:
     return out
 
 
-def _draw(ax, s, color, label, train_len):
-    """One curve, with points BEYOND THE TRAINING LENGTH drawn as crosses.
+def _draw(ax, s, color, label, train_len, size=34):
+    """One curve, with points BEYOND THE TRAINING LENGTH drawn as hollow circles.
 
     Three regimes, and only two of them were previously distinguishable:
       o  within the training window          -- trained reach
       o  beyond the window, <= train_len     -- unseen reach, but sequences that long
                                                 were seen during training
-      X  beyond train_len                    -- unseen reach AND unseen sequence length
+      O  (hollow) beyond train_len           -- unseen reach AND unseen sequence length
     The middle case turns out to be the hard one, so collapsing it with the third (as a
     single marker does) hides the actual result.
     """
@@ -196,9 +196,20 @@ def _draw(ax, s, color, label, train_len):
                 marker="", capsize=3, lw=1.8, color=color, label=label)
     within = s["max_distance"] <= train_len
     ax.scatter(s.loc[within, "max_distance"], s.loc[within, "mean"],
-               marker="o", s=34, color=color, zorder=3)
+               marker="o", s=size, color=color, zorder=3)
+    # white fill + coloured edge reads as hollow while hiding the line behind it
     ax.scatter(s.loc[~within, "max_distance"], s.loc[~within, "mean"],
-               marker="X", s=80, color=color, zorder=3, linewidths=0.6, edgecolors="white")
+               marker="o", s=size, facecolors="white", edgecolors=color, linewidths=1.8,
+               zorder=3)
+
+
+def _single_legend(axes):
+    """One legend, on the right-hand panel (falling back to the first panel that has
+    labelled lines), instead of a copy on every panel."""
+    for ax in list(axes)[::-1]:
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=16)
+            return
 
 
 def plot_reach_curves(b: pd.DataFrame, out_dir, eval_type="interventional"):
@@ -319,20 +330,21 @@ def plot_ceiling(b: pd.DataFrame, out_dir):
     d = b[b["window"] == b["train_len"]]
     if d.empty:
         return
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4), sharey=True)
-    for ax, et in zip(axes, ("endogenous", "interventional")):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.4), sharey=True)
+    for ax, et in zip(axes, ("endogenous", "interventional")):   # endogenous first
         sub = d[d["eval_type"] == et]
         tls = sorted(sub["train_len"].unique())
         colors = dict(zip(tls, sns.color_palette("mako", len(tls))))
         for tl in tls:
             s = _agg(sub[sub["train_len"] == tl], ["max_distance"]).sort_values("max_distance")
-            _draw(ax, s, colors[tl], f"len {tl}", tl)
+            _draw(ax, s, colors[tl], f"Train Len {tl}", tl, size=70)
         ax.set_xscale("log", base=2)
         ax.axhline(0, color="k", lw=0.8, alpha=0.4)
-        ax.set_title(et)
-        ax.set_xlabel("distance from readout")
-        ax.legend(fontsize=10)
-    axes[0].set_ylabel("corr")
+        ax.set_title(et.capitalize(), fontsize=22)
+        ax.set_xlabel("Distance from Readout", fontsize=20)
+        ax.tick_params(labelsize=16)
+    axes[0].set_ylabel("Correlation", fontsize=20)
+    _single_legend(axes)
     fig.tight_layout()
     fig.savefig(Path(out_dir) / "ceiling_diagonal.png", dpi=150)
     plt.close(fig)
@@ -529,18 +541,17 @@ def plot_relative_generalization(pooled: pd.DataFrame, out_dir):
     if not tables:
         return None
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.4), sharey=True)
     allv = pd.concat(tables.values())
     lo = max(-110, float(np.nanmin(allv["mean_pct"] - allv["std_pct"].fillna(0))) - 5)
     hi = max(15, float(np.nanpercentile(allv["mean_pct"], 95)) + 10)
-    short = {"endogenous": "endogenous", "interventional": "interventional"}
-    for ax, et in zip(axes, ("endogenous", "interventional")):
+    for ax, et in zip(axes, ("endogenous", "interventional")):   # endogenous first
         g = tables.get(et)
         ax.axhline(0, color="k", lw=0.9, alpha=0.5)
         ax.set_xscale("log", base=2)
-        ax.set_xlabel("eval length / training length")
-        ax.set_ylabel(f"relative {short[et]} eval (%)")
-        ax.set_title(et)
+        ax.set_xlabel("Eval Length / Train Length", fontsize=20)
+        ax.set_title(et.capitalize(), fontsize=22)
+        ax.tick_params(labelsize=16)
         if g is None:
             continue
         tls = sorted(g["train_len"].unique())
@@ -548,9 +559,10 @@ def plot_relative_generalization(pooled: pd.DataFrame, out_dir):
         for tl in tls:
             q = g[g["train_len"] == tl].sort_values("ratio")
             ax.errorbar(q["ratio"], q["mean_pct"], yerr=q["std_pct"].fillna(0),
-                        marker="o", ms=6, capsize=3, lw=1.8, color=colors[tl],
-                        label=f"train len {tl}")
-        ax.legend(fontsize=10)
+                        marker="o", ms=9, capsize=3, lw=1.8, color=colors[tl],
+                        label=f"Train Len {tl}")
+    axes[0].set_ylabel("Relative Corr. Drop (%)", fontsize=20)   # shared y: left only
+    _single_legend(axes)
     # one shared scale so the two panels are directly comparable; points outside are
     # still in the CSVs and are counted here rather than dropped
     outside = int(((allv["mean_pct"] < lo) | (allv["mean_pct"] > hi)).sum())
