@@ -340,10 +340,10 @@ def plot_ceiling(b: pd.DataFrame, out_dir):
             _draw(ax, s, colors[tl], f"Train Len {tl}", tl, size=70)
         ax.set_xscale("log", base=2)
         ax.axhline(0, color="k", lw=0.8, alpha=0.4)
-        ax.set_title(et.capitalize(), fontsize=22)
-        ax.set_xlabel("Distance from Readout", fontsize=20)
-        ax.tick_params(labelsize=16)
-    axes[0].set_ylabel("Correlation", fontsize=20)
+        ax.set_title(et.capitalize(), fontsize=25)
+        ax.set_xlabel("Distance from Readout", fontsize=23)
+        ax.tick_params(labelsize=19)
+    axes[0].set_ylabel("Correlation", fontsize=23)
     _single_legend(axes)
     fig.tight_layout()
     fig.savefig(Path(out_dir) / "ceiling_diagonal.png", dpi=150)
@@ -549,9 +549,9 @@ def plot_relative_generalization(pooled: pd.DataFrame, out_dir):
         g = tables.get(et)
         ax.axhline(0, color="k", lw=0.9, alpha=0.5)
         ax.set_xscale("log", base=2)
-        ax.set_xlabel("Eval Length / Train Length", fontsize=20)
-        ax.set_title(et.capitalize(), fontsize=22)
-        ax.tick_params(labelsize=16)
+        ax.set_xlabel("Eval Length / Train Length", fontsize=23)
+        ax.set_title(et.capitalize(), fontsize=25)
+        ax.tick_params(labelsize=19)
         if g is None:
             continue
         tls = sorted(g["train_len"].unique())
@@ -561,7 +561,7 @@ def plot_relative_generalization(pooled: pd.DataFrame, out_dir):
             ax.errorbar(q["ratio"], q["mean_pct"], yerr=q["std_pct"].fillna(0),
                         marker="o", ms=9, capsize=3, lw=1.8, color=colors[tl],
                         label=f"Train Len {tl}")
-    axes[0].set_ylabel("Relative Corr. Drop (%)", fontsize=20)   # shared y: left only
+    axes[0].set_ylabel("Relative Corr. Drop (%)", fontsize=23)   # shared y: left only
     _single_legend(axes)
     # one shared scale so the two panels are directly comparable; points outside are
     # still in the CSVs and are counted here rather than dropped
