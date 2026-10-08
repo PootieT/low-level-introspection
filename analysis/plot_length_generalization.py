@@ -594,6 +594,120 @@ def plot_relative_generalization(pooled: pd.DataFrame, out_dir):
     return tables
 
 
+def plot_relative_generalization_compare(pooled_by: dict, out_dir, eval_type="endogenous"):
+    """Does the training OBJECTIVE change how well a readout generalizes in length?
+
+    One column per training length (diagonal cells only, as in
+    plot_relative_generalization), one line per objective (e.g. Joint vs SFT):
+      row 1  relative change against each run's own in-distribution score (the
+             relative_generalization.png quantity)
+      row 2  the raw correlation, because a relative drop hides where each objective
+             STARTS -- a smaller relative drop from a lower start is not a better readout.
+    Error bars are the spread over the 5 neurons. The same neurons are trained under
+    every objective, so the difference is also tested PAIRED by neuron (per train length
+    and ratio > 1) and written to relative_generalization_compare_<eval_type>.csv.
+    """
+    from scipy.stats import ttest_rel
+    col = {"interventional": "interventional_corr", "endogenous": "endogenous_corr"}[eval_type]
+    per_run = {}
+    for label, pooled in pooled_by.items():
+        _, d = _relative_table(pooled, eval_type)
+        if d is not None:
+            per_run[label] = d.assign(objective=label)
+    if len(per_run) < 2:
+        print(f"[lengen] compare ({eval_type}): need >= 2 objectives with results, have "
+              f"{list(per_run)}")
+        return None
+    labels = list(per_run)
+    allr = pd.concat(per_run.values(), ignore_index=True)
+    tls = sorted(allr["train_len"].unique())
+    colors = dict(zip(labels, ["#c0392b", "#2471a3", "#27ae60", "#8e44ad"]))
+    fig, axes = plt.subplots(2, len(tls), figsize=(4.6 * len(tls), 8.6), sharey="row",
+                             squeeze=False)
+    for j, tl in enumerate(tls):
+        for label in labels:
+            q = per_run[label]
+            q = q[q["train_len"] == tl]
+            if q.empty:
+                continue
+            g = (q.groupby("ratio")
+                 .agg(rel=("rel", "mean"), rel_sd=("rel", "std"),
+                      corr=(col, "mean"), corr_sd=(col, "std"), n=("rel", "count"))
+                 .reset_index().sort_values("ratio"))
+            c = colors[label]
+            for i, (y, sd) in enumerate((("rel", "rel_sd"), ("corr", "corr_sd"))):
+                scale = 100 if y == "rel" else 1
+                ax = axes[i, j]
+                ax.errorbar(g["ratio"], scale * g[y], yerr=scale * g[sd].fillna(0),
+                            marker="o", ms=7, capsize=3, lw=2, color=c,
+                            label=f"{label} (n={int(g['n'].max())})")
+        for i in range(2):
+            ax = axes[i, j]
+            ax.set_xscale("log", base=2)
+            ax.grid(alpha=0.25)
+            ax.tick_params(labelsize=13)
+            if i == 0:
+                ax.axhline(0, color="k", lw=0.9, alpha=0.5)
+                ax.set_title(f"Train Len {tl}", fontsize=17)
+            else:
+                ax.set_xlabel("Eval Length / Train Length", fontsize=15)
+    axes[0, 0].set_ylabel(f"Relative Corr. Change (%)\n{eval_type.capitalize()}", fontsize=15)
+    axes[1, 0].set_ylabel(f"{eval_type.capitalize()} Corr.", fontsize=15)
+    axes[0, -1].legend(fontsize=12, loc="lower left")
+    fig.tight_layout()
+    fig.savefig(Path(out_dir) / f"relative_generalization_compare_{eval_type}.png", dpi=150)
+    plt.close(fig)
+
+    # paired by neuron: same neurons, same (train_len, eval_len), different objective
+    rows = []
+    a_lab, b_lab = labels[0], labels[1]
+    key = ["neuron", "train_len", "eval_len", "ratio"]
+    m = per_run[a_lab][key + ["rel", col]].merge(
+        per_run[b_lab][key + ["rel", col]], on=key, suffixes=(f"_{a_lab}", f"_{b_lab}"))
+    for (tl, r), g in m.groupby(["train_len", "ratio"]):
+        diff = g[f"rel_{a_lab}"] - g[f"rel_{b_lab}"]
+        row = {"train_len": tl, "ratio": r, "n_neurons": len(g),
+               f"rel_{a_lab}": g[f"rel_{a_lab}"].mean(), f"rel_{b_lab}": g[f"rel_{b_lab}"].mean(),
+               f"corr_{a_lab}": g[f"{col}_{a_lab}"].mean(),
+               f"corr_{b_lab}": g[f"{col}_{b_lab}"].mean(),
+               f"rel_diff_{a_lab}_minus_{b_lab}": diff.mean(),
+               "n_neurons_better": int((diff > 0).sum())}
+        if len(g) >= 3 and r > 1 and diff.std() > 0:
+            row["paired_t_p"] = float(ttest_rel(g[f"rel_{a_lab}"], g[f"rel_{b_lab}"]).pvalue)
+        rows.append(row)
+    res = pd.DataFrame(rows)
+    res.to_csv(Path(out_dir) / f"relative_generalization_compare_{eval_type}.csv", index=False)
+    print(f"\n[lengen] {a_lab} vs {b_lab}, {eval_type} relative change (paired by neuron):")
+    print(res.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+    return res
+
+
+def main_compare(specs, eval_types=("endogenous",)):
+    """`specs`: ['group:Label', ...]. Writes to outputs/plots/lengen_objective_compare/."""
+    pooled_by = {}
+    for spec in specs:
+        group, _, label = spec.partition(":")
+        _, pooled = load_sweep(group, gate="off")
+        # run directories are synced less often than the plots: when the group's last
+        # full re-plot covers more runs than the directories present, use that instead
+        cached = Path(f"{ROOT}/outputs/plots/{group}/length_generalization_pooled.csv")
+        if cached.exists():
+            c = pd.read_csv(cached)
+            n_dir = pooled["run"].nunique() if not pooled.empty else 0
+            if c["run"].nunique() > n_dir:
+                print(f"[lengen] {group}: {n_dir} run dir(s) present, {cached.name} has "
+                      f"{c['run'].nunique()} runs -- using {cached.name}")
+                pooled = c
+        if pooled.empty:
+            sys.exit(f"{group}: no pooled length-generalization results")
+        pooled_by[label or group] = pooled
+    out_dir = Path(f"{ROOT}/outputs/plots/lengen_objective_compare")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for et in eval_types:
+        plot_relative_generalization_compare(pooled_by, out_dir, et)
+    print(f"\n[lengen] wrote {out_dir}")
+
+
 def main(exp_group="mlp_lengen", gate="off", expected_cells=None):
     out_dir = Path(f"{ROOT}/outputs/plots/{exp_group}")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -621,5 +735,9 @@ if __name__ == "__main__":
     EXPECTED = [f"len{l}/win{w}" for l, ws in
                 ((16, [16]), (32, [16, 32]), (64, [16, 32, 64]), (128, [16, 32, 64, 128]))
                 for w in ws]
-    main(exp_group=sys.argv[1] if len(sys.argv) > 1 else "mlp_lengen",
-         expected_cells=EXPECTED)
+    if len(sys.argv) > 1 and sys.argv[1] == "--compare":
+        # python analysis/plot_length_generalization.py --compare mlp_lengen:Joint mlp_lengen_sft:SFT
+        main_compare(sys.argv[2:])
+    else:
+        main(exp_group=sys.argv[1] if len(sys.argv) > 1 else "mlp_lengen",
+             expected_cells=EXPECTED)
