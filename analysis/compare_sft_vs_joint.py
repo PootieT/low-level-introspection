@@ -344,13 +344,13 @@ def plot_ood_ladders(frames: dict, out_dir, arm_colors=None, common_only=True):
     # font sizes match the length/layer/neuron generalization figures. Tick labels are
     # unrotated two-liners ("In-Domain\n(C4)"): rotated ones hang sideways into the gap
     # between the panels and force it wide.
-    fig, axes = plt.subplots(1, 2, figsize=(18, 6.5), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(19, 6.5), sharey=True)
     xticklabels = [pretty_corpus(c).replace(" (", "\n(") for c in order]
     for ax, readout in zip(axes, ("endogenous", "interventional")):
-        ax.set_title(f"OOD {readout.capitalize()}", fontsize=28)
+        ax.set_title(f"OOD {readout.capitalize()}", fontsize=32)
         ax.set_xticks(np.arange(len(order)))
-        ax.set_xticklabels(xticklabels, fontsize=22)
-        ax.tick_params(axis="y", labelsize=22)
+        ax.set_xticklabels(xticklabels, fontsize=24)
+        ax.tick_params(axis="y", labelsize=26)
         ax.axhline(0, color="grey", ls="--", lw=1); ax.grid(alpha=0.25)
         df = tables.get(readout)
         if df is None:
@@ -364,14 +364,15 @@ def plot_ood_ladders(frames: dict, out_dir, arm_colors=None, common_only=True):
                         label=pretty_arm(arm))
             # n kept out of the legend (identical across arms under common_only); report it
             print(f"[cmp] ladder ({readout}) {pretty_arm(arm)}: n={int(sub['n'].max())} runs")
-    axes[0].set_ylabel("Correlation", fontsize=26)
+    axes[0].set_ylabel("Correlation", fontsize=30)
     axes[0].set_ylim(-0.1, 1.05)
     # one legend, bottom-left of the endogenous panel (the right panel's handles if the
     # left one has no data -- colours are shared, so either panel's handles fit)
     handles, labels = next((ax.get_legend_handles_labels() for ax in axes
                             if ax.get_legend_handles_labels()[0]), ([], []))
     if handles:
-        axes[0].legend(handles, labels, loc="lower left", fontsize=17, framealpha=0.9)
+        axes[0].legend(handles, labels, loc="lower left", fontsize=20, framealpha=0.9,
+                       handlelength=1.4, borderaxespad=0.3)
     fig.tight_layout()
     path = Path(out_dir) / "ood_ladder.png"
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
