@@ -413,6 +413,37 @@ def report_endogenous_coverage(df: pd.DataFrame, expected_neurons: int = 10):
     return cov
 
 
+def _fmt2(df: pd.DataFrame) -> pd.DataFrame:
+    """Cell text with exactly 2 decimals ('0.50', not '0.5'); NaN -> ''; '-0.00' -> '0.00'."""
+    def one(v):
+        if pd.isna(v):
+            return ""
+        s = f"{v:.2f}"
+        return "0.00" if s == "-0.00" else s
+    return df.apply(lambda col: col.map(one))
+
+
+def draw_layer_position_heatmap(mean_df: pd.DataFrame, spread_df: pd.DataFrame, title: str,
+                                path, vmin=None, vmax=None, cmap="viridis", center=None):
+    """The ONE style for every layer x token-position heatmap -- the SFT sweep maps
+    here and the SFT-vs-joint arm/delta maps in compare_sft_vs_joint.py -- so panels
+    from both scripts sit side by side in a paper figure. Cells read 'mean\\n±spread';
+    the metric goes in the title (not on the colorbar)."""
+    annot = _fmt2(mean_df) + "\n±" + _fmt2(spread_df.reindex_like(mean_df).fillna(0))
+    plt.figure(figsize=(16, 12))
+    hm = sns.heatmap(mean_df, annot=annot, fmt="", vmin=vmin, vmax=vmax, center=center,
+                     cmap=cmap, annot_kws={"size": 24})
+    hm.figure.axes[-1].tick_params(labelsize=28)      # colorbar ticks
+    hm.tick_params(axis="x", labelsize=32)
+    hm.tick_params(axis="y", labelsize=32)
+    plt.xlabel("Token Position", fontsize=40)
+    plt.ylabel("Layer", fontsize=40)
+    plt.title(title, fontsize=38, pad=20)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
 def plot_endogenous_heatmaps(df: pd.DataFrame, out_dir: str):
     """One heatmap per (eval, metric): layer x position, annotated mean±SE over the
     cell's neurons."""
@@ -433,25 +464,12 @@ def plot_endogenous_heatmaps(df: pd.DataFrame, out_dir: str):
     for (eval_name, metric), sub in summary.groupby(["eval_type", "metric"]):
         mean_df = sub.pivot(index="layer", columns="position", values="mean")
         se_df = sub.pivot(index="layer", columns="position", values="se")
-        annot = mean_df.round(3).astype(str) + "\n±" + se_df.round(3).astype(str)
         vmin, vmax = scale[metric]
-        # these heatmaps annotate ± SE (se_df), so the label says SE, not Std
-        cbar_label = f"{eval_name.capitalize()} {quantity.get(metric, metric)}\n(Mean ± SE over Neurons)"
-
-        plt.figure(figsize=[16, 12])
-        hm = sns.heatmap(mean_df, annot=annot, fmt="", vmin=vmin, vmax=vmax,
-                         annot_kws={"size": 13}, cmap="viridis",
-                         cbar_kws={"label": cbar_label})
-        hm.figure.axes[-1].yaxis.label.set_size(24)
-        hm.figure.axes[-1].tick_params(labelsize=18)
-        hm.tick_params(axis="x", labelsize=24)
-        hm.tick_params(axis="y", labelsize=24)
-        plt.xlabel("Token Position", fontsize=30)
-        plt.ylabel("Layer", fontsize=30)
-        plt.tight_layout()
+        # these heatmaps annotate ± SE (se_df), so the title says SE, not Std
+        title = (f"Neuron {eval_name.capitalize()} {quantity.get(metric, metric)}\n"
+                 f"(Mean ± SE over Neurons)")
         path = f"{out_dir}/heatmap_{eval_name}_{metric}.png"
-        plt.savefig(path, dpi=150, bbox_inches="tight")
-        plt.close()
+        draw_layer_position_heatmap(mean_df, se_df, title, path, vmin=vmin, vmax=vmax)
         print(f"[endo] wrote {path}")
 
 

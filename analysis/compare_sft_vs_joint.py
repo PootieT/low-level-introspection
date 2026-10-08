@@ -44,6 +44,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
+# the SFT sweep's heatmap style, shared so both scripts' heatmaps are identical
+from plot_single_neuron_results import draw_layer_position_heatmap  # noqa: E402
+
 # Poster-scale fonts: kept identical to plot_single_neuron_results.py so the two
 # scripts' figures share one look.
 plt.rcParams.update({
@@ -391,35 +396,44 @@ def pretty_metric(metric: str) -> str:
     return metric.replace("_", " ").title()
 
 
-def plot_delta_heatmap(merged, metric, label_a, label_b, out_dir):
-    """Within-neuron delta by (layer, position) -- where does one arm win?"""
+def delta_pivots(merged, metric, label_a, label_b):
+    """(mean, std) of the within-neuron delta a - b per (layer, position), or None.
+    The std is the spread across the cell's neurons: a +0.3 mean built from neurons at
+    +0.9 and -0.3 is a different claim from one where every neuron moved +0.3."""
     ca, cb = f"{metric}_{label_a}", f"{metric}_{label_b}"
     if ca not in merged or cb not in merged:
-        return
+        return None
     sub = merged[[*KEY, ca, cb]].dropna()
     if sub.empty:
-        return
+        return None
     sub = sub.assign(delta=sub[ca] - sub[cb])
-    pivot = sub.pivot_table(index="layer", columns="position", values="delta", aggfunc="mean")
-    # spread across the cell's neurons: a +0.3 mean built from neurons at +0.9 and -0.3
-    # is a different claim from one where every neuron moved +0.3
+    mean = sub.pivot_table(index="layer", columns="position", values="delta", aggfunc="mean")
     std = sub.pivot_table(index="layer", columns="position", values="delta", aggfunc="std")
-    annot = (pivot.round(2).astype(str) + "\n±" +
-             std.round(2).fillna(0).astype(str))
-    lim = float(np.nanmax(np.abs(pivot.to_numpy()))) or 1.0
-    plt.figure(figsize=(2.0 * pivot.shape[1] + 5, 1.1 * pivot.shape[0] + 4))
+    return mean, std
+
+
+def delta_color_limit(merged, metrics, label_a, label_b) -> float:
+    """One symmetric colour limit across all `metrics` of a pair, so the endogenous and
+    interventional delta maps share a colorbar and read on the same scale."""
+    lims = [float(np.nanmax(np.abs(p[0].to_numpy())))
+            for p in (delta_pivots(merged, m, label_a, label_b) for m in metrics) if p]
+    lims = [v for v in lims if np.isfinite(v) and v > 0]
+    return max(lims) if lims else 1.0
+
+
+def plot_delta_heatmap(merged, metric, label_a, label_b, out_dir, lim=None):
+    """Within-neuron delta by (layer, position) -- where does one arm win?"""
+    piv = delta_pivots(merged, metric, label_a, label_b)
+    if piv is None:
+        return
+    mean, std = piv
+    if lim is None:
+        lim = float(np.nanmax(np.abs(mean.to_numpy()))) or 1.0
     # cells are annotated mean ± std (std over the cell's neurons, aggfunc="std")
-    hm = sns.heatmap(pivot, cmap="RdBu_r", center=0, vmin=-lim, vmax=lim, annot=annot, fmt="",
-                annot_kws={"size": 20},
-                cbar_kws={"label": f"Paired Diff. {pretty_metric(metric)}\n(Mean ± Std over Neurons)"})
-    hm.figure.axes[-1].yaxis.label.set_size(24)  # colorbar label
-    hm.figure.axes[-1].tick_params(labelsize=22)  # colorbar ticks
-    hm.tick_params(axis="x", labelsize=30)
-    hm.tick_params(axis="y", labelsize=30)
-    plt.xlabel("Token Position", fontsize=38); plt.ylabel("Layer", fontsize=38)
-    plt.tight_layout()
+    title = f"Neuron Paired Diff. {pretty_metric(metric)}\n(Mean ± Std over Neurons)"
     path = Path(out_dir) / f"delta_{metric}_{label_a}_vs_{label_b}.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
+    draw_layer_position_heatmap(mean, std, title, path, vmin=-lim, vmax=lim,
+                                cmap="RdBu_r", center=0)
     print(f"[cmp] wrote {path}")
 
 
@@ -434,22 +448,12 @@ def plot_arm_heatmap(df, metric, label, out_dir):
         return
     mean = sub.pivot_table(index="layer", columns="position", values=metric, aggfunc="mean")
     std = sub.pivot_table(index="layer", columns="position", values=metric, aggfunc="std")
-    annot = mean.round(2).astype(str) + "\n±" + std.round(2).fillna(0).astype(str)
-    # correlations live in [0, 1] -> fixed viridis scale so arms are comparable; other
-    # metrics (e.g. l2) get a data-driven magma scale.
-    is_corr = metric.endswith("corr")
-    kw = dict(cmap="viridis", vmin=0, vmax=1) if is_corr else dict(cmap="magma")
-    plt.figure(figsize=(2.0 * mean.shape[1] + 5, 1.1 * mean.shape[0] + 4))
-    hm = sns.heatmap(mean, annot=annot, fmt="", annot_kws={"size": 20},
-                     cbar_kws={"label": f"{pretty_metric(metric)}\n(Mean ± Std over Neurons)"}, **kw)
-    hm.figure.axes[-1].yaxis.label.set_size(24)  # colorbar label
-    hm.figure.axes[-1].tick_params(labelsize=22)  # colorbar ticks
-    hm.tick_params(axis="x", labelsize=30)
-    hm.tick_params(axis="y", labelsize=30)
-    plt.xlabel("Token Position", fontsize=38); plt.ylabel("Layer", fontsize=38)
-    plt.tight_layout()
+    # correlations get the SFT maps' fixed [0, 1] viridis scale, which also makes the
+    # endogenous and interventional maps share one colorbar
+    vmin, vmax = (0, 1) if metric.endswith("corr") else (None, None)
+    title = f"Neuron {pretty_metric(metric)}\n(Mean ± Std over Neurons)"
     path = Path(out_dir) / f"heatmap_{label}_{metric}.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
+    draw_layer_position_heatmap(mean, std, title, path, vmin=vmin, vmax=vmax)
     print(f"[cmp] wrote {path}")
 
 
@@ -503,8 +507,11 @@ def main(arms: dict, out_dir, pairs=None, model=None):
         table = pd.DataFrame(stats).assign(arm=label_a, baseline=label_b)
         tables.append(table)
         print(table.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
-        for m in ("interventional_corr", "endogenous_corr"):
-            plot_delta_heatmap(merged, m, label_a, label_b, out_dir)
+        # one colour limit for both readouts, so the two delta maps share a colorbar
+        delta_metrics = ("interventional_corr", "endogenous_corr")
+        lim = delta_color_limit(merged, delta_metrics, label_a, label_b)
+        for m in delta_metrics:
+            plot_delta_heatmap(merged, m, label_a, label_b, out_dir, lim=lim)
 
     if tables:
         pd.concat(tables, ignore_index=True).to_csv(Path(out_dir) / "paired_summary.csv",
