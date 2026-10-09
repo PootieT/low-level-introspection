@@ -1,0 +1,9 @@
+# Features for the layer x position SAE sweep (filled in after the blind steering judge).
+# One line per layer:  LAYER  F1  F2  F3     (ranked; F1's whole grid runs first)
+# Replace every TODO with S<layer>.<index>, e.g.  5  S5.14311  S5.3916  S5.8744
+# The launchers refuse to run while any TODO is left.
+0   TODO  TODO  TODO
+5   TODO  TODO  TODO
+10  TODO  TODO  TODO
+15  TODO  TODO  TODO
+20  TODO  TODO  TODO

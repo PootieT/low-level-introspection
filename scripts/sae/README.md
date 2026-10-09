@@ -1,45 +1,58 @@
-# SAE-feature introspection — handoff
+# SAE-feature introspection — current pipeline
 
-Companion track to the neuron (MLP) experiments. Same question — *can a model be
-trained to report its own low-level internal signals, and is the report faithful or a
-context bypass?* — but the target is a **Gemma Scope SAE feature** on
-`google/gemma-2-2b` instead of an MLP neuron on Llama-3.2-1B.
+Companion to the neuron track. Same question — *can a model be trained to report its own
+low-level internal signals, and is the report faithful or a context bypass?* — but the
+target is a **Gemma Scope SAE feature** on `google/gemma-2-2b` instead of an MLP neuron.
 
-Everything here is post-BOS-fix. The conventions in `../README.md` (shared cache keys,
-`--signal-filter`, `--force-drift-eval`, gate-via-config, explicit `--lora-dropout`,
-`set -e`) apply unchanged; this file only covers what is SAE-specific.
+This file documents the **current methodology**: gate OFF everywhere, LM-head readout,
+and one joint trainer that spans endogenous + interventional. The shared conventions in
+`../README.md` (cache keys, `--signal-filter`, gate-via-config, `set -e`) apply unchanged.
 
 ---
 
-## 1. Why this track looks different from the neuron track
+## 1. What is different from the neuron track
 
 **The readout is binary detection, not magnitude regression.** SAE features are sparse
-(~0.1–1% of tokens). At a fixed token position a magnitude target is ~all zeros, so a
-regressor minimises loss by predicting 0 and every correlation-style metric is
-meaningless. So the model instead emits one of two words — `active` / `inactive` — in
-its own tokens, and we score:
+(~0.1–1% of tokens), so a magnitude target is ~all zeros and correlation metrics are
+meaningless. The model instead answers in its own words: at the readout position we take
+the token it actually **generates** — argmax over the full vocabulary, one greedy forward
+— and check whether it is `active`, `inactive`, or neither. The prediction is that
+generated token, not a logit comparison between the two words.
 
-| metric | why |
-|---|---|
-| **AP** (average precision) | the headline. Imbalance-honest at a ~1% base rate. |
-| AUROC | secondary, threshold-free. |
-| `f1_at_0`, `acc_at_0` | at the natural threshold (logit gap = 0). |
-| `base_rate_positive` | context. **A 99% accuracy at a 1% base rate means nothing.** |
+**We report balanced accuracy + precision** on the generated token, for both the
+endogenous readout and the interventional test — those two metrics only. AUROC/AP and the
+two-word logit gap are **not** used.
 
-Scoring never samples generation: we do one forward pass and take the
-`logit(" active") − logit(" inactive")` gap at the readout position. That gap is the
-continuous score AP/AUROC are computed from.
+**The steering primitive is difference-of-decode.**
 
-**The steering primitive is different.** A neuron is a module output you can overwrite.
-An SAE feature is not a module — it is `ReLU(W_enc·resid + b_enc)` computed on the
-residual stream. To set it we clamp via *difference-of-decode*:
+*The problem.* With a neuron, "set it to X" is easy — a neuron is a number the model
+literally computes, so you overwrite it. An SAE feature is **not** something the model
+computes. The model computes its residual-stream vector `resid`; a *separate* little
+autoencoder (the SAE) reads that vector and decomposes it into ~16k features, where
+feature *i*'s value is `ReLU(W_enc·resid + b_enc)`. So the feature is derived *from* the
+residual — there is no slot inside the model to overwrite.
 
-```
-resid += decode(feats with feature := target) − decode(feats)
-```
+*The recipe.* To force feature *i* to a target value:
+1. `feats = encode(resid)` — read the current feature values;
+2. make a copy with just that one feature changed to the target;
+3. take the difference of decodes: `delta = decode(feats_with_target) − decode(feats)`;
+4. `resid += delta`.
 
-which preserves the SAE reconstruction error and moves only that feature's
-contribution (`SAEBundle.steer_delta`, applied by `SAEInterventionHook`).
+(`SAEBundle.steer_delta`, applied by `SAEInterventionHook`.)
+
+*Why the difference, not just `resid = decode(feats_with_target)`?* The SAE is lossy —
+`decode(encode(resid)) ≈ resid`, not exactly. Replacing the residual with a fresh decode
+would discard that reconstruction error and disturb *every* direction at once. Adding only
+the difference cancels the reconstruction error (it appears in both decode terms), so the
+net change is exactly feature *i*'s decoder direction scaled to hit the target — **only
+that one feature moves in SAE coordinates; everything else is left untouched.** (Re-encoding
+the steered residual does *not* return the target, because encoder and decoder are not
+inverses; see "What the interventional test measures" in §6.)
+
+**The gate is OFF.** The LoRA adapter runs over the whole sequence, so the readout can
+causally read the feature at its origin. Because nothing else then preserves language
+modelling over the input text, training adds an **adaptive KL anchor** to the base model
+on the text region (`--kl-anchor-target 0.1`, matching the neuron track).
 
 ---
 
@@ -48,182 +61,340 @@ contribution (`SAEBundle.steer_delta`, applied by `SAEInterventionHook`).
 ### Library (shared, SAE-aware)
 | file | role |
 |---|---|
-| `src/introspector/signals/sae.py` | `SAEBundle`: loads a Gemma Scope SAE through `sae_lens`, applies it to HF residuals. `encode` / `decode` / `steer_delta`. |
-| `src/introspector/signals/schema.py` | `SAEFeatureSpec` (`type="sae"`, plus `sae_release` / `sae_site` / `sae_width`, which are part of the cache identity hash). |
-| `src/introspector/signals/resolution.py` | `S<layer>.<index>` → `SAEFeatureSpec` (the `S` prefix, alongside `N`/`A`/`R`). |
-| `src/introspector/models/signal_paths.py` | `resolve_sae_hook_path` — the residual site the SAE was trained on (decoder-layer output ≡ TransformerLens `blocks.L.hook_resid_post`). **Capture and steering must use this same site.** |
-| `src/introspector/training/model.py` | `SAEInterventionHook` — the steering hook. |
-| `src/introspector/prompts.py` | `sae_prompt` (the introspection prefill). |
+| `src/introspector/signals/sae.py` | `SAEBundle`: loads a Gemma Scope SAE via `sae_lens`; `encode`/`decode`/`steer_delta`. |
+| `src/introspector/signals/schema.py` | `SAEFeatureSpec` (+`sae_release`/`sae_site`/`sae_width`), `SAEFeatureSampler`. |
+| `src/introspector/signals/resolution.py` | `S<layer>.<index>` → `SAEFeatureSpec`. |
+| `src/introspector/signals/neuronpedia.py` | Neuronpedia client for feature concepts (descriptions/top tokens). |
+| `src/introspector/models/signal_paths.py` | `resolve_sae_hook_path` — the residual site the SAE was trained on (capture AND steer here). |
+| `src/introspector/training/model.py` | `SAEInterventionHook`, the gated-LoRA wrappers. |
+| `src/introspector/prompts.py` | the introspection prompt. |
 
 ### Entry points
 | file | role |
 |---|---|
-| `validate_sae_hook.py` | **Gate 0.** Is the SAE being applied to the right residual? |
+| `validate_sae_hook.py` | **Gate 0.** Is the SAE applied to the right residual? (FVU ≪ 0.35, L0 in the tens, BOS excluded.) |
 | `select_sae_features.py` | Streaming density pass → per-layer feature-stats parquet. |
-| `cache_signals.py` | Shared cacher; the `sae` branch saves the residual in-trace and encodes after. |
-| `train_sae_detector.py` | **Endogenous** detection training + all post-hoc evals. |
-| `train_sae_detector_intervention.py` | **Interventional** detection training (label = the steered state). |
-| `analysis/plot_sae_detection_sweep.py` | Plots a sweep directory. |
-| `score_ood_generalization.py` | `evaluate_ood_detection` (detection branch of the OOD ladder). |
-| `score_lm_degradation.py`, `score_lighteval_benchmarks.py` | Signal-agnostic; **gate-off checkpoints only.** |
+| `annotate_sae_features_neuronpedia.py` | Attach Neuronpedia concepts to the density-selected features (network-only). |
+| `generate_sae_steering_samples.py` | Blinded steered-vs-unsteered samples for the out-of-band steering judge. |
+| `cache_signals.py` | Shared cacher; the `sae` branch encodes features after capturing the residual. |
+| `train_sae_detector_joint.py` | **The trainer.** Joint endogenous + interventional loss, gate off, LM head, KL anchor. |
+| `analysis/plot_sae_joint_results.py` | Figures from the joint metrics (balanced acc / precision). |
+| `scripts/sae/{sweep_common,cache_sae_sweep,train_sae_sweep,submit_sae_sweep}.sh` | The layer x position sweep (§7). |
+| `analysis/plot_sae_sweep.py` | Layer x position figures + `sweep_summary.csv` for the sweep. |
 
 ---
 
 ## 3. Run order
 
-### Step 0 — validate the SAE hook (once per model × SAE release × layer family)
-
 ```bash
+# 0. validate the hook (once per model × release × layer family)
 python validate_sae_hook.py --model google/gemma-2-2b \
-    --sae-release gemma-scope-2b-pt-res-canonical \
-    --layer 9 --width 16k --site res --n-texts 64 --max-seq-length 64
+    --sae-release gemma-scope-2b-pt-res-canonical --layer 9 --width 16k --site res
+
+# 1. per-layer density stats  (writes data/sae_stats/gemma2-2b_res{L}_16k.parquet)
+sbatch scripts/sae/precompute_sae_feature_stats.sh
+
+# 1.5 attach Neuronpedia concepts to the selected features (login node, needs internet)
+bash scripts/sae/annotate_sae_features_neuronpedia.sh   # login node (needs internet), not sbatch
+
+# 2. steering gate: generate blinded samples, then judge them OUT OF BAND
+sbatch scripts/sae/generate_sae_steering_samples.sh
+#     -> read the *.judge.md blind, pick the concept-expressing option(s) per prompt;
+#        features whose STEERED options are consistently chosen (baseline not) qualify.
+
+# 3. cache + train the joint gate-off sweep (per weight W)
+W=0.9 sbatch scripts/sae/train_sae_joint_layer9.sh     # also W=1.0 (=endogenous), 0.75, 0.5
+
+# 4. figures
+python analysis/plot_sae_joint_results.py --runs outputs/runs/sae_l9_joint --weight 0.9
 ```
 
-**Everything downstream is garbage if this fails.** Pass criteria:
-- printed HF hook path and the SAE's recorded `hook_name` describe the same site
-  (`model.layers.9.output` ↔ `blocks.9.hook_resid_post`);
-- **FVU ≪ 0.35** and **L0 in the tens** — both computed with **BOS excluded**;
-- top-activating features look like real concepts (cross-check ids on Neuronpedia).
+The steering gate decides which features to train on; the 5 layer-9 features that passed
+are the default `FEATURES` in `train_sae_joint_layer9.sh`.
 
-> Gemma-2 parks a massive-activation attention sink on `<bos>` (residual norm ~1500 vs
-> ~140 elsewhere). If BOS is left in, FVU comes out **> 1** and every "top feature" is
-> the sink. That is expected and already handled — mentioned so a re-run of an older
-> script does not send you chasing it.
-
-### Step 1 — per-layer feature stats
-
-```bash
-qsub scripts/sae/precompute_sae_feature_stats.sh          # 8 tasks, one per layer
-```
-
-Writes `data/sae_stats/gemma2-2b_res{L}_16k.parquet`. Skips layers already done.
-Selection keeps `density ∈ [1e-3, 1e-2]`; the upper bound mirrors Neuronpedia's default
-"hide >1% density", which is what keeps punctuation/position features out.
-
-**Required before Step 2** — without a parquet the sweep's picker silently falls back to
-uniform-random over 16k features, most of which are dead at a fixed position.
-
-### Step 2 — the main endogenous grid
-
-```bash
-JID=$(qsub scripts/sae/precompute_sae_feature_stats.sh | awk '{print $3}' | cut -d. -f1)
-qsub -hold_jid $JID scripts/sae/train_single_sae_introspector_sweep_layer_position.sh
-```
-
-8 layers × 8 positions × {gate on, gate off} = **128 array tasks**, 5 features trained
-inside each → 640 runs. Per task: generate config → `cache_signals.py` → 5 ×
-`train_sae_detector.py`.
-
-- **Features are density-stratified and seeded by LAYER only**, so a layer's features are
-  identical at every position → the position curve is paired per feature. `sample` index
-  is a monotone density rank (0 = rarest → 9 = most frequent).
-- **One dataset per (layer, position) cell** holds all 10 features (encoding 10 features
-  costs one forward pass per text); `--signal-filter S<layer>.<index>` splits it per run.
-- **GATE is the outer array dimension** (tasks 1–64 on, 65–128 off) so both arms of a cell
-  never race to build the same cache directory.
-
-### Step 3 — interventional pilot (can run concurrently; separate cache group)
-
-```bash
-qsub scripts/sae/train_sae_intervention_pilot.sh          # 3 features x 3 positions
-```
-
-Trains with steering: the on/off state is drawn 50/50 **independently of the text** and
-the label *is* that steered state, so context cannot predict it. This is the
-anti-bypass condition. Run this before committing to a full interventional grid.
-
-### Step 4 — plots
-
-```bash
-python analysis/plot_sae_detection_sweep.py    # edit the path at the bottom
-```
-
-Writes to `outputs/plots/<sweep_name>/`, per split (`test`, `test_interventional`;
-`dev` is skipped):
-
-- `test__overview_feature.png` — one line per feature (busy but complete)
-- `test__overview_layer_x_gate.png` — per layer, **mean ± 1 SE**, gate as line style
-- `test__overview_sample_x_gate.png` — per density bin, mean ± SE
-- `test__overview_gate.png` — **the headline arm comparison**
-
-`plot_all_splits(path, individual_metrics=True)` additionally writes one PNG per metric.
+> **Note on layer 9.** The batch scripts in steps 1–2 now sweep the layer x position grid's
+> layers `{0,5,10,15,20}` (§7; they originally swept even layers `{0,…,14}`) — layer 9
+> (the layer actually trained) is **not**
+> in that set. The five trained layer-9 features were selected by running the same three
+> steps directly for layer 9 (this is what produced the `res9` artifacts in
+> `data/sae_stats/` and `data/sae_steering_samples/`):
+>
+> ```bash
+> python select_sae_features.py --model google/gemma-2-2b \
+>     --sae-release gemma-scope-2b-pt-res-canonical --layer 9 --width 16k --site res \
+>     --n-tokens 2000000 --max-seq-length 128 --fixed-position -1 \
+>     --min-density 1e-3 --max-density 1e-2 \
+>     --out data/sae_stats/gemma2-2b_res9_16k.parquet
+> python annotate_sae_features_neuronpedia.py \
+>     --stats data/sae_stats/gemma2-2b_res9_16k.parquet \
+>     --model gemma-2-2b --layer 9 --width 16k --site res \
+>     --out data/sae_stats/gemma2-2b_res9_16k.annotated.parquet
+> python generate_sae_steering_samples.py \
+>     --annotated data/sae_stats/gemma2-2b_res9_16k.annotated.parquet \
+>     --model google/gemma-2-2b --layer 9 --width 16k --site res \
+>     --out-dir data/sae_steering_samples
+> ```
+> (Or add `9` to the `LAYERS` arrays in the three batch scripts to fold it into the sweep.)
 
 ---
 
-## 4. How to read the results
+## 4. The joint trainer
 
-**The alignment line comes first.** Every cell's `SAMPLE=0` run prints:
+`loss = w · endogenous_CE + (1 − w) · interventional_CE + kl_coef · KL_anchor` (two
+forwards/step). `W=1.0` is pure endogenous (interventional forward skipped) through the
+same code, so endogenous and joint are directly comparable. Sweep `w ∈ {1.0, 0.9, 0.75, 0.5}`.
+
+- **endogenous** forward: no steering; target = the feature's natural firing at the token.
+- **interventional** forward: steer the feature on/off 50/50, decorrelated from the text;
+  target = the forced state. Context cannot predict it — the anti-bypass condition.
+- **KL anchor**: adaptive KL-to-base penalty on the input-text tokens only. It logs
+  `L_kl` and `kl_coef`; `L_kl` stuck at exactly 0 would mean `disable_adapter()` is not
+  being honored. See below for the mechanics.
+
+### The KL anchor, in detail
+
+**What it is against.** The gate is off, so the adapter runs over the whole sequence — but
+the detection loss only cares about the answer token, so nothing else stops the adapter
+from scrambling the model's behaviour on ordinary text. The anchor is the leash: at a few
+sampled **input-text** positions it measures how far the tuned model (adapter ON) has
+drifted from the frozen base model (adapter OFF — for LoRA that *is* the original
+gemma-2-2b) and penalises that drift. The introspection prompt is never anchored; that is
+where the readout lives and is meant to change.
+
+**The quantity.** For one text position `c`, summing over the vocabulary `v`:
+
+    KL_at(c) = sum_v  p_base(v|c) * log( p_base(v|c) / p_tuned(v|c) )
+
+    KL_anchor = average of KL_at(c) over the sampled text positions      (nats/token)
+
+`p_base` = model with the adapter off, `p_tuned` = adapter on, so it isolates the drift
+caused purely by the adapter. Both sides use gemma's softcapped logits (we reuse the
+endogenous forward's `.logits` rather than re-running the LM head), so the KL measures real
+drift, not the softcap.
+
+**Why sample ~4 positions, not all.** A full KL needs the entire next-token distribution
+(V ~= 256k) at every position, in fp32, with the backward graph — several GB over a full
+sequence. Uniformly random text positions are an *unbiased* estimate of the mean per-token
+KL, so a few per row (times the batch, times many steps) is plenty. `--kl-anchor-positions`
+defaults to 4. The controller's dead-band (below) absorbs the resulting estimator noise.
+
+**The penalty added to the loss:**
+
+    total_loss = w * L_endo + (1 - w) * L_interv + kl_coef * KL_anchor
+
+**How `kl_coef` adapts (a thermostat).** `kl_coef` (call it lambda) is *not* fixed and
+*not* learned by gradient — a controller nudges it each step to hold the measured KL near a
+target budget (`--kl-anchor-target`, default 0.1 nats/token). With lambda clamped to
+`[1e-4, 1e3]`, starting at 1.0:
+
+    if   measured_KL > 1.5 * target :  lambda = min(lambda * 1.5, 1e3)    # drift high -> punish harder
+    elif measured_KL < target / 1.5 :  lambda = max(lambda / 1.5, 1e-4)   # drift low  -> ease off
+    else                            :  leave lambda unchanged             # dead-band  -> do nothing
+
+- Multiplicative (x1.5 / /1.5) so lambda can span its whole range in a few steps and adjust
+  proportionally to how far off it is.
+- The `1.5` dead-band is a *tolerance*: the KL is a noisy sampled estimate, so don't react
+  unless it is more than ~50% off target. `1.5` is the PPO adaptive-KL convention
+  (Schulman et al.), matched to the neuron track — a heuristic, not a derived value.
+- lambda is a constant during backprop; it is updated *afterwards* from the detached
+  measured KL.
+
+Net effect is negative feedback: you specify the *amount of drift you tolerate* (the
+target), and lambda auto-solves for whatever penalty strength delivers it — instead of
+hand-picking a fixed weight. `--kl-anchor-target 0` disables the anchor;
+`--kl-anchor-weight` (with no target) uses a fixed lambda that never adapts.
+
+**Cost per step** (w<1, anchor on): three forwards — endogenous (grad), interventional
+(grad), and one no-grad `disable_adapter` forward for the base distribution.
+
+Outputs per run: `sae_joint_train_metrics.json` (endogenous + interventional balanced
+accuracy / precision) and `sae_cache_alignment.json`. All metrics are on the model's
+generated token.
+
+---
+
+## 5. How to read the results
+
+**Alignment first — the sanity gate.** This catches one silent bug: *steering/reading the
+wrong token.* Every `--force-drift-eval` run prints and saves `sae_cache_alignment.json`.
+
+*What the cache is.* Training and eval read a dataset precomputed once by `cache_signals.py`.
+Each row stores the text, `token_position` (which token we introspect on), the `token`
+string there, and `activation` — the feature's value at that token, computed by the FROZEN
+base model + SAE encoder. That `activation` is the endogenous label.
+
+*The risk it guards.* `token_position` was computed on the *cache-time* tokenization. Eval
+re-tokenizes the text and steers at that same index. If the two tokenizations disagree (a
+stray BOS, an extra separator, a padding slip), the index now points at a *different* token
+than the one the label describes — nothing crashes; the numbers are just wrong.
+
+*The check* (`cache_alignment`). With the adapter **off** (reproducing the caching model),
+it recomputes the feature at the cached position at offsets −1 / 0 / +1, correlates each
+against the cached `activation`, and checks the decoded token equals the cached `token`.
+Pass criteria:
+- **best offset +0** — the offset whose recompute best matches the cache is 0 (no shift);
+- **corr ≈ 1.0** — at offset 0 the recomputed value reproduces the cached one (same model,
+  same token);
+- **token_match ≈ 1.0** — the token string at that index equals the cached one.
 
 ```
-=== SAE CACHE ALIGNMENT (adapters off) ===
-  offset +0: corr(live, cached) = +0.9999   <-- train assumes this
-  best offset = +0  ->  alignment OK
+offset -1: corr(live, cached) = +0.01
+offset +0: corr(live, cached) = +0.9999   <-- what training assumes
+offset +1: corr(live, cached) = -0.01
+best offset = +0  ->  alignment OK
 ```
 
-`best offset = +0`, corr ≈ 1.0, `token_match` ≈ 1.0. **Anything else and the run's
-interventional numbers are void** — it means the steering hook is injecting into a
-different token than the prompt names (the off-by-one class of bug, now guarded).
-Also saved as `sae_cache_alignment.json`.
+If the best correlation instead shows up at +1 or −1 (with `token_match` low), the hook is
+injecting into the *neighbour* of the named token, so **every interventional number is
+void.** It is a gate you pass, not a result you report.
 
-**Then the two arms.** With **gate ON**, no trainable parameter touches the introspected
-token, so the model *cannot* read the feature — whatever AP it scores is context bypass,
-and that is the number to subtract. With **gate OFF** the adapter reaches the site and
-causal reading becomes possible.
+*Scope.* This validates the cache against the BASE model (adapter off) — it only confirms
+the positions are right. It does NOT measure how far the TUNED model's live activation has
+drifted from the cached value during training (the introspection-vs-recompute question);
+that is a separate diagnostic (cf. the neuron track's `measure_activation_drift`), not yet
+built here.
 
-**Then faithfulness.** `test_interventional.paired_directional_acc` = fraction of contexts
-where steering the feature ON raises the active-vs-inactive gap relative to steering it
-OFF, on the *same* context.
+**Then faithfulness — read it from `test_interventional.balanced_accuracy`.** The
+interventional set steers the feature on/off 50/50, decorrelated from the text, and labels
+each forward by the forced state. Because that label cannot be predicted from context, this
+balanced accuracy *is* the causal test:
 
-| value | meaning |
+| test_interventional.balanced_accuracy | meaning |
 |---|---|
-| → 1.0 | the report causally tracks the feature — faithful |
-| ≈ 0.5 | no causal effect: the report rides context (**bypass** — what we see endogenously, matching the neuron result**)** |
-| < 0.5 | systematic inverse effect; most likely an out-of-distribution steering artifact, not genuine anti-reading |
+| → 1.0 | steering flips the report — it causally tracks the feature — **faithful** |
+| ≈ 0.5 | steering does nothing — the report rides context — **bypass** |
+| < 0.5 | steering flips it the wrong way — usually an OOD steering artifact, not anti-reading |
 
-Outputs per run: `sae_detection_metrics.json` (endogenous trainer),
-`sae_intervention_train_metrics.json` (interventional trainer),
-`sae_cache_alignment.json`, `ood_generalization_detection.csv`,
-`sae_interventional_scores.png`.
-
----
-
-## 5. Gotchas
-
-- **A single-class eval set gives undefined AP/AUROC, not bad ones.** A feature that never
-  fires on a corpus/position reports `nan`. Filter on `base_rate_positive` before
-  concluding "generalization failure" — same trap as the near-silent-neuron caveat in the
-  neuron OOD script.
-- **`score_lm_degradation.py` / `score_lighteval_benchmarks.py` are gate-off only.** With
-  the gate on, the adapter never ran over ordinary text during training, so a plain PEFT
-  forward describes a model that does not exist. The scripts refuse gate-on checkpoints
-  unless `--force`; the sweep only invokes them on the gate-off arm.
-- **`--signal-filter` is not part of the cache identity** — that is deliberate (it is what
-  lets 10 features share one dataset). It does mean that if you forget it on a
-  multi-feature config, the trainer aborts rather than guessing which feature to steer.
-- **`extreme` at scale 1 == uniform over the feature's empirical active range.** The name
-  is kept for consistency with the neuron scripts; `uniform` would be the better name at
-  publication-refactor time. Raise `--intervention-extreme-scale` (10, 100) for
-  larger-than-natural injections. Because SAE activations are non-negative, "on" draws are
-  floored at the smallest observed active value so an `active` label is always genuinely
-  active — unlike the neuron sampler, which is symmetric around the midpoint.
-- **Disk**: 640 runs × checkpoints. `StripEmbeddingSaveCallback` already strips the frozen
-  embedding rows; watch the quota anyway on the first full grid.
-- **Compute**: gemma-2-2b × 5 runs/task (each caches 300K + trains 1 epoch + evals) at
-  `h_rt=18:00:00`. If tasks time out, lower `--train-max-samples` or `N_FEAT_TRAIN`.
+(Contrast `test_endogenous.balanced_accuracy`, which only shows the report and the feature
+*correlate* on natural data — it cannot tell faithful from bypass. The interventional
+number is what separates them.)
 
 ---
 
-## 6. Open question this track is meant to answer
+## 6. Gotchas
 
-The neuron track found that introspection reports do **not** causally track the signal at
-earlier token positions — intervention does not move the prediction — i.e. the readout is
-a context bypass. The SAE track asks whether that is a property of *the target* (an
-arbitrary, uninterpretable neuron the model has no reason to propagate) or of *the
-mechanism* (attention cannot transport an arbitrary internal scalar to a later readout).
+- **A `nan` metric means "no data to score", not "the model failed".** SAE features are
+  sparse, so at a fixed token position a feature can have *no active examples* in the test
+  set — one class only. Balanced accuracy and precision are then undefined (averaging the
+  per-class recalls hits 0/0 on the missing class), so the eval returns `nan` with a
+  `single-class eval set` note instead of a misleading number. It is *per feature* (each
+  feature is scored on its own run) and specific to the *tested position*. Before calling a
+  feature a failure, check `base_rate_positive`: `0.0` (or `1.0`) means the set was
+  single-class. Only the *endogenous* metric can hit this — the interventional set is 50/50
+  by construction. With the selected 0.1–1% density features it should not occur (~hundreds
+  of active examples in 30k); it is a guard for rarer features, other positions, or smaller
+  corpora.
 
-Two things change here: the target is a semantically meaningful, load-bearing direction
-the model actually uses, and the task is **detection** rather than magnitude — which plays
-to what attention is structurally good at (identity/retrieval) rather than what it is bad
-at (reading a scalar magnitude). If detection stays faithful at early positions where
-neuron magnitude reading failed, that is the interesting positive result. If it collapses
-the same way, the wall is about transport, not about the target — also a clean finding.
+- **One cache holds several features; `--signal-filter` picks one, and forgetting it aborts.**
+  To avoid re-encoding, a single cache stores all of a cell's features (one forward pass over
+  the text encodes them all); each run trains on one via `--signal-filter S9.<index>`. The
+  filter is deliberately *not* part of the cache identity, so every per-feature run reuses the
+  same cache directory instead of rebuilding it. The catch: because the filter is not in the
+  identity, a multi-feature cache with no filter is ambiguous — so the trainer **aborts**
+  rather than silently training on the wrong feature (which would be an invisible bug). Always
+  pass the filter when the cache holds more than one feature.
+
+- **`extreme` scale 1 is the *natural* magnitude, not an extreme one.** The interventional
+  steering magnitude comes from `OnOffSampler`; the distribution is named `extreme` only for
+  parity with the neuron scripts. At `--intervention-extreme-scale 1`, an "on" draw is uniform
+  over the feature's observed active range `[amin, amax]` — i.e. natural magnitudes. Because
+  SAE activations are non-negative, every "on" draw is floored at `amin` (~the JumpReLU
+  threshold), so an "on" label is active *in SAE coordinates* (re-encoded, it often is not;
+  see the next item). To inject harder than natural, raise
+  `--intervention-extreme-scale` (10, 100). Interpretation: faithfulness at scale 1 is a
+  strong result (the model reads the feature at magnitudes it actually sees); needing a large
+  scale to move the report is a weaker, more artificial effect.
+
+- **What the interventional test measures: the decoder direction, not an encoder-read
+  "active" feature.** Steering adds `(v - f) * W_dec[i]`. Re-encoded, feature *i*'s
+  pre-activation rises by only ~0.85·v (`W_enc[:, i] · W_dec[i]` is 0.83–0.86 for the
+  layer-9 features), and on a naturally inactive token it starts below zero, so a natural-
+  magnitude "on" steer usually stays under the JumpReLU threshold (~2.5). Measured on the
+  five layer-9 features in bf16 (`_scratch_equiv/check_steer_reencode.py`, 2026-10-09):
+
+  | feature | train draws read active | eval value (median active) read active | ...on naturally inactive rows | "off" reads inactive |
+  |---|---|---|---|---|
+  | S9.1568 | 74% | 18% | 8% | 99.6% |
+  | S9.4854 | 78% | 21% | 12% | 100% |
+  | S9.4120 | 63% | 16% | 5% | 99.6% |
+  | S9.978 | 55% | 11% | 5% | 100% |
+  | S9.12408 | 75% | 24% | 7% | 99.8% |
+
+  So the interventional result answers "can the model detect feature *i*'s decoder direction
+  injected at natural magnitude", while the endogenous labels use the encoder's definition
+  (activation > 0). The two coincide for "off" but not for "on". **Kept deliberately** (decided
+  2026-10-09) so the layer x position sweep stays comparable with the layer-9 runs; describe
+  interventional faithfulness in these terms. An encoder-consistent variant (per-row
+  injection chosen so the re-encoded value equals the target) would be a separate follow-up.
+  Same check: the bf16 model's activations agree with the fp32-cached labels on 100% of
+  inactive and 98.4–100% of active rows.
+
+---
+
+## 7. Layer x position sweep
+
+The layer-9 analysis repeated over **layers {0, 5, 10, 15, 20} x token positions
+{1, 8, 16, 24, 31}**, 3 features per layer, W in {1.0, 0.9}: 5 x 5 x 3 x 2 = **150 runs**
+(~1 h each on layer-9 timing). The layer-9 runs (position -1) are the reference.
+
+**Features are selected per layer, not per position**, with exactly the layer-9 pipeline
+(§3 steps 0–2, at position -1), then reused at every position of that layer. Gemma Scope
+trains one SAE per layer, so features do not carry across layers by index; each layer gets
+its own. The annotation step fetches only the top 200 candidates per layer
+(`--max-fetch`, default `MAX_FETCH=200`): the steering step only takes the top 20 by
+the same ranking, so this selects the same features as a full fetch as long as >= 20 of
+the 200 have an explanation (at every layer, all 200 did).
+
+**Layer 25 is excluded.** It is the last decoder layer: after its output only the final norm
+and the LM head follow, neither of which mixes positions, so steering the text token cannot
+reach the readout token and the interventional test is capped at chance by construction.
+
+**Positions are absolute token indices** (0 is BOS, which Gemma Scope SAEs exclude, and
+`--max-seq-length 32` makes 31 the last). The sweep sets `--min-seq-length 32`: without it
+the cacher clamps a position past a short text to its last token, mixing positions.
+
+```bash
+# 1. selection (per layer, position -1) -- writes ..._res{L}_pos-1_16k.parquet
+sbatch scripts/sae/precompute_sae_feature_stats.sh             # includes Gate 0 per layer
+bash   scripts/sae/annotate_sae_features_neuronpedia.sh        # needs internet
+sbatch scripts/sae/generate_sae_steering_samples.sh            # layer-9 settings -> judge.md per layer, judge blind
+
+# 2. record the top 3 passing features per layer (ranked) in scripts/sae/sweep_features.txt
+
+# 3. per-position density check of the chosen features (25 tasks)
+POSITIONS="1 8 16 24 31" sbatch --array=1-25 scripts/sae/precompute_sae_feature_stats.sh
+
+# 4. caches (25, one per layer x position) then training (150), chained with afterok
+DRY_RUN=1 bash scripts/sae/submit_sae_sweep.sh                 # print the plan
+bash scripts/sae/submit_sae_sweep.sh                           # WEIGHTS="..." / MAX_PARALLEL=N
+
+# 5. figures -> figures/sae_sweep/
+python analysis/plot_sae_sweep.py --runs outputs/runs/sae_layerpos_joint \
+    --anchor outputs/runs/sae_l9_joint
+```
+
+- **Two stages, so tasks never race on a cache.** One cache per (layer, position) holds all
+  3 of the layer's features (the signal list is the same for every run of the cell, so they
+  resolve to one `dataset_name`); `cache_sae_sweep.sh` builds them, `train_sae_sweep.sh`
+  starts only after all succeed.
+- **Feature-major task order.** Training tasks 1–50 are F1 of every layer over all positions
+  and weights, 51–100 F2, 101–150 F3. SLURM starts low indices first, so F1's complete
+  layer x position grid arrives first.
+- **Every run does the cache-alignment check** (`--force-drift-eval`) and stops if steering
+  would hit a different token than the one cached. New positions are exactly where an
+  off-by-one would show up.
+- **Resubmitting is safe.** The trainer skips a finished run and resumes from the newest
+  checkpoint (saved every 25%); the cacher skips a built cache.
+- **Rows whose token changes on re-tokenization are dropped** (train and test). The prompt
+  is `f"{text} {separator}..."`; a truncated text ending in a lone space token merges with
+  the template's space, so the prompt would name and steer a different token than the
+  label describes. ~1.3% of rows at the last position of a truncated text, none elsewhere;
+  the trainer prints the count per split.
+- **The alignment check samples active rows on purpose** (up to half of its 512), so a
+  sparse feature cannot fail it just by having no positives among the first rows; below 10
+  active test rows it falls back to the token-match check and warns.
+- **Precision is `nan`, not 0, when a run never predicts `active`** (undefined, and kept
+  out of the means in the heatmaps).
+- **Metrics files now include confusion counts** (`tpr`, `tnr`, `act_pred_*`, `ina_pred_*`),
+  so `plot_sae_sweep.py` draws confusion matrices without reloading checkpoints.
+
