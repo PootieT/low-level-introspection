@@ -93,7 +93,12 @@ class SAEFeatureSampler(BaseModel):
     #     Tune this to the dataset size, not blindly.
     min_density: float = 1e-3
     max_density: float = 0.01
-    # optional Neuronpedia auto-interp score floor (None => ignore)
+    # optional Neuronpedia auto-interp score floor (None => ignore). NOTE: Neuronpedia
+    # exposes descriptions but NOT auto-interp scores for the Gemma Scope res-16k
+    # features (scores: []), so this floor is effectively inert for that release --
+    # feature selection is instead decided by the steering judge
+    # (generate_sae_steering_samples.py + out-of-band judging). annotate_sae_features_
+    # neuronpedia.py still records interp_score when a release does provide one.
     min_interp_score: float | None = None
     seed: int = 0
 

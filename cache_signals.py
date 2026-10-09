@@ -457,7 +457,10 @@ def write_dataset_metadata(config: ExperimentConfig, output_dir: Path, model,
                 "test": config.test_dataset.max_seq_length,
             },
         },
-        "capture": {"model_dtype": dtype, "signal_site": "mlp.act_fn output (post-activation neuron)"},
+        "capture": {"model_dtype": dtype, "signal_site": (
+            "SAE feature (encode of the decoder-layer residual output)"
+            if any(getattr(sp, "type", None) == "sae" for sp in config.train_signals)
+            else "mlp.act_fn output (post-activation neuron)")},
         "row_counts": row_counts,
         # What the cache ACTUALLY contains, not what was requested. A length sweep is
         # only meaningful if the documents really reach the nominal length: max_seq_length
