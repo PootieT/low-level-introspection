@@ -639,8 +639,15 @@ def plot_relative_generalization_compare(pooled_by: dict, out_dir, eval_type="en
                 scale = 100 if y == "rel" else 1
                 ax = axes[i, j]
                 ax.errorbar(g["ratio"], scale * g[y], yerr=scale * g[sd].fillna(0),
-                            marker="o", ms=7, capsize=3, lw=2, color=c,
+                            marker="", capsize=3, lw=2, color=c,
                             label=f"{label} (n={int(g['n'].max())})")
+                # solid = in-distribution (eval at the training length), hollow = longer
+                # than anything seen in training -- as in plot_relative_generalization
+                ind = g["ratio"] == 1
+                ax.plot(g.loc[ind, "ratio"], scale * g.loc[ind, y], "o", ms=8, color=c,
+                        zorder=3)
+                ax.plot(g.loc[~ind, "ratio"], scale * g.loc[~ind, y], "o", ms=8,
+                        mfc="white", mec=c, mew=1.8, zorder=3)
         for i in range(2):
             ax = axes[i, j]
             ax.set_xscale("log", base=2)
