@@ -74,6 +74,14 @@ def parse_args() -> argparse.Namespace:
                              "In a length sweep set this to the LONGEST arm's length for EVERY "
                              "arm, so all arms draw from the same document population; per-arm "
                              "floors confound the length effect with a content shift.")
+    parser.add_argument("--train-negative-keep", type=float, default=None,
+                        help="Keep each INACTIVE train row with this probability "
+                             "(deterministic per signal x text; active rows always kept). For "
+                             "multi-feature detection caches, where a dense text x feature table "
+                             "is mostly inactive rows. Part of the cache identity when set.")
+    parser.add_argument("--test-negative-keep", type=float, default=None,
+                        help="Same for the test split. The rows with subsample_u below any "
+                             "threshold <= this stay a uniform (natural-mix) sample of texts.")
     parser.add_argument("--text-field", default="text")
     # parser.add_argument("--sample-per-data", type=int, default=1)  # TODO maybe no need better to have diverse datapoints
 
@@ -142,6 +150,18 @@ def parse_args() -> argparse.Namespace:
                              "(train with train_sae_detector.py).")
     parser.add_argument("--detection-balance-pos-frac", type=float, default=0.5,
                         help="Oversample feature-active rows in TRAIN up to this fraction (detection only).")
+    parser.add_argument("--detection-total-train-rows", type=int, default=None,
+                        help="Multi-feature detection: resample TRAIN to exactly this many rows, "
+                             "split equally across features (budget // N each) and balanced to "
+                             "--detection-balance-pos-frac per feature. Unset => single-feature recipe.")
+    parser.add_argument("--feature-labels-file", type=str, default=None,
+                        help="JSON with a 'labels' dict {'S<layer>.<index>': label} (the pool file "
+                             "build_sae_featgen_pool.py writes). Stored in the config for "
+                             "--prompt-type prompt_sae_label.")
+    parser.add_argument("--max-prompt-tokens", type=int, default=30,
+                        help="Token budget for the introspection prompt + answer on top of "
+                             "--max-seq-length. 30 fits the index prompts; a label prompt needs "
+                             "room for the label.")
     parser.add_argument("--intervention-signal-distribution", type=str, default="uniform",
                         choices=["uniform", "gaussian", "extreme", "empirical"],
                         help="Distribution to sample the injected value from at intervention time. "
@@ -234,6 +254,9 @@ def main() -> None:
         return
 
     hf_data_kwargs = json.loads(args.hf_data_kwargs) if args.hf_data_kwargs else {}
+    feature_labels = None
+    if args.feature_labels_file:
+        feature_labels = json.loads(Path(args.feature_labels_file).read_text())["labels"]
 
     model_config = AutoConfig.from_pretrained(args.model)
     train_spec = resolve_signal_source(load_spec(args.train_signals), model_config=model_config, precision=args.precision)
@@ -261,6 +284,7 @@ def main() -> None:
             hf_data_kwargs=hf_data_kwargs,
             max_seq_length=args.max_seq_length,
             min_seq_length=args.min_seq_length,
+            negative_keep=args.train_negative_keep,
         ),
         dev_dataset=DatasetConfig(
             name=args.train_dataset,
@@ -271,6 +295,8 @@ def main() -> None:
             max_seq_length=args.max_seq_length,
             min_seq_length=args.min_seq_length,
             offset=args.dev_offset_from_train,
+            # never subsampled: dev is small, and a subsampled split can come out EMPTY,
+            # which datasets cannot load back from disk
         ),
         test_dataset=DatasetConfig(
             name=args.test_dataset,
@@ -280,6 +306,7 @@ def main() -> None:
             hf_data_kwargs=hf_data_kwargs,
             max_seq_length=args.max_seq_length,
             min_seq_length=args.min_seq_length,
+            negative_keep=args.test_negative_keep,
         ),
 
         train_signals=train_spec,
@@ -309,7 +336,7 @@ def main() -> None:
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             eval_batch_size=args.eval_batch_size,
             num_epochs=args.num_epochs,
-            max_seq_length=args.max_seq_length + 30, # input + introspection prefill
+            max_seq_length=args.max_seq_length + args.max_prompt_tokens, # input + introspection prefill
             prompt_type=args.prompt_type,
             disable_adapter_in_input=args.disable_adapter_in_input,
             precision=args.precision,
@@ -320,6 +347,8 @@ def main() -> None:
             bf16=args.bf16,
             objective=args.objective,
             detection_balance_pos_frac=args.detection_balance_pos_frac,
+            detection_total_train_rows=args.detection_total_train_rows,
+            feature_labels=feature_labels,
         ),
         eval_config = EvalConfig(
             do_sample=args.do_sample,

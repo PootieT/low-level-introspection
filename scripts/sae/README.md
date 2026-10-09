@@ -398,3 +398,74 @@ python analysis/plot_sae_sweep.py --runs outputs/runs/sae_layerpos_joint \
 - **Metrics files now include confusion counts** (`tpr`, `tnr`, `act_pred_*`, `ina_pred_*`),
   so `plot_sae_sweep.py` draws confusion matrices without reloading checkpoints.
 
+
+---
+
+## 8. Feature generalization (features named by their label)
+
+The SAE analogue of the neuron track's neuron-generalization sweep
+(`scripts/neuron/train_single_mlp_introspector_neuron_generalization.sh`), where naming
+neurons by index gave no generalization at all. Here a feature is named by its
+Neuronpedia explanation. Can one introspector, trained on N layer-9 features, read
+features it never trained on?
+
+| file | role |
+|---|---|
+| `build_sae_featgen_pool.py` | the 200-feature pool: `candidates` (density band + positives floor, seeded random sample), `build` (labels, near-duplicate removal, ordering, label-similarity matrix) |
+| `src/introspector/sae_featgen.py` | row budget (`balance_rows_per_feature`), pool loading, nearest-trained-label similarity |
+| `train_sae_detector_joint.py` | multi-feature path (`main_multi`), taken when `detection_total_train_rows` is set. The single-feature `main()` is untouched. |
+| `score_sae_feature_generalization.py` | eval on every pool feature (seen / held out) + the steer x ask distractor matrix |
+| `scripts/sae/featgen_common.sh` | the run table + config generation |
+| `analysis/plot_sae_feature_generalization.py` | figures + CSVs |
+
+```bash
+qsub scripts/sae/build_featgen_pool_layer9.sh        # gate 0, stats, candidates, Neuronpedia, pool
+qsub scripts/sae/cache_sae_feature_generalization.sh # every cache, one job
+qsub -hold_jid sae_featgen_cache -t 1-5 scripts/sae/train_sae_feature_generalization.sh   # label arm
+qsub -t 6-10 scripts/sae/train_sae_feature_generalization.sh                              # index arm, later
+python analysis/plot_sae_feature_generalization.py
+```
+
+**Design.**
+- **Recipe.** Layer 9, position -1, 32-token texts, joint w=0.9, KL 0.1, gate off: the
+  layer-9 recipe. N in {1, 3, 10, 30, 100} as nested prefixes of the pool.
+- **Arms.** `label` uses `prompt_sae_label`: the existing SAE templates with only the
+  feature's name swapped for its quoted label. `index` is the existing
+  `prompt_no_token_index`, the control.
+- **Row budget: 300k rows at every N, split equally across features (300k/N each),
+  exactly half active.**
+  - Inactive rows are subsampled to the quota: the smallest `subsample_u`, so they are
+    nested across N.
+  - Active rows are repeated to the quota.
+  - So distinct active examples per feature are fixed by density at every N, while
+    distinct inactive examples shrink as 1/N. **State this when reporting the N curve.**
+  - Active repeats fall from 100-1000x at N=1 to at most 10x at N=100.
+- **Caches** store only what the trainer can use, via `DatasetConfig.negative_keep`
+  (`--train-negative-keep`, `--test-negative-keep`):
+  - Inactive rows are kept by a deterministic per-(signal, text) hash
+    (`dataset_utils.subsample_key`). Thresholds nest, and rows below a threshold are a
+    uniform sample of texts.
+  - The field enters the cache hash only when set, so every existing cache keeps its
+    name.
+- **Pool selection.**
+  - Same density band as section 3, plus >= 50 projected positives at the readout.
+  - `pos_density` is measured at the last token of a 32-token window
+    (`select_sae_features.py --pos-window 32`). At 128 tokens the last token is often
+    the document's end, which is a different population.
+  - Near-duplicate labels are dropped at all-MiniLM-L6-v2 cosine >= 0.7. Paraphrases
+    measured 0.65-0.82, unrelated labels ~0.15.
+  - The 5 steering-judged features come first, so the smallest runs line up with the
+    existing layer-9 single-feature runs.
+
+**Reading the results.**
+- **Headline: held-out interventional balanced accuracy.** Each text is steered on
+  (the feature's median active value) and off.
+- **It needs the distractor matrix next to it.** At eval most texts are naturally
+  inactive, so "off" changes nothing and "on" is the only perturbation. A readout that
+  detects *any* injection scores well on held-out features too. The matrix steers
+  feature j while the prompt names feature i: a readout addressed to i stays at its
+  "off" rate off the diagonal.
+- **Endogenous held-out accuracy is weak evidence**: the label describes text the
+  feature fires on, so it can be guessed without introspection.
+- **Precision is reported at each feature's natural base rate** (from TPR/FPR), since
+  the endogenous eval set subsamples inactive rows.

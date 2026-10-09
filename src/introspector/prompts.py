@@ -1,4 +1,5 @@
 import random
+from functools import partial
 from typing import Literal
 
 
@@ -116,6 +117,49 @@ def sae_prompt(
     return prompt
 
 
+def feature_key(layer: int, signal_index: int) -> str:
+    """Key into TrainingConfig.feature_labels for an SAE feature."""
+    return f"S{int(layer)}.{int(signal_index)}"
+
+
+def sae_label_prompt(
+    layer: int,
+    signal_index: int,
+    token: str,
+    token_index: int,
+    labels: dict[str, str],
+) -> str:
+    """sae_prompt() with the feature NAMED BY ITS LABEL instead of its index.
+
+    These MUST stay sae_prompt()'s templates with only `SAE feature {SIGNAL_IDX}` (or
+    `{LAYER}.{SIGNAL_IDX}`) swapped for `SAE feature "{LABEL}"`, so the label and
+    index arms of the feature-generalization experiment differ in how the feature is
+    addressed and in nothing else (same rule as mlp_prompt_with_token_index). The
+    fourth template's `{LAYER}.{SIGNAL_IDX}` becomes `"{LABEL}" (layer {LAYER})` --
+    its index-only form names the layer, so the label form keeps it.
+
+    A feature with no label raises rather than falling back to its index: a silent
+    fallback would put index-addressed rows into a label-addressed run.
+    """
+    key = feature_key(layer, signal_index)
+    if key not in labels:
+        raise KeyError(f"no label for SAE feature {key}; the config's feature_labels "
+                       f"must cover every feature the run trains or evaluates")
+    templates = [
+        'At token "{TOKEN}", SAE feature "{LABEL}" at layer {LAYER} is',
+        'The SAE feature "{LABEL}" at layer {LAYER} for token "{TOKEN}" is',
+        'SAE feature "{LABEL}" at layer {LAYER} and token "{TOKEN}" has activation level of',
+        'SAE feature "{LABEL}" (layer {LAYER}) at token "{TOKEN}" has activation of',
+    ]
+    return random.choice(templates).format(TOKEN=token, LABEL=labels[key], LAYER=layer)
+
+
+def prompt_sae_label(signal_type: str, labels: dict[str, str], **kwargs):
+    if signal_type != "sae":
+        raise ValueError(f"prompt_sae_label is for SAE features, got signal_type={signal_type!r}")
+    return sae_label_prompt(labels=labels, **kwargs)
+
+
 def prompt_no_token_index(
     signal_type: Literal["mlp", "attention_score", "residual_stream", "sae"],
     **kwargs
@@ -147,4 +191,21 @@ def prompt_with_token_index(
 PROMPT_REGISTRY = {
     "prompt_no_token_index": prompt_no_token_index,
     "prompt_with_token_index": prompt_with_token_index,
+    # needs labels=TrainingConfig.feature_labels bound first; use get_prompt_fn
+    "prompt_sae_label": prompt_sae_label,
 }
+
+# prompt types whose function needs the config's feature_labels bound in
+_LABEL_PROMPTS = {"prompt_sae_label"}
+
+
+def get_prompt_fn(training_config):
+    """PROMPT_REGISTRY lookup that binds feature_labels for the label prompts, so
+    preprocess_example can call every prompt function with the same row fields."""
+    fn = PROMPT_REGISTRY[training_config.prompt_type]
+    if training_config.prompt_type in _LABEL_PROMPTS:
+        if not training_config.feature_labels:
+            raise ValueError(f"prompt_type={training_config.prompt_type!r} needs "
+                             f"training_config.feature_labels (--feature-labels-file)")
+        return partial(fn, labels=training_config.feature_labels)
+    return fn

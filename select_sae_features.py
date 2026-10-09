@@ -62,6 +62,13 @@ def parse_args():
     p.add_argument("--fixed-position", type=int, default=-1,
                    help="Readout position for the first fixed-position detection run; "
                         "pos_density is measured here.")
+    p.add_argument("--pos-window", type=int, default=None,
+                   help="Measure pos_density as if each text were truncated to this many "
+                        "tokens (BOS included): a negative --fixed-position counts back from "
+                        "min(length, window). Training caches use --max-seq-length 32, whose "
+                        "last token is mid-sentence for most C4 documents, while at 128 it is "
+                        "often the document's final token -- a different population. Density "
+                        "(the selection band) is still measured over all --max-seq-length tokens.")
     p.add_argument("--min-density", type=float, default=1e-3)
     p.add_argument("--max-density", type=float, default=0.01)
     p.add_argument("--cache-size", type=int, default=20000,
@@ -126,6 +133,8 @@ def main():
 
         # fixed-position (last real token per sequence, right-padded)
         lengths = am.sum(dim=1)                              # [B]
+        if args.pos_window:
+            lengths = lengths.clamp(max=args.pos_window)
         pos = (lengths + args.fixed_position) if args.fixed_position < 0 else torch.full_like(lengths, args.fixed_position)
         pos = pos.clamp(0, feats.shape[1] - 1)
         bidx = torch.arange(feats.shape[0], device=device)
@@ -154,6 +163,8 @@ def main():
         "active_max": active_max.cpu().numpy(),
         "n_active": active_count.cpu().numpy().astype("int64"),
     })
+    if args.pos_window:
+        df["pos_window"] = args.pos_window   # which population pos_density describes
     df["selected"] = (df["density"] >= args.min_density) & (df["density"] <= args.max_density)
     # projected positives if we build a fixed-position detection cache of --cache-size
     df["proj_pos_at_fixed_pos"] = (df["pos_density"] * args.cache_size).round().astype("int64")

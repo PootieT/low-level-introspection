@@ -207,8 +207,9 @@ class SAEInterventionHook:
     whether the introspector's report follows.
 
     token_positions/target_values: [bs] tensors (positions are absolute, i.e.
-    already padding-adjusted). Handles decoder layers whose forward returns either
-    a bare tensor or a (hidden, ...) tuple.
+    already padding-adjusted). feature_index: one int for the whole batch, or a [bs]
+    tensor giving each row its own feature (multi-feature runs). Handles decoder
+    layers whose forward returns either a bare tensor or a (hidden, ...) tuple.
     """
 
     def __init__(self, bundle, token_positions, feature_index, target_values):

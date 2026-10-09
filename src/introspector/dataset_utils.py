@@ -87,7 +87,7 @@ def _spec_identity(spec) -> dict[str, Any]:
 
 
 def _split_identity(ds_cfg) -> dict[str, Any]:
-    return {
+    ident = {
         "name": ds_cfg.name,
         "split": ds_cfg.split,
         "text_field": ds_cfg.text_field,
@@ -101,6 +101,11 @@ def _split_identity(ds_cfg) -> dict[str, Any]:
         "offset": ds_cfg.offset,
         "hf_data_kwargs": ds_cfg.hf_data_kwargs,
     }
+    # Only when set: adding the key unconditionally would change the hash -- and so the
+    # directory name -- of every cache built before the field existed.
+    if getattr(ds_cfg, "negative_keep", None) is not None:
+        ident["negative_keep"] = ds_cfg.negative_keep
+    return ident
 
 
 def dataset_identity(config) -> dict[str, Any]:
@@ -162,6 +167,22 @@ def canonical_dataset_name(config) -> str:
             identity_hash(config),
         ]),
     ])
+
+
+def subsample_key(seed: int, signal_type: str, layer: int, index: int, text: str) -> float:
+    """Deterministic uniform draw in [0, 1) for one (signal, text) row.
+
+    Keyed on the row's CONTENT, not its position in the stream, so the same row gets
+    the same key in every cache that contains it -- whatever the batch size, the other
+    signals cached alongside it, or the split's length. That is what makes subsampling
+    nested: thresholding at q keeps a superset of thresholding at q' < q, so a
+    feature's rows in an N=100 run are a subset of its rows in an N=10 run, and taking
+    the k smallest keys picks the same k rows in both. Being independent of the
+    activation, the rows with key < q are a uniform sample of texts at rate q.
+    """
+    code = _TYPE_CODE.get(signal_type, "X")
+    h = hashlib.blake2b(f"{seed}|{code}{layer}.{index}|{text}".encode("utf-8"), digest_size=8)
+    return int.from_bytes(h.digest(), "big") / 2.0 ** 64
 
 
 def parse_signal_filter(spec: str) -> dict[str, Any]:

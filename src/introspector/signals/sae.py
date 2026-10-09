@@ -104,6 +104,8 @@ class SAEBundle:
         applies cancels correctly. Returns [..., d_model] to be ADDED to resid.
 
         resid: [..., d_model] raw residual at the hook site.
+        index: one feature id for every row, or a [bs] integer tensor giving each row
+            of a [bs, d_model] resid its OWN feature (multi-feature training/eval).
         target_value: scalar or broadcastable to resid[..., 0].
         """
         import torch
@@ -112,7 +114,14 @@ class SAEBundle:
         base = self.decode(feats)                        # [..., d_model]
         feats_clamped = feats.clone()
         tv = torch.as_tensor(target_value, device=feats.device, dtype=feats.dtype)
-        feats_clamped[..., index] = tv
+        if torch.is_tensor(index) and index.ndim == 1:
+            if feats.ndim != 2 or index.shape[0] != feats.shape[0]:
+                raise ValueError(f"per-row index {tuple(index.shape)} needs a [bs, d_model] "
+                                 f"resid with bs={index.shape[0]}; got feats {tuple(feats.shape)}")
+            rows = torch.arange(feats.shape[0], device=feats.device)
+            feats_clamped[rows, index.to(feats.device)] = tv.expand(feats.shape[0])
+        else:
+            feats_clamped[..., index] = tv
         steered = self.decode(feats_clamped)             # [..., d_model]
         return (steered - base).to(dtype=resid.dtype, device=resid.device)
 

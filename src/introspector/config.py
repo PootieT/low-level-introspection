@@ -34,6 +34,18 @@ class DatasetConfig(BaseModel):
     min_seq_length: int | None = None
     hf_data_kwargs: dict[str, Any] = {}
     offset: int = 0
+    # Keep each INACTIVE (activation <= 0) row with this probability, decided by a
+    # deterministic hash of (seed, signal, text) -- dataset_utils.subsample_key, stored
+    # per row as `subsample_u`. Active rows are always kept. None => keep every row and
+    # write no `subsample_u` column (the behaviour of every cache built before this).
+    #
+    # For multi-feature SAE caches: a dense text x feature table is 15M rows at 100
+    # features x 150k texts, almost all of them inactive rows the trainer would throw
+    # away. Because the key is per (signal, text) and thresholded, a lower keep is a
+    # strict SUBSET of a higher one -- a feature's inactive rows at N=100 are a prefix
+    # of its rows at N=10 -- and the rows with u < q are a uniform sample of texts at
+    # rate q, active and inactive alike.
+    negative_keep: float | None = None
 
 
 class TrainingConfig(BaseModel):
@@ -71,6 +83,17 @@ class TrainingConfig(BaseModel):
     # fraction so a sparse feature can't be learned as "always inactive". Eval/test
     # keep the natural distribution; metrics are AUROC/AP (imbalance-robust).
     detection_balance_pos_frac: float = 0.5
+    # MULTI-FEATURE detection (train_sae_detector_joint.py). When set, the train split
+    # is resampled to exactly this many rows in total, split EQUALLY across the trained
+    # features (budget // N each), each feature's share balanced to
+    # detection_balance_pos_frac: inactive rows subsampled, active rows repeated. None
+    # => the single-feature recipe (oversample_positives), unchanged.
+    detection_total_train_rows: int | None = None
+    # Natural-language name per SAE feature, keyed "S<layer>.<index>" (Neuronpedia
+    # explanations). Read by prompt_type="prompt_sae_label", which names the feature by
+    # this label instead of its index. Carries the WHOLE pool's labels, not just the
+    # trained ones, so held-out features can be prompted at eval time.
+    feature_labels: dict[str, str] | None = None
     # LR schedule
     warmup_ratio: float = 0.0
     lr_scheduler_type: str = "linear"   # linear | cosine | constant | ...

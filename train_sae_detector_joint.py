@@ -47,17 +47,22 @@ import torch.nn.functional as F
 from datasets import load_from_disk
 from torch.utils.data import DataLoader
 from peft import LoraConfig, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainerCallback, TrainingArguments
+from transformers import (
+    AutoModelForCausalLM, AutoTokenizer, Trainer, TrainerCallback, TrainingArguments, set_seed,
+)
 
 from src.introspector.config import ExperimentConfig
-from src.introspector.dataset_utils import apply_signal_filter, parse_signal_filter
+from src.introspector.dataset_utils import (
+    apply_signal_filter, parse_signal_filter, parse_signal_filters,
+)
 from src.introspector.models.signal_paths import resolve_sae_hook_path
 from src.introspector.signals.sae import load_sae_for_spec
 from src.introspector.training.model import (
     StripEmbeddingSaveCallback, replace_model_with_gated_version,
-    replace_lora_with_gated_version, SAEInterventionHook,
+    replace_lora_with_gated_version, SAEInterventionHook, load_added_token_embeddings,
 )
-from src.introspector.prompts import PROMPT_REGISTRY
+from src.introspector.prompts import get_prompt_fn
+from src.introspector.sae_featgen import balance_rows_per_feature, ensure_subsample_u
 from train_introspector import preprocess_example, INTROSPECTION_SEPARATOR
 
 
@@ -83,6 +88,32 @@ def resolve_spec(config):
     if len(specs) > 1:
         raise SystemExit("multiple SAE features cached but no --signal-filter; ambiguous.")
     return specs[0]
+
+
+def resolve_specs(config):
+    """MULTI-feature counterpart of resolve_spec: every SAE feature this run trains on,
+    in config order (= pool order, which the row budget and the eval follow). Uses the
+    signal filter's list when given, else every cached SAE feature. All must come from
+    ONE SAE: the steering hook sits on one layer and encodes with one bundle."""
+    specs = [s for s in config.train_signals if getattr(s, "type", None) == "sae"]
+    if not specs:
+        raise SystemExit("config.train_signals contains no SAE feature")
+    if config.signal_filter:
+        by_key = {(s.layer, s.index): s for s in specs}
+        out = []
+        for w in parse_signal_filters(config.signal_filter):
+            key = (w["signal_layer"], w["signal_index"])
+            if key not in by_key:
+                raise SystemExit(f"--signal-filter names S{key[0]}.{key[1]}, which is not cached")
+            out.append(by_key[key])
+        specs = out
+    sae_ids = {(s.sae_release, s.sae_site, s.sae_width, s.layer) for s in specs}
+    if len(sae_ids) > 1:
+        raise SystemExit(f"multi-feature run spans {len(sae_ids)} SAEs {sorted(sae_ids)}; "
+                         f"one hook site and one encoder are assumed")
+    if len({s.index for s in specs}) != len(specs):
+        raise SystemExit("duplicate feature in the trained set")
+    return specs
 
 
 def oversample_positives(ds, target_pos_frac, seed):
@@ -189,20 +220,53 @@ class OnOffSampler:
         return (True, self._on_value()) if self.rng.random() < 0.5 else (False, 0.0)
 
 
+class MultiOnOffSampler:
+    """OnOffSampler per feature -- each 'on' magnitude comes from THAT feature's own
+    active range -- sharing one RNG, so the draw sequence is fixed by the row order
+    alone. draw(feature_index) -> (is_on, value)."""
+    def __init__(self, active_by_feature, distribution="extreme", extreme_scale=1.0, seed=0):
+        self.rng = np.random.RandomState(seed)
+        self.samplers = {}
+        for f, vals in active_by_feature.items():
+            s = OnOffSampler(vals, distribution=distribution, extreme_scale=extreme_scale, seed=seed)
+            s.rng = self.rng
+            self.samplers[int(f)] = s
+
+    def draw(self, feature_index):
+        return self.samplers[int(feature_index)].draw()
+
+    @classmethod
+    def from_rows(cls, raw, **kw):
+        sig = np.asarray(raw["signal_index"])
+        act = np.asarray(raw["activation"], dtype=float)
+        by_f = {int(f): act[(sig == f) & (act > 0)] for f in np.unique(sig)}
+        dead = [f for f, v in by_f.items() if len(v) == 0]
+        if dead:
+            raise SystemExit(f"no active rows (no 'on' magnitude to steer to) for feature "
+                             f"index(es) {dead[:10]}; drop them from the pool")
+        return cls(by_f, **kw)
+
+
 class JointTrainCollator:
     """Prompt-only rows, RIGHT-padded (readout = last real token = attn.sum(1)-1).
     Emits the natural label AND a freshly sampled on/off steer, plus an
     `anchor_region_mask` (input text=0, introspection prompt=1, pad=0) for the KL
-    anchor. Gate OFF: no lora_token_mask."""
+    anchor. Gate OFF: no lora_token_mask.
+
+    With a MultiOnOffSampler each row is steered on/off for ITS OWN feature (its
+    signal_index), drawn from that feature's active range, and the batch carries
+    `feature_index` for the steering hook."""
     def __init__(self, tokenizer, sampler):
         self.pad_id, self.sampler = tokenizer.pad_token_id, sampler
+        self.per_feature = isinstance(sampler, MultiOnOffSampler)
 
     def __call__(self, features):
         ids = [list(f["input_ids"]) for f in features]
         m = max(len(x) for x in ids)
         steer, interv, region = [], [], []
         for x, f in zip(ids, features):
-            is_on, value = self.sampler.draw()
+            is_on, value = (self.sampler.draw(f["signal_index"]) if self.per_feature
+                            else self.sampler.draw())
             steer.append(value)
             interv.append(int(is_on))
             fil = int(f["frozen_input_len"])
@@ -216,6 +280,8 @@ class JointTrainCollator:
             "interv_label": torch.tensor(interv, dtype=torch.long),
             "anchor_region_mask": torch.tensor(region),
         }
+        if self.per_feature:
+            batch["feature_index"] = torch.tensor([int(f["signal_index"]) for f in features])
         assert bool((((batch["anchor_region_mask"] == 0) & (batch["attention_mask"] == 1))
                      .any(dim=1)).all()), "a row has no input-text position for the KL anchor"
         return batch
@@ -306,8 +372,10 @@ class JointTrainer(Trainer):
         if self.w >= 1.0:
             loss = endo
         else:
+            # feature_index=None: multi-feature run, each row steers its own feature
+            fidx = inputs["feature_index"] if self.feature_index is None else self.feature_index
             hook = SAEInterventionHook(self.bundle, inputs["token_position"],
-                                       self.feature_index, inputs["steer_value"])
+                                       fidx, inputs["steer_value"])
             handle = self.module.register_forward_hook(hook)
             try:
                 out_i = model(input_ids=ii, attention_mask=am)
@@ -499,14 +567,16 @@ def cache_alignment(model, spec, bundle, module, test_raw, ds_pred, collator, to
     return res
 
 
-def make_preprocess(config, tokenizer, for_train):
+def make_preprocess(config, tokenizer, for_train, multi=False):
     """for_train: prompt-only + frozen_input_len (for the region mask) + the raw
-    token_position/activation the collator needs. Eval: prompt-only, detection words
-    set so the prompt ends exactly before the answer token."""
+    token_position/activation the collator needs (+ signal_index when multi, so each
+    row steers its own feature). Eval: prompt-only, detection words set so the prompt
+    ends exactly before the answer token."""
     tc = config.training_config
+    prompt_fn = get_prompt_fn(tc)
     def pp(ex):
         out = preprocess_example(
-            ex, tokenizer=tokenizer, prompt_fn=PROMPT_REGISTRY[tc.prompt_type],
+            ex, tokenizer=tokenizer, prompt_fn=prompt_fn,
             max_length=tc.max_seq_length, return_frozen_input_len=True, for_prediction=True,
             **({} if for_train else dict(detection=True,
                                          detection_active_word=tc.detection_active_word,
@@ -514,8 +584,21 @@ def make_preprocess(config, tokenizer, for_train):
         if for_train:
             out["token_position"] = ex["token_position"]
             out["activation"] = ex["activation"]
+            if multi:
+                out["signal_index"] = ex["signal_index"]
         return out
     return pp
+
+
+def assert_prompts_fit(ds, max_length, split):
+    """preprocess_example TRUNCATES at max_length, cutting the END of the prompt -- the
+    readout token -- so a too-long prompt is read out mid-sentence with no error. A
+    label prompt is much longer than an index prompt, so check rather than assume."""
+    longest = max(len(x) for x in ds["input_ids"])
+    if longest >= max_length:
+        raise SystemExit(f"{split}: a prompt reaches max_seq_length={max_length} tokens and "
+                         f"was truncated. Raise --max-prompt-tokens in the config generator.")
+    print(f"[joint] {split}: longest prompt {longest} tokens (< max_seq_length {max_length})")
 
 
 def parse_args():
@@ -534,6 +617,25 @@ def parse_args():
     p.add_argument("--overwrite-cache", action="store_true")
     p.add_argument("--force-drift-eval", action="store_true")
     p.add_argument("--ignore-misalignment", action="store_true")
+    # ---- multi-feature runs (training_config.detection_total_train_rows set) ----
+    p.add_argument("--feature-gen-pool-config", type=Path, default=None,
+                   help="Multi-feature runs: config of the POOL cache (every pool feature over "
+                        "the eval texts). The end-of-run eval scores every feature in it, "
+                        "labelled trained/held-out (score_sae_feature_generalization.py). "
+                        "Without it, only the run's own features on its own test split.")
+    p.add_argument("--feature-gen-only", action="store_true",
+                   help="Load the latest (or --checkpoint) checkpoint and run ONLY the "
+                        "multi-feature eval; no training.")
+    p.add_argument("--checkpoint", type=Path, default=None)
+    p.add_argument("--fg-interv-texts", type=int, default=500,
+                   help="Natural-distribution texts per feature for the interventional eval "
+                        "(each run steered on AND off).")
+    p.add_argument("--fg-endo-max-pos", type=int, default=500)
+    p.add_argument("--fg-endo-neg", type=int, default=1000)
+    p.add_argument("--fg-distractor-features", type=int, default=20,
+                   help="Seen AND held-out features (this many of each) in the steer x ask "
+                        "distractor matrix. 0 disables it.")
+    p.add_argument("--fg-distractor-texts", type=int, default=50)
     return p.parse_args()
 
 
@@ -543,6 +645,13 @@ def main():
     tc = config.training_config
     assert tc.objective == "detection", "joint detector expects objective='detection'"
     assert not tc.disable_adapter_in_input, "joint runs are gate-OFF; do not set disable_adapter_in_input"
+    if tc.detection_total_train_rows is not None:
+        # Multi-feature runs take their own path, so the single-feature recipe below --
+        # which the layer x position grid runs on -- is untouched by them.
+        return main_multi(args, config)
+    if args.feature_gen_only or args.feature_gen_pool_config:
+        raise SystemExit("--feature-gen-* need a multi-feature config "
+                         "(training_config.detection_total_train_rows)")
     w = args.joint_loss_weight
 
     out_dir = Path(config.output_dir) / config.experiment_name
@@ -640,6 +749,157 @@ def main():
                "test_endogenous": test_endo, "test_interventional": test_interv}
     print(json.dumps(metrics, indent=2))
     (out_dir / "sae_joint_train_metrics.json").write_text(json.dumps(metrics, indent=2))
+
+
+def build_model(config, tokenizer, checkpoint=None):
+    """Gated-LoRA gemma, as main() builds it -- fresh adapter, or a trained one loaded
+    frozen from `checkpoint` (with the separator's embedding row restored, since
+    StripEmbeddingSaveCallback drops the embedding matrices from every checkpoint)."""
+    tc = config.training_config
+    model = AutoModelForCausalLM.from_pretrained(
+        config.model_name, torch_dtype=torch.bfloat16 if tc.bf16 else torch.float32, device_map="auto")
+    model.resize_token_embeddings(len(tokenizer))
+    if checkpoint is None:
+        model = get_peft_model(model, LoraConfig(
+            r=tc.lora_r, lora_alpha=tc.lora_alpha, target_modules=tc.lora_target_modules,
+            lora_dropout=tc.lora_dropout, bias="none", task_type="CAUSAL_LM"))
+    else:
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, str(checkpoint), autocast_adapter_dtype=False)
+    model.resize_token_embeddings(len(tokenizer))
+    if checkpoint is not None:
+        load_added_token_embeddings(model, str(checkpoint))
+    replace_model_with_gated_version(model)
+    replace_lora_with_gated_version(model)
+    return model
+
+
+def main_multi(args, config):
+    """N SAE features in one run (the feature-generalization experiment).
+
+    Same objective, gate, KL anchor and steering as the single-feature path. What
+    changes: every row carries its own feature (prompt names it, steering targets it,
+    'on' magnitudes come from its own active range); the train split is resampled to
+    a fixed TOTAL budget split equally across features (sae_featgen.balance_rows_per_
+    feature); and the eval scores every feature of a pool cache, trained or not.
+    """
+    from score_sae_feature_generalization import evaluate_feature_generalization
+    tc = config.training_config
+    w = args.joint_loss_weight
+    out_dir = Path(config.output_dir) / config.experiment_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    done = out_dir / "sae_joint_train_metrics.json"
+    if done.exists() and not args.overwrite_cache and not args.feature_gen_only:
+        print(f"Already ran, skipping {out_dir}")
+        return
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    n_added = tokenizer.add_special_tokens({"additional_special_tokens": [INTROSPECTION_SEPARATOR]})
+    specs = resolve_specs(config)
+    feat_str = ",".join(f"S{s.layer}.{s.index}" for s in specs)
+    print(f"[multi] {len(specs)} feature(s): {feat_str if len(specs) <= 10 else feat_str[:120] + '...'}  "
+          f"prompt={tc.prompt_type}  budget={tc.detection_total_train_rows} rows")
+
+    ckpt = None
+    if args.feature_gen_only:
+        ckpts = glob.glob(f"{out_dir}/checkpoint-*")
+        ckpt = args.checkpoint or (max(ckpts, key=os.path.getctime) if ckpts else None)
+        if ckpt is None:
+            raise SystemExit(f"--feature-gen-only: no checkpoint in {out_dir}; pass --checkpoint")
+        print(f"[multi] --feature-gen-only: evaluating {ckpt}")
+    # Seed BEFORE building the model: resize_token_embeddings draws the separator's new
+    # embedding row, and LoRA draws its A matrices, from the global torch RNG, which
+    # nothing else seeds before Trainer() -- unseeded, two identical runs differ from
+    # step 0 (the single-feature main() still has that property).
+    set_seed(config.seed)
+    model = build_model(config, tokenizer, checkpoint=ckpt)
+    bundle = load_sae_for_spec(specs[0], device=str(model.device))
+    bundle.sae.requires_grad_(False)
+    module_path = resolve_sae_hook_path(model, specs[0].layer, site=specs[0].sae_site,
+                                        path_to_output=False)
+    module = operator.attrgetter(module_path)(model)
+    aid, iid = label_token_ids(tokenizer, tc)
+    eval_collator = EvalCollator(tokenizer)
+
+    if not args.feature_gen_only:
+        cache = config.dataset_cache_dir
+        filt = config.signal_filter or feat_str
+        train_raw = apply_signal_filter(load_from_disk(str(cache / "train")), filt, "train")
+        train_raw = drop_retokenization_mismatches(train_raw, tokenizer, "train")
+        train_raw = ensure_subsample_u(train_raw, config.seed)
+        train_bal, bal_stats = balance_rows_per_feature(
+            train_raw, [s.index for s in specs], tc.detection_total_train_rows,
+            tc.detection_balance_pos_frac, config.seed)
+        bal_stats.insert(0, "signal", [f"S{specs[0].layer}.{f}" for f in bal_stats["feature"]])
+        bal_stats.to_csv(out_dir / "train_balance_by_feature.csv", index=False)
+        sampler = MultiOnOffSampler.from_rows(
+            train_raw, distribution=tc.intervention_signal_distribution,
+            extreme_scale=tc.intervention_extreme_scale, seed=config.seed)
+        print(f"[multi] w(endo)={w}  gate=OFF  kl_target={args.kl_anchor_target}  "
+              f"rows={len(train_bal)}")
+
+        random.seed(config.seed)
+        train_ds = train_bal.map(make_preprocess(config, tokenizer, for_train=True, multi=True),
+                                 remove_columns=train_bal.column_names)
+        assert_prompts_fit(train_ds, tc.max_seq_length, "train")
+
+        if args.force_drift_eval:
+            # On the run's own TRAIN rows of its first feature: thousands of actives,
+            # and it is exactly the data the run trains on.
+            align_raw = train_raw.filter(lambda ex: ex["signal_index"] == specs[0].index)
+            random.seed(config.seed + 2)
+            align_pred = align_raw.map(make_preprocess(config, tokenizer, for_train=False),
+                                       remove_columns=align_raw.column_names)
+            align = cache_alignment(model, specs[0], bundle, module, align_raw, align_pred,
+                                    eval_collator, tokenizer, tc.eval_batch_size, out_dir)
+            if not align["aligned"] and not args.ignore_misalignment:
+                raise SystemExit("cache alignment FAILED; pass --ignore-misalignment to train anyway.")
+
+        total_steps = max(1, math.ceil(len(train_ds) / tc.train_batch_size * float(tc.num_epochs)))
+        warmup = {"warmup_steps": max(1, round(tc.warmup_ratio * total_steps))} \
+            if tc.warmup_ratio and tc.warmup_ratio > 0 else {}
+        save = {"save_strategy": "epoch"} if tc.save_steps <= 0 \
+            else {"save_strategy": "steps", "save_steps": tc.save_steps}
+        training_args = TrainingArguments(
+            output_dir=str(out_dir), run_name=config.experiment_name,
+            learning_rate=tc.learning_rate, lr_scheduler_type=tc.lr_scheduler_type,
+            per_device_train_batch_size=tc.train_batch_size, num_train_epochs=tc.num_epochs,
+            gradient_accumulation_steps=tc.gradient_accumulation_steps,
+            logging_steps=math.ceil(100 / tc.train_batch_size), eval_strategy="no",
+            bf16=tc.bf16, remove_unused_columns=False, report_to="wandb", **warmup, **save)
+        trainer = JointTrainer(
+            model=model, args=training_args, train_dataset=train_ds,
+            data_collator=JointTrainCollator(tokenizer, sampler),
+            bundle=bundle, feature_index=None, module_path=module_path,
+            active_id=aid, inactive_id=iid, joint_w=w,
+            kl_target=args.kl_anchor_target, kl_weight=args.kl_anchor_weight,
+            kl_positions=args.kl_anchor_positions, kl_coef_init=args.kl_anchor_coef_init,
+            kl_range=tuple(float(x) for x in args.kl_anchor_coef_range.split(",")),
+            callbacks=[StripEmbeddingSaveCallback(n_added)])
+        trainer.add_callback(KLCoefCheckpoint([trainer]))
+        ckpts = glob.glob(f"{out_dir}/checkpoint-*")
+        resume = max(ckpts, key=os.path.getctime) if ckpts and not args.overwrite_cache else None
+        if resume and (Path(resume) / "kl_coef.json").exists():
+            trainer.kl_coef = json.loads((Path(resume) / "kl_coef.json").read_text())["kl_coef"]
+            print(f"[multi] resuming from {resume} with kl_coef={trainer.kl_coef:.4g}")
+        trainer.train(resume_from_checkpoint=resume)
+
+    summary = evaluate_feature_generalization(
+        model, config, tokenizer, specs, bundle, module, aid, iid, out_dir,
+        pool_config=args.feature_gen_pool_config, batch_size=tc.eval_batch_size,
+        n_interv=args.fg_interv_texts, endo_max_pos=args.fg_endo_max_pos,
+        endo_neg=args.fg_endo_neg, n_distractor=args.fg_distractor_features,
+        distractor_texts=args.fg_distractor_texts)
+    metrics = {"joint_loss_weight": w, "gate": "off", "n_features": len(specs),
+               "prompt_type": tc.prompt_type,
+               "detection_total_train_rows": tc.detection_total_train_rows,
+               "kl_anchor_target": args.kl_anchor_target,
+               "kl_anchor_weight": args.kl_anchor_weight,
+               "feature_generalization": summary}
+    print(json.dumps(metrics, indent=2, default=str))
+    done.write_text(json.dumps(metrics, indent=2, default=str))
 
 
 if __name__ == "__main__":

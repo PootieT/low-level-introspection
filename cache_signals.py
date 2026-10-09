@@ -39,7 +39,7 @@ from transformers import AutoTokenizer, BatchEncoding
 
 from src.introspector.config import ExperimentConfig, DatasetConfig
 from src.introspector.dataset_utils import (
-    canonical_dataset_name, dataset_identity, identity_hash,
+    canonical_dataset_name, dataset_identity, identity_hash, subsample_key,
 )
 from src.introspector.models.signal_paths import (
     resolve_mlp_signal_path, resolve_resid_signal_path, resolve_sae_hook_path,
@@ -196,6 +196,8 @@ def create_batch_example(
     token_selector: TokenSelector,
     model: LanguageModel,
     max_seq_length: int = 512,
+    negative_keep: float | None = None,
+    seed: int = 0,
 ) -> List[dict[str, Any]]:
     """
     Create a single example of (text, signal, token_position, value)
@@ -204,6 +206,10 @@ def create_batch_example(
     :param token_selector: how to pick which token(s) to use
     :param model: NNsight model wrapper
     :param max_seq_length: maximum sequence length
+    :param negative_keep: keep an inactive (activation <= 0) row only if its
+        subsample_key is below this; active rows are always kept, and every row gets a
+        `subsample_u` column. None => keep everything, no column (DatasetConfig.negative_keep).
+    :param seed: mixed into subsample_key
     :return:
     """
     encoded = model.tokenizer(texts, truncation=True, padding=True, return_tensors="pt", max_length=max_seq_length, padding_side="right")
@@ -228,9 +234,17 @@ def create_batch_example(
         # against the cost of an undetected off-by-one.
         row_input_ids = encoded["input_ids"][data_idx][:int(seq_lens[data_idx])].tolist()
         for signal in signals:
+            activation = signals_activations[signal][data_idx]
+            # Subsample BEFORE building the row: at 100 features x 150k texts the dense
+            # table is 15M dicts, nearly all of them inactive rows that would be dropped.
+            if negative_keep is not None:
+                u = subsample_key(seed, signal.type, signal.layer, signal.index,
+                                  truncated_texts[data_idx])
+                if activation <= 0 and u >= negative_keep:
+                    continue
             token_position = batch_token_positions[data_idx]
             token_str = model.tokenizer.decode(encoded["input_ids"][data_idx][token_position], clean_up_tokenization_spaces=False)
-            out.append({
+            row = {
                 "text": truncated_texts[data_idx],
                 "signal_type": signal.type,
                 "signal_layer": signal.layer,
@@ -238,9 +252,12 @@ def create_batch_example(
                 "token_position": batch_token_positions[data_idx],
                 "token": token_str,
                 "text_input_ids": row_input_ids,
-                "activation": signals_activations[signal][data_idx],
-                "target": float_to_str_target(signals_activations[signal][data_idx], signal.precision) #f"{'+' if signals_activations[signal][data_idx]>0 else ''}{signals_activations[signal][data_idx]:.{signal.precision}f}",
-            })
+                "activation": activation,
+                "target": float_to_str_target(activation, signal.precision) #f"{'+' if signals_activations[signal][data_idx]>0 else ''}{signals_activations[signal][data_idx]:.{signal.precision}f}",
+            }
+            if negative_keep is not None:
+                row["subsample_u"] = u
+            out.append(row)
 
     return out
 
@@ -308,6 +325,8 @@ def build_split(
             token_selector=token_selector,
             model=model,
             max_seq_length=dataset_config.max_seq_length,
+            negative_keep=dataset_config.negative_keep,
+            seed=config.seed,
         )
 
         rows.extend(batch_row)
