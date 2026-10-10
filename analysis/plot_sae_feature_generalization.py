@@ -33,8 +33,8 @@ FIGURES (PNG + PDF, each with the CSV it was drawn from)
                            label to the NEAREST TRAINED label (pool label_similarity). If the
                            label arm generalizes by meaning, near-paraphrases should go first.
 
-Every number is MACRO over features (each feature weighs the same), with SEM over
-features as the error bar.
+Every number is MACRO over features (each feature weighs the same), with the std over
+features as the error bar (the CSVs also carry the SEM).
 
   python analysis/plot_sae_feature_generalization.py \
       [--runs outputs/runs/sae_featgen] [--out outputs/plots/sae_featgen]
@@ -157,7 +157,7 @@ def plot_by_n(per, out_dir, series, names, fname):
                 if g.empty:
                     continue
                 st = SPLIT_STYLE[split]
-                ax.errorbar(g["n_features"], g["mean"], yerr=g["sem"], color=SERIES_COLOR[ser],
+                ax.errorbar(g["n_features"], g["mean"], yerr=g["std"], color=SERIES_COLOR[ser],
                             ls=st["ls"], marker=st["marker"], ms=9, lw=1.8, capsize=3,
                             mfc=st["mfc"] or SERIES_COLOR[ser], mec=SERIES_COLOR[ser])
         chance_line(ax)
@@ -200,7 +200,7 @@ def plot_distractor(dist, out_dir, series, names, fname, title):
                 g = s[(s.series == ser) & (s.ask_split == split) & (s.stimulus == stim)].sort_values("n_features")
                 if g.empty:
                     continue
-                ax.errorbar(g["n_features"], g["mean"], yerr=g["sem"], color=SERIES_COLOR[ser],
+                ax.errorbar(g["n_features"], g["mean"], yerr=g["std"], color=SERIES_COLOR[ser],
                             ls=st["ls"], marker=st["marker"], ms=7, lw=2, capsize=3,
                             label=f"{names[ser]}: {st['name']}")
         n_axis(ax, ns)
