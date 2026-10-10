@@ -458,7 +458,7 @@ def plot_delta_heatmap(merged, metric, label_a, label_b, out_dir, lim=None):
     if lim is None:
         lim = float(np.nanmax(np.abs(mean.to_numpy()))) or 1.0
     # cells are annotated mean ± std (std over the cell's neurons, aggfunc="std")
-    title = f"Neuron Paired Diff. {pretty_metric(metric)}"
+    title = f"Neuron \u0394 {pretty_metric(metric)}"   # \u0394 = label_a - label_b, paired within neuron
     path = Path(out_dir) / f"delta_{metric}_{label_a}_vs_{label_b}.png"
     draw_layer_position_heatmap(mean, std, title, path, vmin=-lim, vmax=lim,
                                 cmap="RdBu_r", center=0, seq_len=SEQ_LEN)

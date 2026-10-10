@@ -5,7 +5,7 @@ joint weight, the 2x3 confusion matrix -- true {active, inactive} x predicted
 {active, inactive, neither}; the neither column is dropped when every panel has zero
 neither predictions -- colored by row-normalized rate (recall view, robust to
 the ~99% inactive imbalance) with raw counts annotated. Writes
-figures/sae/confusion_endogenous_w<W>.{png,pdf}."""
+outputs/plots/sae_l9_joint/confusion_endogenous_w<W>.{png,pdf}."""
 import argparse
 import json
 from pathlib import Path
@@ -34,7 +34,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--json", type=Path, default=ROOT / "_scratch_equiv/endo_perclass.json")
     p.add_argument("--weight", type=float, default=0.9)
-    p.add_argument("--out-dir", type=Path, default=ROOT / "figures/sae")
+    p.add_argument("--out-dir", type=Path, default=ROOT / "outputs/plots/sae_l9_joint")
     args = p.parse_args()
 
     rows = json.loads(Path(args.json).read_text())

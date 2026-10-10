@@ -10,7 +10,7 @@ sweep). AUROC/AP are deliberately not plotted; they were retired.
   python analysis/plot_sae_joint_results.py \
       --runs outputs/runs/sae_l9_joint --weight 0.9
 
-Writes PNGs to figures/. Static, one 0-1 axis each, colorblind-safe hues, direct
+Writes PNGs to outputs/plots/sae_l9_joint/. Static, one 0-1 axis each, colorblind-safe hues, direct
 value labels, chance line at 0.5 for the interventional metric.
 """
 import argparse, glob, json, re
@@ -21,6 +21,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+ROOT = Path(__file__).parents[1]
 BLUE, ORANGE = "#2a78d6", "#eb6834"
 INK, INK2, MUTED, SURF = "#0b0b0b", "#52514e", "#8a8a85", "#fcfcfb"
 plt.rcParams.update({"font.size": 12, "figure.facecolor": SURF, "axes.facecolor": SURF,
@@ -75,7 +76,7 @@ def main():
     p.add_argument("--runs", default="outputs/runs/sae_l9_joint")
     p.add_argument("--weight", type=float, default=0.9,
                    help="Joint weight to show in the per-feature bars.")
-    p.add_argument("--out-dir", type=Path, default=Path("figures"))
+    p.add_argument("--out-dir", type=Path, default=ROOT / "outputs/plots/sae_l9_joint")
     args = p.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 

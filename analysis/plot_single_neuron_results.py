@@ -434,7 +434,8 @@ SEQ_LEN = 32
 # every case: placed in the paper at the same scale (same dpi / same \includegraphics
 # scale), text prints at the same size everywhere.
 HEATMAP_FIGSIZE = (16, 12)
-SMALL_GRID_PAIR_FIGSIZE = (14.8, 6)   # rendered: same width as a neuron panel
+SMALL_GRID_PAIR_FIGSIZE = (14.8, 6.8)  # rendered: same width as a neuron panel;
+                                       # a little over half its height for 2-line titles
 # the one set of sizes every layer x position heatmap uses
 _FS = dict(annot=24, ticks=32, axis_label=40, title=38, cbar_ticks=28)
 
@@ -488,9 +489,9 @@ def draw_layer_position_heatmap_pair(panels, path, cbar_label=None, vmin=None, v
     (SAE, attention) that share one paper slot. One colour scale and one colorbar
     (its own column, so both maps get equal width); 'Layer' labelled once, on the left.
 
-    Each map is half as wide as a neuron panel, so a full 'SAE Interventional Balanced
-    Accuracy' title does not fit at the shared title size: titles name the signal and
-    readout, and the metric they share goes on the colorbar (`cbar_label`).
+    Each map is half as wide as a neuron panel, so a one-line 'SAE Interventional
+    Balanced Accuracy' does not fit at the shared title size: pass two-line titles
+    ('SAE Interventional\nBalanced Accuracy'). `cbar_label` is optional.
 
     panels: [(mean_df, spread_df, title), (mean_df, spread_df, title)]."""
     fig, axes = plt.subplots(1, len(panels) + 1, figsize=figsize,

@@ -8,7 +8,7 @@ accuracy vs joint weight (endogenous + interventional) as line panels.
   python analysis/plot_sae_balanced_accuracy.py \
       --runs outputs/runs/sae_l9_joint --weight 0.9
 
-Writes figures/sae/balanced_accuracy_w<W>.{png,pdf} and balanced_accuracy_vs_weight.{png,pdf}.
+Writes outputs/plots/sae_l9_joint/balanced_accuracy_w<W>.{png,pdf} and balanced_accuracy_vs_weight.{png,pdf}.
 """
 import argparse, glob, json, re
 from pathlib import Path
@@ -69,7 +69,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--runs", default=str(ROOT / "outputs/runs/sae_l9_joint"))
     p.add_argument("--weight", type=float, default=0.9)
-    p.add_argument("--out-dir", type=Path, default=ROOT / "figures/sae")
+    p.add_argument("--out-dir", type=Path, default=ROOT / "outputs/plots/sae_l9_joint")
     args = p.parse_args()
 
     joint = load_joint(args.runs)

@@ -368,7 +368,7 @@ POSITIONS="1 8 16 24 31" sbatch --array=1-25 scripts/sae/precompute_sae_feature_
 DRY_RUN=1 bash scripts/sae/submit_sae_sweep.sh                 # print the plan
 bash scripts/sae/submit_sae_sweep.sh                           # WEIGHTS="..." / MAX_PARALLEL=N
 
-# 5. figures -> figures/sae_sweep/
+# 5. figures -> outputs/plots/sae_layerpos_joint/
 python analysis/plot_sae_sweep.py --runs outputs/runs/sae_layerpos_joint \
     --anchor outputs/runs/sae_l9_joint
 ```

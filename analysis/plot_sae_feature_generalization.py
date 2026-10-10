@@ -242,7 +242,8 @@ def plot_similarity(per, out_dir):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--runs", type=Path, default=Path("outputs/runs/sae_featgen"))
-    p.add_argument("--out", type=Path, default=Path("outputs/plots/sae_featgen"))
+    p.add_argument("--out", type=Path,
+                   default=Path(__file__).resolve().parents[1] / "outputs/plots/sae_featgen")
     args = p.parse_args()
     apply_rc()
     args.out.mkdir(parents=True, exist_ok=True)

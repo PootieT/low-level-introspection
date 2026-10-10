@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dataset-statistics figures for the layer-9 SAE joint runs: the natural activation
 rate per feature and split (bar plot) and the active / inactive token counts (table).
-Writes figures/sae/dataset_stats_rates.{png,pdf} and dataset_stats_table.{png,pdf}. Counts are
+Writes outputs/plots/sae_l9_joint/dataset_stats_rates.{png,pdf} and dataset_stats_table.{png,pdf}. Counts are
 read straight from the cache (no model needed)."""
 import sys
 from pathlib import Path
@@ -37,7 +37,7 @@ for fi in ORDER:
         act = int((a > 0).sum())
         counts[fi][s] = (act, len(a) - act, len(a))
 
-out = ROOT / "figures/sae"; out.mkdir(parents=True, exist_ok=True)
+out = ROOT / "outputs/plots/sae_l9_joint"; out.mkdir(parents=True, exist_ok=True)
 
 fig, ax = plt.subplots(figsize=(12, 5.2))
 x = np.arange(len(ORDER)); w = 0.26

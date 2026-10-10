@@ -9,6 +9,8 @@ labels them with their Neuronpedia concept (annotated parquets), and writes, per
                                  layer x position, mean ± std over the 3 features, in the
                                  neuron heatmaps' style (neuron-panel width, half height)
   heatmap_<metric>_byfeat_w<W>   same, one row per feature rank (F1-F3)
+  delta_<metric>_w<W>_vs_w1       joint (w<W>) minus SFT (w=1.0), paired within feature,
+                                 endogenous | interventional, mean ± std over features
   vs_position_bacc_w<W>          balanced acc vs position, one line per layer (mean +- SE)
   vs_layer_bacc_w<W>             balanced acc vs layer, one line per position (mean +- SE);
                                  --anchor runs (layer 9, POS -1) drawn as reference points
@@ -116,10 +118,11 @@ def plot_heatmaps(df, w, metric, out):
             continue
         mean = d.pivot_table(index="layer", columns="position", values=col, aggfunc="mean")
         std = d.pivot_table(index="layer", columns="position", values=col, aggfunc="std")
-        panels.append((mean, std, f"SAE {short.capitalize()}"))
+        # two-line title: a one-line one is wider than a half-width map
+        panels.append((mean, std, f"SAE {short.capitalize()}\n{METRIC_TITLE[metric]}"))
     if panels:
         path = out / f"heatmap_{metric}_w{w:g}.png"
-        draw_layer_position_heatmap_pair(panels, path, cbar_label=METRIC_TITLE[metric],
+        draw_layer_position_heatmap_pair(panels, path,
                                          vmin=vmin, vmax=1.0, formats=("png", "pdf"))
         print("wrote", path, "+ .pdf")
 
@@ -134,6 +137,48 @@ def plot_heatmaps(df, w, metric, out):
             heat(axes[i, j], piv, f"{r}: {short}", vmin)
     fig_title(fig, f"{METRICS[metric]} by feature rank (w={w:g}); feature differs per layer")
     fig.tight_layout(); save(fig, out / f"heatmap_{metric}_byfeat_w{w:g}")
+
+
+# w is the endogenous term's weight: w=1.0 trains on the endogenous loss alone, i.e. the
+# SAE counterpart of the neuron track's SFT (gate-off) arm; w<1 is the joint objective.
+SFT_W = 1.0
+
+
+def plot_deltas(df, metric, out):
+    """Joint minus SFT, paired within feature: for every joint weight w != SFT_W, the
+    difference metric(w) - metric(SFT_W) on the SAME (layer, position, feature), then
+    mean ± std over the layer's features per cell -- the SAE counterpart of the neuron
+    delta maps (compare_sft_vs_joint.py). Endogenous | interventional in one figure
+    with ONE symmetric colour limit, so the two readouts are on the same scale."""
+    keys = ["layer", "position", "feature"]
+    sft = df[df.w == SFT_W]
+    if sft.empty:
+        print(f"no w={SFT_W:g} (SFT) runs; skipping delta heatmaps")
+        return
+    for w in sorted(set(df.w) - {SFT_W}, reverse=True):
+        joint = df[df.w == w]
+        m = joint.merge(sft, on=keys, suffixes=("_joint", "_sft"))
+        unmatched = len(joint) - len(m)
+        print(f"[delta] {metric}: w={w:g} vs w={SFT_W:g}: paired {len(m)} run(s), "
+              f"{unmatched} joint run(s) without an SFT partner")
+        panels, lims = [], []
+        for _, short in ARMS:
+            a, b = f"{short}_{metric}_joint", f"{short}_{metric}_sft"
+            if a not in m or b not in m:
+                continue
+            d = m[keys].assign(delta=m[a] - m[b]).dropna()
+            mean = d.pivot_table(index="layer", columns="position", values="delta", aggfunc="mean")
+            std = d.pivot_table(index="layer", columns="position", values="delta", aggfunc="std")
+            lims.append(float(np.nanmax(np.abs(mean.to_numpy()))))
+            # two lines: 'SAE Paired Diff. Endogenous' is wider than a half-width map
+            panels.append((mean, std, f"SAE {short.capitalize()}\n\u0394 {METRIC_TITLE[metric]}"))
+        if not panels:
+            continue
+        lim = max([v for v in lims if np.isfinite(v) and v > 0], default=1.0)
+        path = out / f"delta_{metric}_w{w:g}_vs_w{SFT_W:g}.png"
+        draw_layer_position_heatmap_pair(panels, path, vmin=-lim, vmax=lim, cmap="RdBu_r",
+                                         center=0, formats=("png", "pdf"))
+        print("wrote", path, "+ .pdf")
 
 
 def mean_se(d, by, col):
@@ -238,7 +283,7 @@ def main():
     p.add_argument("--anchor", default=str(ROOT / "outputs/runs/sae_l9_joint"),
                    help="Layer-9 POS -1 runs drawn as reference points ('' to skip).")
     p.add_argument("--features-file", default=str(ROOT / "scripts/sae/sweep_features.txt"))
-    p.add_argument("--out-dir", type=Path, default=ROOT / "figures/sae_sweep")
+    p.add_argument("--out-dir", type=Path, default=ROOT / "outputs/plots/sae_layerpos_joint")
     args = p.parse_args()
 
     df = load_runs(args.runs, "sweep")
@@ -262,6 +307,8 @@ def main():
         plot_lines(df, anchor, w, args.out_dir)
         plot_base_rate(df, concepts, w, args.out_dir)
         plot_confusion(df, concepts, w, args.out_dir)
+    for metric in METRICS:
+        plot_deltas(df, metric, args.out_dir)
 
 
 if __name__ == "__main__":
