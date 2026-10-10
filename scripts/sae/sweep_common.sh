@@ -10,8 +10,8 @@
 # ============================================================================
 cd /work/neu/p2026_0061_neu/low-level-introspection
 
-LAYERS=(${LAYERS_OVERRIDE:-0 5 10 15 20})
-POSITIONS=(${POSITIONS_OVERRIDE:-1 8 16 24 31})
+LAYERS=(${LAYERS_OVERRIDE:-5 10 15 20})
+POSITIONS=(${POSITIONS_OVERRIDE:-8 16 24 31})
 WEIGHTS=(${WEIGHTS:-1.0 0.9})
 N_FEATS=3
 FEATURES_FILE=${FEATURES_FILE:-scripts/sae/sweep_features.txt}

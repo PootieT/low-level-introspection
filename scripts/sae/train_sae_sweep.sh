@@ -6,15 +6,15 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=03:00:00
+#SBATCH --time=01:30:00
 #SBATCH --output=log/%x-%A_%a.out
-#SBATCH --array=1-150   # 3 features x 5 layers x 5 positions x 2 weights
+#SBATCH --array=1-96    # 3 features x 4 layers x 4 positions x 2 weights
 
 # ============================================================================
 # Stage 2 of the layer x position sweep: one joint gate-off run per task.
 #
-# Task order is FEATURE-MAJOR: tasks 1-50 are feature rank 1 (F1) of every layer, over
-# all layers x positions x weights; 51-100 are F2; 101-150 are F3. SLURM starts lower
+# Task order is FEATURE-MAJOR: tasks 1-32 are feature rank 1 (F1) of every layer, over
+# all layers x positions x weights; 33-64 are F2; 65-96 are F3. SLURM starts lower
 # array indices first, so F1's full layer x position grid finishes first.
 #
 # Every run does the cache-alignment check (--force-drift-eval): it recomputes the

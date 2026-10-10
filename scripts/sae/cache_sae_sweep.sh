@@ -6,9 +6,9 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=02:00:00
+#SBATCH --time=00:30:00
 #SBATCH --output=log/%x-%A_%a.out
-#SBATCH --array=1-25    # one task per (layer, position) = 5 x 5
+#SBATCH --array=1-16    # one task per (layer, position) = 4 x 4
 
 # ============================================================================
 # Stage 1 of the layer x position sweep: build ONE signal cache per (layer, position)

@@ -1,0 +1,18 @@
+{
+  "joint_loss_weight": 0.9,
+  "gate": "off",
+  "kl_anchor_target": 0.1,
+  "kl_anchor_weight": 0.0,
+  "test_endogenous": {
+    "n": 30000,
+    "base_rate_positive": 0.0042,
+    "balanced_accuracy": 0.8442004035998814,
+    "precision": 0.5838926174496645
+  },
+  "test_interventional": {
+    "n": 60000,
+    "base_rate_positive": 0.5,
+    "balanced_accuracy": 0.9887166666666667,
+    "precision": 0.9978945223622101
+  }
+}

@@ -521,9 +521,13 @@ def main():
     train_path = output_dir / "train"
     dev_path = output_dir / "dev"
     test_path = output_dir / "test"
-    if train_path.exists() and not args.overwrite_cache:
+    # metadata.json is written after all three splits, so it marks a COMPLETE cache; a
+    # build killed midway (train saved, test not) is rebuilt instead of skipped.
+    if (output_dir / "metadata.json").exists() and not args.overwrite_cache:
         print("Signal dataset cached, skipping ...")
         return
+    if train_path.exists() and not args.overwrite_cache:
+        print("Incomplete cache (no metadata.json); rebuilding ...")
 
     set_seed(config.seed)
 
