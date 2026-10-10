@@ -1,0 +1,11 @@
+# Features for the layer x position SAE sweep, selected 2026-10-09 with the layer-9 pipeline:
+# density 0.1-1% at the last token -> Neuronpedia explanation -> blind LLM steering judge
+# (steered chosen >= 60%, unsteered <= 20% of 50 prompts) -> semantic concepts by layer 9's
+# own bar -> the 3 highest-ranked per layer. Evidence: data/sae_steering_judge/.
+# Layer 0 is excluded: none of its 50 semantic candidates (ranks 1-120) passed.
+# Position 1 is excluded: 10 of 12 features have 0-7 active test examples there (data/sae_steering_judge/position_density.csv).
+# One line per layer:  LAYER  F1  F2  F3     (ranked; F1's whole grid runs first)
+5   S5.14228   S5.86      S5.10039
+10  S10.13054  S10.3151   S10.3887
+15  S15.12245  S15.12162  S15.7473
+20  S20.10859  S20.8322   S20.7717

@@ -1,0 +1,34 @@
+{
+  "joint_loss_weight": 1.0,
+  "gate": "off",
+  "kl_anchor_target": 0.1,
+  "kl_anchor_weight": 0.0,
+  "test_endogenous": {
+    "n": 30000,
+    "base_rate_positive": 0.007933333333333334,
+    "balanced_accuracy": 0.7572777649464464,
+    "precision": 0.6473684210526316,
+    "tpr": 0.5168067226890757,
+    "tnr": 0.997748807203817,
+    "act_pred_active": 123,
+    "act_pred_inactive": 115,
+    "act_pred_neither": 0,
+    "ina_pred_active": 67,
+    "ina_pred_inactive": 29695,
+    "ina_pred_neither": 0
+  },
+  "test_interventional": {
+    "n": 60000,
+    "base_rate_positive": 0.5,
+    "balanced_accuracy": 0.50005,
+    "precision": 0.5039164490861618,
+    "tpr": 0.0064333333333333334,
+    "tnr": 0.9936666666666667,
+    "act_pred_active": 193,
+    "act_pred_inactive": 29807,
+    "act_pred_neither": 0,
+    "ina_pred_active": 190,
+    "ina_pred_inactive": 29810,
+    "ina_pred_neither": 0
+  }
+}
