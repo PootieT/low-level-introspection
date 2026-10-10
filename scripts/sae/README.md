@@ -423,6 +423,10 @@ qsub scripts/sae/build_featgen_pool_layer9.sh        # gate 0, stats, candidates
 qsub scripts/sae/cache_sae_feature_generalization.sh # every cache, one job
 qsub -hold_jid sae_featgen_cache -t 1-5 scripts/sae/train_sae_feature_generalization.sh   # label arm
 qsub -t 6-10 scripts/sae/train_sae_feature_generalization.sh                              # index arm, later
+# label arm at N=3's 100k rows PER FEATURE (N=10/30/100 = 1M/3M/10M rows), one shared cache:
+qsub -v STAGE_GROUPS=data100k scripts/sae/cache_sae_feature_generalization.sh
+qsub -hold_jid sae_featgen_cache -t 11 -l h_rt=24:00:00 scripts/sae/train_sae_feature_generalization.sh
+qsub -hold_jid sae_featgen_cache -t 12-13 -l h_rt=48:00:00 scripts/sae/train_sae_feature_generalization.sh
 python analysis/plot_sae_feature_generalization.py
 ```
 
@@ -440,6 +444,18 @@ python analysis/plot_sae_feature_generalization.py
   - So distinct active examples per feature are fixed by density at every N, while
     distinct inactive examples shrink as 1/N. **State this when reporting the N curve.**
   - Active repeats fall from 100-1000x at N=1 to at most 10x at N=100.
+- **data100k rows (11-13): 100k rows PER FEATURE at N=10/30/100** (N=3's budget). With
+  300k total, seen-feature interventional accuracy collapses at N>=10, and these runs
+  test whether that is starvation. Totals and optimizer updates grow with N (1M/3M/10M
+  rows), so they don't separate data from steps.
+  - At a fixed per-feature quota the inactive keep rate is the same at every N (0.383, as
+    for label_n3), and subsampling is keyed per (feature, text). So one 100-feature cache
+    holds every row each of them needs, and each run selects its features with
+    `--signal-filter`. The table's `cache_feats` column sets this.
+  - Runs over 1M rows checkpoint every 10%. One that outlives its job resumes from the
+    latest checkpoint when the same task is resubmitted.
+  - Plotted as their own series (`featgen_data_matched`, `featgen_distractor_data_matched`),
+    with label_n3 as the shared N=3 point, so they never average into the 300k-total curves.
 - **Caches** store only what the trainer can use, via `DatasetConfig.negative_keep`
   (`--train-negative-keep`, `--test-negative-keep`):
   - Inactive rows are kept by a deterministic per-(signal, text) hash

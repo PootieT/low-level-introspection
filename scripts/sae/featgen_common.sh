@@ -19,13 +19,23 @@
 # position -1 of a 32-token text, gate off, w(endo)=0.9, KL budget 0.1, lr 2e-5, rank
 # 16, 'extreme' scale 1 (natural-magnitude) steering, 150k C4 train texts.
 #
-# ROW BUDGET. TOTAL_ROWS rows for every N, split equally across features (TOTAL/N each),
-# half active, half inactive (sae_featgen.balance_rows_per_feature): inactive rows are
-# subsampled to the quota, active rows repeated to it. Distinct active examples per
-# feature are therefore fixed by its density at every N, while distinct inactive ones
-# shrink as 1/N -- state this wherever the N curve is reported. The cache keeps only
-# what the trainer can use: every active row plus inactive rows at rate
-# NEG_MARGIN x quota / TRAIN_TEXTS (DatasetConfig.negative_keep), which is 1.0 at N=1.
+# ROW BUDGET. Each row of the table sets its run's TOTAL rows, split equally across its
+# features (total/N each), half active, half inactive (sae_featgen.balance_rows_per_
+# feature): inactive rows are subsampled to the quota, active rows repeated to it.
+#   groups label/index   300k total at every N (fixed total, as in neuron-gen's scaling
+#                        group): rows per feature fall as 1/N. Distinct active examples
+#                        per feature are fixed by density, distinct inactive ones shrink
+#                        as 1/N -- state this wherever the N curve is reported.
+#   group data100k       100k rows PER FEATURE at every N, i.e. N=3's per-feature budget:
+#                        is the collapse of seen-feature interventional accuracy at N>=10
+#                        starvation? Total rows (and optimizer updates) grow with N --
+#                        1M / 3M / 10M rows, ~3x / 10x / 33x a 300k run.
+# The cache keeps only what the trainer can use: every active row plus inactive rows at
+# rate NEG_MARGIN x quota / TRAIN_TEXTS (DatasetConfig.negative_keep). Subsampling is
+# keyed per (feature, text), so runs with the SAME per-feature quota can share one cache
+# holding more features (column cache_feats) and select theirs with --signal-filter:
+# the data100k rows all read one 100-feature cache, whose first 3 features hold exactly
+# the label_n3 run's rows.
 # ============================================================================
 
 EXP_GROUP=${EXP_GROUP:-sae_featgen}
@@ -35,7 +45,7 @@ TOKEN_POS=-1
 SEQ_LEN=32
 POOL_JSON=${POOL_JSON:-data/sae_featgen/pool_layer9.json}
 
-TOTAL_ROWS=${TOTAL_ROWS:-300000}   # per run, at every N (fixed total, as in neuron-gen's scaling group)
+TOTAL_ROWS=${TOTAL_ROWS:-300000}   # the fixed-total groups' budget per run (label/index rows)
 TRAIN_TEXTS=150000                 # = the layer-9 single-feature runs' train split
 NEG_MARGIN=1.15                    # cache this much more than the inactive quota (sampling noise)
 OWN_TEST_TEXTS=500                 # a run's own test split; the eval reads the pool cache instead
@@ -49,20 +59,25 @@ KL_TARGET=${KL_TARGET:-0.1}
 LR=2e-5; LORA_R=16; LORA_ALPHA=$((LORA_R * 2)); BS=32
 
 # ---- the table: one row per run --------------------------------------------------
-#      name          group   arm     n_features
+#      name                group     arm    n_features  total_rows   cache_feats
 RUNS=(
   # label arm (1-5): run first
-  "label_n1        label   label     1"
-  "label_n3        label   label     3"
-  "label_n10       label   label    10"
-  "label_n30       label   label    30"
-  "label_n100      label   label   100"
+  "label_n1             label     label     1   $TOTAL_ROWS      1"
+  "label_n3             label     label     3   $TOTAL_ROWS      3"
+  "label_n10            label     label    10   $TOTAL_ROWS     10"
+  "label_n30            label     label    30   $TOTAL_ROWS     30"
+  "label_n100           label     label   100   $TOTAL_ROWS    100"
   # index arm (6-10): the control, after the label arm
-  "index_n1        index   index     1"
-  "index_n3        index   index     3"
-  "index_n10       index   index    10"
-  "index_n30       index   index    30"
-  "index_n100      index   index   100"
+  "index_n1             index     index     1   $TOTAL_ROWS      1"
+  "index_n3             index     index     3   $TOTAL_ROWS      3"
+  "index_n10            index     index    10   $TOTAL_ROWS     10"
+  "index_n30            index     index    30   $TOTAL_ROWS     30"
+  "index_n100           index     index   100   $TOTAL_ROWS    100"
+  # label arm at N=3's 100k rows PER FEATURE (11-13). Long: submit with a larger h_rt
+  # (~33x a 300k run at N=100); a killed run resumes from its latest checkpoint.
+  "label_n10_d100k      data100k  label    10      1000000    100"
+  "label_n30_d100k      data100k  label    30      3000000    100"
+  "label_n100_d100k     data100k  label   100     10000000    100"
 )
 
 POOL_CONFIG=experiment_configs/$EXP_GROUP/_featgen_pool_L${LAYER}.json
@@ -79,7 +94,7 @@ PY
 }
 
 # select_row: GROUP filters the table, RUN picks one row by name, else SGE_TASK_ID
-# indexes (within the GROUP if given). Sets NAME R_GROUP ARM N_FEAT.
+# indexes (within the GROUP if given). Sets NAME R_GROUP ARM N_FEAT TOTAL CACHE_FEATS.
 select_row() {
     local selected=() row r_name r_group
     for row in "${RUNS[@]}"; do
@@ -104,7 +119,11 @@ select_row() {
         fi
         pick=${selected[$i]}
     fi
-    read -r NAME R_GROUP ARM N_FEAT <<< "$pick"
+    read -r NAME R_GROUP ARM N_FEAT TOTAL CACHE_FEATS <<< "$pick"
+}
+
+negative_keep() {   # negative_keep N TOTAL -> the cache's inactive-row keep rate
+    python -c "print(round(min(1.0, $NEG_MARGIN * ($2 / (2 * $1)) / $TRAIN_TEXTS), 4))"
 }
 
 # make_pool_config: every pool feature. TRAIN keeps active rows only (the 'on'
@@ -128,12 +147,21 @@ make_pool_config() {
     [ -f "$POOL_CONFIG" ] || { echo "pool config not written" >&2; return 1; }
 }
 
-# make_run_config NAME ARM N -> prints the config path. Both arms at one N resolve to
-# the SAME dataset_name (the prompt is not part of the cache identity).
+# make_run_config NAME ARM N TOTAL CACHE_FEATS -> prints the config path. The cache
+# holds the first CACHE_FEATS pool features at N's per-feature quota; the run trains on
+# the first N of them (--signal-filter when CACHE_FEATS > N). Both arms at one N resolve
+# to the SAME dataset_name (the prompt is not part of the cache identity).
 make_run_config() {
-    local name=$1 arm=$2 n=$3
-    local feats; feats=$(pool_features "$n") || return 1
-    local keep; keep=$(python -c "print(round(min(1.0, $NEG_MARGIN * ($TOTAL_ROWS / (2 * $n)) / $TRAIN_TEXTS), 4))")
+    local name=$1 arm=$2 n=$3 total=$4 cache_feats=${5:-$3}
+    local feats; feats=$(pool_features "$cache_feats") || return 1
+    local keep; keep=$(negative_keep "$n" "$total") || return 1
+    local filter_flag=""
+    if [ "$cache_feats" -gt "$n" ]; then
+        filter_flag="--signal-filter $(pool_features "$n")" || return 1
+    fi
+    # checkpoint every 10% on the long runs, so a time-limit kill loses less
+    local save=0.25
+    [ "$total" -gt 1000000 ] && save=0.1
     local prompt_flags
     case $arm in
         label) prompt_flags="--prompt-type prompt_sae_label --feature-labels-file $POOL_JSON --max-prompt-tokens $LABEL_PROMPT_TOKENS" ;;
@@ -146,18 +174,18 @@ make_run_config() {
         --experiment-name "saeFeatgen_${name}" \
         --model $MODEL \
         --objective detection --detection-balance-pos-frac 0.5 \
-        --detection-total-train-rows $TOTAL_ROWS \
+        --detection-total-train-rows $total \
         --intervention-signal-distribution extreme --intervention-extreme-scale 1 \
         --train-dataset allenai/c4 --train-dataset-split "train" \
         --train-max-samples $TRAIN_TEXTS --train-negative-keep $keep \
         --dev-max-samples 200 --dev-offset-from-train 1000000 \
         --test-dataset allenai/c4 --test-dataset-split "validation" --test-max-samples $OWN_TEST_TEXTS \
         --max-seq-length $SEQ_LEN --hf-data-kwargs '{"config": "en", "streaming": true}' \
-        --train-signals "$feats" --test-signals "$feats" \
+        --train-signals "$feats" --test-signals "$feats" $filter_flag \
         --train-token-selector $TOKEN_POS --test-token-selector $TOKEN_POS --precision 3 \
         --train-batch-size $BS --eval-batch-size 128 --num-epochs 1 \
         --lora-r $LORA_R --lora-alpha $LORA_ALPHA --lora-dropout 0.0 --bf16 \
-        --learning-rate $LR --warmup-ratio 0.03 --lr-scheduler-type cosine --save-steps 0.25 \
+        --learning-rate $LR --warmup-ratio 0.03 --lr-scheduler-type cosine --save-steps $save \
         $prompt_flags \
         --cache-dir data --output-dir outputs/runs/$EXP_GROUP --output "$config" >&2 || return 1
     [ -f "$config" ] || { echo "config not written: $config" >&2; return 1; }

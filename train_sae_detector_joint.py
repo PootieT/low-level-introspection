@@ -462,7 +462,7 @@ def interventional_eval(model, spec, bundle, module, test_raw, ds_pred, collator
     return generation_metrics(preds, labels, aid, iid)
 
 
-def drop_retokenization_mismatches(raw, tokenizer, split):
+def drop_retokenization_mismatches(raw, tokenizer, split, num_proc=None):
     """Keep rows whose prompt, re-tokenized, still has the cached token at token_position.
     The prompt is f"{text} {separator}...": when a truncated text ends in a lone space
     token, the template's space merges with it ("\u2581" -> "\u2581\u2581"), so the
@@ -472,7 +472,7 @@ def drop_retokenization_mismatches(raw, tokenizer, split):
         enc = tokenizer([f"{t} {INTROSPECTION_SEPARATOR}" for t in batch["text"]])["input_ids"]
         return [p < len(ids) and tokenizer.decode(ids[p]) == tok
                 for ids, p, tok in zip(enc, batch["token_position"], batch["token"])]
-    kept = raw.filter(ok, batched=True)
+    kept = raw.filter(ok, batched=True, num_proc=num_proc)
     print(f"[joint] {split}: dropped {len(raw) - len(kept)}/{len(raw)} rows whose "
           f"token changes when the prompt is re-tokenized")
     return kept
@@ -586,6 +586,11 @@ def make_preprocess(config, tokenizer, for_train, multi=False):
             out["activation"] = ex["activation"]
             if multi:
                 out["signal_index"] = ex["signal_index"]
+                # never read: JointTrainCollator rebuilds the mask and has no LM labels.
+                # Dropped because .map writes every column to disk -- ~2/3 of a 10M-row
+                # run's preprocessing cache.
+                out.pop("labels", None)
+                out.pop("attention_mask", None)
         return out
     return pp
 
@@ -594,7 +599,9 @@ def assert_prompts_fit(ds, max_length, split):
     """preprocess_example TRUNCATES at max_length, cutting the END of the prompt -- the
     readout token -- so a too-long prompt is read out mid-sentence with no error. A
     label prompt is much longer than an index prompt, so check rather than assume."""
-    longest = max(len(x) for x in ds["input_ids"])
+    # Arrow-side: ds["input_ids"] would build Python lists, ~15 GB at 10M rows
+    import pyarrow.compute as pc
+    longest = pc.max(pc.list_value_length(ds.data.column("input_ids"))).as_py()
     if longest >= max_length:
         raise SystemExit(f"{split}: a prompt reaches max_seq_length={max_length} tokens and "
                          f"was truncated. Raise --max-prompt-tokens in the config generator.")
@@ -827,7 +834,15 @@ def main_multi(args, config):
         cache = config.dataset_cache_dir
         filt = config.signal_filter or feat_str
         train_raw = apply_signal_filter(load_from_disk(str(cache / "train")), filt, "train")
-        train_raw = drop_retokenization_mismatches(train_raw, tokenizer, "train")
+        # Above ~1M rows the single-process tokenization passes take hours (measured
+        # ~2k rows/s), so they fan out over the job's slots. Below it they stay serial:
+        # with workers, each shard draws prompt templates from its own copy of the RNG,
+        # which would change the template assignment of the runs already made.
+        workers = int(os.environ.get("NSLOTS", "1"))
+        workers = workers if workers > 1 else None
+        big = lambda ds: workers if len(ds) > 1_000_000 else None
+        train_raw = drop_retokenization_mismatches(train_raw, tokenizer, "train",
+                                                   num_proc=big(train_raw))
         train_raw = ensure_subsample_u(train_raw, config.seed)
         train_bal, bal_stats = balance_rows_per_feature(
             train_raw, [s.index for s in specs], tc.detection_total_train_rows,
@@ -842,7 +857,7 @@ def main_multi(args, config):
 
         random.seed(config.seed)
         train_ds = train_bal.map(make_preprocess(config, tokenizer, for_train=True, multi=True),
-                                 remove_columns=train_bal.column_names)
+                                 remove_columns=train_bal.column_names, num_proc=big(train_bal))
         assert_prompts_fit(train_ds, tc.max_seq_length, "train")
 
         if args.force_drift_eval:

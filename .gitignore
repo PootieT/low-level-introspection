@@ -218,5 +218,10 @@ __marimo__/
 .streamlit/secrets.toml
 _scratch_equiv/
 .hf_cache/
+.idea/
+wandb/
 data/
 introspection_env/
+outputs/runs/
+outputs/plots/
+experiment_configs/
