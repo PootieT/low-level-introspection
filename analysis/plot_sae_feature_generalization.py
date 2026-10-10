@@ -67,7 +67,7 @@ FIXED = ("label", "index")
 MATCHED = ("label", "label_d100k")
 SPLIT_STYLE = {"seen": dict(ls="-", marker="o", mfc=None),
                "unseen": dict(ls="--", marker="o", mfc="white")}
-SPLIT_NAME = {"seen": "trained", "unseen": "held out"}
+SPLIT_NAME = {"seen": "Seen", "unseen": "Unseen"}
 STIM_STYLE = {"diagonal": dict(ls="-", marker="o", name="steer the named feature ↑"),
               "own": dict(ls=":", marker="s", name="steer a different feature ↓"),
               "off": dict(ls="--", marker="^", name="named feature clamped to 0 ↓")}
@@ -136,7 +136,12 @@ def n_axis(ax, ns):
     ax.set_xlabel("features trained (N)")
 
 
-def plot_by_n(per, out_dir, series, names, fname, title):
+def plot_by_n(per, out_dir, series, names, fname):
+    """Balanced accuracy vs N, trained vs held-out features, one colour per series --
+    formatted like the neuron/layer generalization figures (plot_neuron_generalization
+    data30k_vs_scaling, plot_layer_generalization unseen_by_n): no suptitle, capitalized
+    labels, their font sizes, and one compact legend inside the interventional panel
+    (colour = series, line style = trained / held out)."""
     per = per[per["series"].isin(series)]
     if per.empty:
         return
@@ -144,8 +149,8 @@ def plot_by_n(per, out_dir, series, names, fname, title):
     s = macro(per, ["eval_type", "series", "split", "n_features"], "balanced_accuracy")
     s.to_csv(out_dir / f"{fname}.csv", index=False)
     ns = sorted(s["n_features"].unique())
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5.6), sharey=True, layout="constrained")
-    for ax, kind in zip(axes, ("endogenous", "interventional")):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.4), sharey=True)
+    for ax, kind in zip(axes, ("endogenous", "interventional")):   # endogenous first
         for ser in series:
             for split in ("seen", "unseen"):
                 g = s[(s.eval_type == kind) & (s.series == ser) & (s.split == split)].sort_values("n_features")
@@ -153,17 +158,24 @@ def plot_by_n(per, out_dir, series, names, fname, title):
                     continue
                 st = SPLIT_STYLE[split]
                 ax.errorbar(g["n_features"], g["mean"], yerr=g["sem"], color=SERIES_COLOR[ser],
-                            ls=st["ls"], marker=st["marker"], ms=8, lw=2, capsize=3,
-                            mfc=st["mfc"] or SERIES_COLOR[ser], mec=SERIES_COLOR[ser],
-                            label=f"{names[ser]}, {SPLIT_NAME[split]}")
+                            ls=st["ls"], marker=st["marker"], ms=9, lw=1.8, capsize=3,
+                            mfc=st["mfc"] or SERIES_COLOR[ser], mec=SERIES_COLOR[ser])
         chance_line(ax)
         n_axis(ax, ns)
-        ax.set_title(kind)
+        ax.set_title(kind.capitalize(), fontsize=28)
+        ax.set_xlabel("Features Trained (N)", fontsize=26)
+        ax.tick_params(labelsize=22)
         style_axes(ax)
-    axes[0].set_ylabel("balanced accuracy (macro over features)")
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="outside lower center", ncol=4, frameon=True)
-    fig.suptitle(title)
+    axes[0].set_ylabel("Macro Accuracy\nover SAE Features", fontsize=26)
+    # compact legend: series by colour, trained / held out by line style + marker fill
+    handles = [plt.Line2D([], [], color=SERIES_COLOR[ser], marker="o", ms=9, lw=1.8,
+                          label=names[ser].title()) for ser in series]
+    handles += [plt.Line2D([], [], color="k", ls=SPLIT_STYLE[sp]["ls"], marker="o", ms=9, lw=1.8,
+                           mfc=SPLIT_STYLE[sp]["mfc"] or "k", mec="k",
+                           label=SPLIT_NAME[sp].title()) for sp in ("seen", "unseen")]
+    # one column: narrow enough to sit right of the N=1,3 points, which start near 1.0
+    axes[-1].legend(handles=handles, loc="upper right", ncol=1, fontsize=16, framealpha=0.9)
+    fig.tight_layout()
     save(fig, out_dir / fname)
 
 
@@ -249,12 +261,10 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     per, dist = load_runs(args.runs)
     per.to_csv(args.out / "featgen_all_features.csv", index=False)
-    plot_by_n(per, args.out, FIXED, SERIES_NAME, "featgen_by_n",
-              "SAE feature generalization: does the readout reach held-out features?")
+    plot_by_n(per, args.out, FIXED, SERIES_NAME, "featgen_by_n")
     matched = (per["series"] == "label_d100k").any()
     if matched:
-        plot_by_n(per, args.out, MATCHED, DATA_NAME, "featgen_data_matched",
-                  "Label prompt: 300k rows total vs 100k rows per feature")
+        plot_by_n(per, args.out, MATCHED, DATA_NAME, "featgen_data_matched")
     if dist is not None:
         dist.to_csv(args.out / "featgen_distractor_all.csv", index=False)
         plot_distractor(dist, args.out, FIXED, SERIES_NAME, "featgen_distractor",
