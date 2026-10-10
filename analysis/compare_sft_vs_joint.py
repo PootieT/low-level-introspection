@@ -47,7 +47,7 @@ import seaborn as sns
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 # the SFT sweep's heatmap style, shared so both scripts' heatmaps are identical
-from plot_single_neuron_results import draw_layer_position_heatmap  # noqa: E402
+from plot_single_neuron_results import SEQ_LEN, draw_layer_position_heatmap  # noqa: E402
 
 # Poster-scale fonts: kept identical to plot_single_neuron_results.py so the two
 # scripts' figures share one look.
@@ -461,7 +461,7 @@ def plot_delta_heatmap(merged, metric, label_a, label_b, out_dir, lim=None):
     title = f"Neuron Paired Diff. {pretty_metric(metric)}"
     path = Path(out_dir) / f"delta_{metric}_{label_a}_vs_{label_b}.png"
     draw_layer_position_heatmap(mean, std, title, path, vmin=-lim, vmax=lim,
-                                cmap="RdBu_r", center=0)
+                                cmap="RdBu_r", center=0, seq_len=SEQ_LEN)
     print(f"[cmp] wrote {path}")
 
 
@@ -481,7 +481,8 @@ def plot_arm_heatmap(df, metric, label, out_dir):
     vmin, vmax = (0, 1) if metric.endswith("corr") else (None, None)
     title = f"Neuron {pretty_metric(metric)}"
     path = Path(out_dir) / f"heatmap_{label}_{metric}.png"
-    draw_layer_position_heatmap(mean, std, title, path, vmin=vmin, vmax=vmax)
+    draw_layer_position_heatmap(mean, std, title, path, vmin=vmin, vmax=vmax,
+                                seq_len=SEQ_LEN)
     print(f"[cmp] wrote {path}")
 
 

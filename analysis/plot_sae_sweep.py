@@ -5,7 +5,9 @@ Reads every sae_joint_train_metrics.json under --runs (run names
 saeJoint_S<L>.<i>_POS<p>_gateoff_w<W>), ranks features by scripts/sae/sweep_features.txt,
 labels them with their Neuronpedia concept (annotated parquets), and writes, per weight W:
 
-  heatmap_<metric>_w<W>          layer x position, mean over the 3 features, endo | interv
+  heatmap_<metric>_w<W>          paper heatmap, endogenous | interventional in one figure,
+                                 layer x position, mean ± std over the 3 features, in the
+                                 neuron heatmaps' style (neuron-panel width, half height)
   heatmap_<metric>_byfeat_w<W>   same, one row per feature rank (F1-F3)
   vs_position_bacc_w<W>          balanced acc vs position, one line per layer (mean +- SE)
   vs_layer_bacc_w<W>             balanced acc vs layer, one line per position (mean +- SE);
@@ -31,12 +33,17 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 from sae_style import INK, SMALL, apply_rc, box, chance_line, fig_title, save, style_axes
+# the neuron heatmaps' drawing function, so the paper's layer x position panels for
+# neuron / SAE / attention share one style (imported before apply_rc so the SAE rc wins
+# for every other figure here; the heatmap helper sets its own sizes explicitly)
+from plot_single_neuron_results import draw_layer_position_heatmap_pair
 
 ROOT = Path(__file__).parents[1]
 apply_rc()
 RUN_RE = re.compile(r"saeJoint_S(?P<layer>\d+)\.(?P<index>\d+)_POS(?P<pos>-?\d+)_gateoff_w(?P<w>\d+)")
 ARMS = [("test_endogenous", "endogenous"), ("test_interventional", "interventional")]
 METRICS = {"balanced_accuracy": "balanced accuracy", "precision": "precision"}
+METRIC_TITLE = {"balanced_accuracy": "Balanced Accuracy", "precision": "Precision"}
 RANK_COLOR = dict(zip(["F1", "F2", "F3"], sns.color_palette("tab10", 3)))
 
 
@@ -93,14 +100,28 @@ def heat(ax, piv, title, vmin=0.5):
 
 
 def plot_heatmaps(df, w, metric, out):
-    vmin = 0.5 if metric == "balanced_accuracy" else 0.0
+    """Paper heatmap in the NEURON convention (plot_single_neuron_results.py): endogenous
+    | interventional side by side in ONE figure, layer x absolute token position, cells
+    mean ± std over the layer's 3 features, viridis on one fixed range with one colorbar.
+
+    The figure is a neuron panel's width and half its height (both arms share one paper
+    slot), with the neuron font sizes, so each 4x4 map is a quarter of a neuron panel
+    and its text prints at the same size when placed at the same scale."""
+    vmin = 0.5 if metric == "balanced_accuracy" else 0.0   # 0.5 = chance balanced accuracy
     d = df[df.w == w]
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
-    for ax, (_, short) in zip(axes, ARMS):
-        piv = d.pivot_table(index="layer", columns="position", values=f"{short}_{metric}", aggfunc="mean")
-        heat(ax, piv, short, vmin)
-    fig_title(fig, f"{METRICS[metric]}, mean over 3 features per layer (w={w:g})")
-    fig.tight_layout(); save(fig, out / f"heatmap_{metric}_w{w:g}")
+    panels = []
+    for _, short in ARMS:
+        col = f"{short}_{metric}"
+        if col not in d:
+            continue
+        mean = d.pivot_table(index="layer", columns="position", values=col, aggfunc="mean")
+        std = d.pivot_table(index="layer", columns="position", values=col, aggfunc="std")
+        panels.append((mean, std, f"SAE {short.capitalize()}"))
+    if panels:
+        path = out / f"heatmap_{metric}_w{w:g}.png"
+        draw_layer_position_heatmap_pair(panels, path, cbar_label=METRIC_TITLE[metric],
+                                         vmin=vmin, vmax=1.0, formats=("png", "pdf"))
+        print("wrote", path, "+ .pdf")
 
     ranks = sorted(d["rank"].dropna().unique())
     if not ranks:

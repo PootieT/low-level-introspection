@@ -423,25 +423,95 @@ def _fmt2(df: pd.DataFrame) -> pd.DataFrame:
     return df.apply(lambda col: col.map(one))
 
 
-def draw_layer_position_heatmap(mean_df: pd.DataFrame, spread_df: pd.DataFrame, title: str,
-                                path, vmin=None, vmax=None, cmap="viridis", center=None):
-    """The ONE style for every layer x token-position heatmap -- the SFT sweep maps
-    here and the SFT-vs-joint arm/delta maps in compare_sft_vs_joint.py -- so panels
-    from both scripts sit side by side in a paper figure. Cells read 'mean\\n±spread';
-    the metric goes in the title (not on the colorbar)."""
-    annot = _fmt2(mean_df) + "\n±" + _fmt2(spread_df.reindex_like(mean_df).fillna(0))
-    plt.figure(figsize=(16, 12))
-    hm = sns.heatmap(mean_df, annot=annot, fmt="", vmin=vmin, vmax=vmax, center=center,
-                     cmap=cmap, annot_kws={"size": 24})
-    hm.figure.axes[-1].tick_params(labelsize=28)      # colorbar ticks
-    hm.tick_params(axis="x", labelsize=32)
-    hm.tick_params(axis="y", labelsize=32)
-    plt.xlabel("Token Position", fontsize=40)
-    plt.ylabel("Layer", fontsize=40)
-    plt.title(title, fontsize=38, pad=20)
-    plt.tight_layout()
-    plt.savefig(path, dpi=150, bbox_inches="tight")
+# Every layer x position sweep uses fixed 32-token windows (configs: max_seq_length=32;
+# the SAE sweep's SEQ_LEN=32 with --min-seq-length 32). Neuron runs store positions
+# relative to the end (-1 = last token); heatmaps draw them as 0-indexed ABSOLUTE
+# positions (-1 -> 31, -28 -> 4), which is also how the SAE sweep names its positions.
+SEQ_LEN = 32
+# Paper layout: the neuron 8x8 maps are one 16x12 figure per arm. The small 4x4 grids
+# (SAE, attention) put BOTH arms in one figure the width of a neuron panel and half its
+# height, so each 4x4 map is a quarter of a neuron panel. Font sizes are identical in
+# every case: placed in the paper at the same scale (same dpi / same \includegraphics
+# scale), text prints at the same size everywhere.
+HEATMAP_FIGSIZE = (16, 12)
+SMALL_GRID_PAIR_FIGSIZE = (14.8, 6)   # rendered: same width as a neuron panel
+# the one set of sizes every layer x position heatmap uses
+_FS = dict(annot=24, ticks=32, axis_label=40, title=38, cbar_ticks=28)
+
+
+def _abs_positions(mean_df, spread_df, seq_len):
+    """Relabel negative (end-relative) position columns as absolute ones (seq_len + pos)."""
+    if seq_len is None:
+        return mean_df, spread_df
+    to_abs = lambda c: c + seq_len if c < 0 else c          # noqa: E731
+    return mean_df.rename(columns=to_abs), spread_df.rename(columns=to_abs)
+
+
+def _cell_text(mean_df, spread_df):
+    return _fmt2(mean_df) + "\n±" + _fmt2(spread_df.reindex_like(mean_df).fillna(0))
+
+
+def _save(path, formats):
+    for ext in formats:
+        plt.savefig(Path(path).with_suffix(f".{ext}"), dpi=150, bbox_inches="tight")
     plt.close()
+
+
+def draw_layer_position_heatmap(mean_df: pd.DataFrame, spread_df: pd.DataFrame, title: str,
+                                path, vmin=None, vmax=None, cmap="viridis", center=None,
+                                seq_len=None, figsize=HEATMAP_FIGSIZE, formats=("png",)):
+    """The ONE style for every layer x token-position heatmap -- the SFT sweep maps
+    here and the SFT-vs-joint arm/delta maps in compare_sft_vs_joint.py -- so panels sit
+    side by side in a paper figure. Cells read 'mean\\n±spread'; the metric goes in the
+    title (not on the colorbar). See draw_layer_position_heatmap_pair for 4x4 grids.
+
+    seq_len: relabel negative (end-relative) positions as absolute ones (seq_len + pos).
+    formats: file types written next to `path` (its suffix is replaced)."""
+    mean_df, spread_df = _abs_positions(mean_df, spread_df, seq_len)
+    plt.figure(figsize=figsize)
+    hm = sns.heatmap(mean_df, annot=_cell_text(mean_df, spread_df), fmt="", vmin=vmin,
+                     vmax=vmax, center=center, cmap=cmap, annot_kws={"size": _FS["annot"]})
+    hm.figure.axes[-1].tick_params(labelsize=_FS["cbar_ticks"])      # colorbar ticks
+    hm.tick_params(axis="both", labelsize=_FS["ticks"])
+    plt.xlabel("Token Position", fontsize=_FS["axis_label"])
+    plt.ylabel("Layer", fontsize=_FS["axis_label"])
+    plt.title(title, fontsize=_FS["title"], pad=20)
+    plt.tight_layout()
+    _save(path, formats)
+
+
+def draw_layer_position_heatmap_pair(panels, path, cbar_label=None, vmin=None, vmax=None,
+                                     cmap="viridis", center=None, seq_len=None,
+                                     figsize=SMALL_GRID_PAIR_FIGSIZE, formats=("png",)):
+    """Two layer x position heatmaps side by side (endogenous | interventional) in the
+    same style and font sizes as draw_layer_position_heatmap, for the small 4x4 grids
+    (SAE, attention) that share one paper slot. One colour scale and one colorbar
+    (its own column, so both maps get equal width); 'Layer' labelled once, on the left.
+
+    Each map is half as wide as a neuron panel, so a full 'SAE Interventional Balanced
+    Accuracy' title does not fit at the shared title size: titles name the signal and
+    readout, and the metric they share goes on the colorbar (`cbar_label`).
+
+    panels: [(mean_df, spread_df, title), (mean_df, spread_df, title)]."""
+    fig, axes = plt.subplots(1, len(panels) + 1, figsize=figsize,
+                             gridspec_kw={"width_ratios": [1] * len(panels) + [0.06]})
+    *maps, cax = axes
+    for i, (ax, (mean_df, spread_df, title)) in enumerate(zip(maps, panels)):
+        mean_df, spread_df = _abs_positions(mean_df, spread_df, seq_len)
+        last = i == len(panels) - 1
+        sns.heatmap(mean_df, ax=ax, annot=_cell_text(mean_df, spread_df), fmt="",
+                    vmin=vmin, vmax=vmax, center=center, cmap=cmap,
+                    annot_kws={"size": _FS["annot"]}, cbar=last, cbar_ax=cax if last else None,
+                    yticklabels=(i == 0))
+        ax.tick_params(axis="both", labelsize=_FS["ticks"])
+        ax.set_xlabel("Token Position", fontsize=_FS["axis_label"])
+        ax.set_ylabel("Layer" if i == 0 else "", fontsize=_FS["axis_label"])
+        ax.set_title(title, fontsize=_FS["title"], pad=20)
+    cax.tick_params(labelsize=_FS["cbar_ticks"])
+    if cbar_label:
+        cax.set_ylabel(cbar_label, fontsize=_FS["ticks"])
+    fig.tight_layout()
+    _save(path, formats)
 
 
 def plot_endogenous_heatmaps(df: pd.DataFrame, out_dir: str):
@@ -468,7 +538,8 @@ def plot_endogenous_heatmaps(df: pd.DataFrame, out_dir: str):
         vmin, vmax = scale[metric]
         title = f"Neuron {eval_name.capitalize()} {quantity.get(metric, metric)}"
         path = f"{out_dir}/heatmap_{eval_name}_{metric}.png"
-        draw_layer_position_heatmap(mean_df, std_df, title, path, vmin=vmin, vmax=vmax)
+        draw_layer_position_heatmap(mean_df, std_df, title, path, vmin=vmin, vmax=vmax,
+                                    seq_len=SEQ_LEN)
         print(f"[endo] wrote {path}")
 
 
