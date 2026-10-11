@@ -53,6 +53,14 @@ ARMS = {                      # label -> (group, w, kl_tag)
     "joint_free":   ("mlp_joint_grid_layer_token", 0.01, "none"),
 }
 NEEDED = ["coupling_gap", "drift_vs_cached_corr", "interventional_corr", "endogenous_corr"]
+# figure names for the arm labels (the labels stay the keys in every CSV)
+ARM_TITLE = {"sft": "SFT", "joint_kl0.1": "Joint Loss (KL=0.1)", "joint_free": "Joint Loss (KL=None)"}
+SEQ_LEN = 32      # heatmap columns are drawn as 0-indexed absolute positions (-1 -> 31)
+FS = dict(title=22, label=20, ticks=16, legend=15, annot=12)
+
+
+def _arm(a):
+    return ARM_TITLE.get(a, a)
 
 
 def load_arms() -> pd.DataFrame:
@@ -121,12 +129,13 @@ def plot_gap_vs_drift(df: pd.DataFrame, out_dir: Path):
     for arm in arms:
         q = df[df["arm"] == arm]
         ax.scatter(q["drift_vs_cached_corr"], q["coupling_gap"], s=28, alpha=0.65,
-                   color=pal[arm], label=f"{arm} (n={len(q)})", edgecolors="none")
+                   color=pal[arm], label=f"{_arm(arm)} (n={len(q)})", edgecolors="none")
     ax.axhline(0, color="k", lw=0.9, alpha=0.5)
-    ax.set_xlabel("neuron drift: corr(live tuned, cached)   (1 = did not move)")
-    ax.set_ylabel("coupling gap: corr(pred, live) − corr(pred, cached)")
+    ax.set_xlabel("Neuron Drift: Corr(Live Tuned, Cached)", fontsize=FS["label"])
+    ax.set_ylabel("Coupling Gap", fontsize=FS["label"])
+    ax.tick_params(labelsize=FS["ticks"])
     ax.invert_xaxis()
-    ax.legend()
+    ax.legend(fontsize=FS["legend"])
     fig.tight_layout()
     fig.savefig(out_dir / "coupling_gap_vs_drift.png", dpi=150)
     plt.close(fig)
@@ -139,7 +148,7 @@ def plot_readout_scatter(df: pd.DataFrame, out_dir: Path):
         print("[ic] readout scatter skipped: full readout block not available (needs run dirs)")
         return
     arms = [a for a in ARMS if a in set(df["arm"])] or sorted(df["arm"].unique())
-    fig, axes = plt.subplots(1, len(arms), figsize=(5.2 * len(arms), 5), sharey=True, squeeze=False)
+    fig, axes = plt.subplots(1, len(arms), figsize=(6 * len(arms), 5.6), sharey=True, squeeze=False)
     for ax, arm in zip(axes[0], arms):
         q = df[df["arm"] == arm]
         sc = ax.scatter(q["corr_pred_cached"], q["corr_pred_tuned_live"],
@@ -147,10 +156,14 @@ def plot_readout_scatter(df: pd.DataFrame, out_dir: Path):
                         s=30, edgecolors="k", linewidths=0.4)
         ax.plot([-0.2, 1], [-0.2, 1], "k--", lw=0.9, alpha=0.6)
         ax.set_xlim(-0.2, 1.02); ax.set_ylim(-0.2, 1.02)
-        ax.set_xlabel("corr(pred, cached target)")
-        ax.set_title(arm)
-    axes[0][0].set_ylabel("corr(pred, live tuned activation)")
-    cb = fig.colorbar(sc, ax=axes, shrink=0.85, pad=0.02); cb.set_label("neuron drift corr")
+        ax.set_title(_arm(arm), fontsize=FS["title"])
+        ax.tick_params(labelsize=FS["ticks"])
+    axes[0][0].set_ylabel("Corr(Prediction, Live Activation)", fontsize=FS["label"])
+    # one shared x-label: per-panel copies are wider than a panel and collide
+    fig.supxlabel("Corr(Prediction, Cached Target)", fontsize=FS["label"], y=-0.02)
+    cb = fig.colorbar(sc, ax=axes, shrink=0.85, pad=0.02)
+    cb.set_label("Neuron Drift Corr.", fontsize=FS["label"])
+    cb.ax.tick_params(labelsize=FS["ticks"])
     fig.savefig(out_dir / "readout_cached_vs_live.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
@@ -161,15 +174,20 @@ def plot_cell_heatmaps(cells: pd.DataFrame, out_dir: Path, metric: str, vmin=Non
     col = f"{metric}_mean"
     if col not in cells.columns:
         return
-    fig, axes = plt.subplots(1, len(arms), figsize=(5.4 * len(arms), 4.6), squeeze=False)
-    for ax, arm in zip(axes[0], arms):
+    fig, axes = plt.subplots(1, len(arms), figsize=(7.5 * len(arms), 6.6), squeeze=False)
+    for i, (ax, arm) in enumerate(zip(axes[0], arms)):
         piv = cells[cells["arm"] == arm].pivot(index="layer", columns="position", values=col)
+        piv = piv.rename(columns=lambda c: c + SEQ_LEN if c < 0 else c)   # absolute positions
         sns.heatmap(piv, annot=True, fmt=".2f", cmap=cmap, vmin=vmin, vmax=vmax, ax=ax,
-                    linewidths=0.5, linecolor="white", annot_kws={"size": 8},
-                    cbar=(ax is axes[0][-1]))
-        ax.set_title(arm); ax.set_xlabel("position"); ax.set_ylabel("layer")
+                    linewidths=0.5, linecolor="white", annot_kws={"size": FS["annot"]},
+                    cbar=(ax is axes[0][-1]), yticklabels=(i == 0))
+        ax.set_title(_arm(arm), fontsize=FS["title"])
+        ax.set_xlabel("Token Position", fontsize=FS["label"])
+        ax.set_ylabel("Layer" if i == 0 else "", fontsize=FS["label"])
+        ax.tick_params(labelsize=FS["ticks"])
+    fig.axes[-1].tick_params(labelsize=FS["ticks"])                        # colorbar
     fig.tight_layout()
-    fig.savefig(out_dir / f"heatmap_{metric}.png", dpi=150)
+    fig.savefig(out_dir / f"heatmap_{metric}.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 

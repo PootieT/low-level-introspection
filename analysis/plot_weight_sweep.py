@@ -43,6 +43,14 @@ ROOT = Path(__file__).parents[1]
 NEURON_RE = re.compile(r"N(?P<layer>\d+)\.(?P<index>\d+)")
 POS_RE = re.compile(r"POS(?P<pos>-?\d+)")
 KL_RE = re.compile(r"_kl(?P<kl>[0-9.]+)")
+SEQ_LEN = 32      # titles show 0-indexed absolute token positions (-1 -> 31)
+FS = dict(title=22, label=20, ticks=16, legend=13)
+
+
+def _cell_title(cell):
+    """'L10 POS-1 (kl=0.1)' -> 'L10, t=31 (KL=0.1)'."""
+    t = POS_RE.sub(lambda m: f"t={int(m['pos']) + SEQ_LEN if int(m['pos']) < 0 else m['pos']}", cell)
+    return t.replace(" t=", ", t=").replace("(kl=", "(KL=")
 W_RE = re.compile(r"_w(?P<w>[0-9.]+)")
 TRAIN_LEN = 32
 
@@ -116,7 +124,7 @@ def summarize(df: pd.DataFrame, metrics) -> pd.DataFrame:
 def plot_pareto(summary, out_dir):
     """Endogenous vs interventional, one point per W, error bars = SE over neurons."""
     cells = sorted(summary["cell"].unique())
-    fig, axes = plt.subplots(1, len(cells), figsize=(5.8 * len(cells), 5.4), squeeze=False)
+    fig, axes = plt.subplots(1, len(cells), figsize=(6.6 * len(cells), 6.2), squeeze=False)
     ws = sorted(summary["w"].unique())
     colors = dict(zip(ws, sns.color_palette("viridis", len(ws))))
     for ax, cell in zip(axes.flat, cells):
@@ -128,16 +136,13 @@ def plot_pareto(summary, out_dir):
                         xerr=r.get("interventional_corr_se"), yerr=r.get("endogenous_corr_se"),
                         fmt="o", ms=11, color=colors[r["w"]], capsize=3, zorder=3,
                         label=f"w={r['w']:g} (n={int(r['n_neurons'])})")
-            ax.annotate(f"{r['w']:g}", (r["interventional_corr_mean"], r["endogenous_corr_mean"]),
-                        textcoords="offset points", xytext=(7, 5), fontsize=10)
-        ax.set_title(cell)
-        ax.set_xlabel("interventional corr (causal reading)")
-        ax.set_ylabel("endogenous corr")
+        ax.set_title(_cell_title(cell), fontsize=FS["title"])
+        ax.set_xlabel("Interventional Correlation", fontsize=FS["label"])
+        ax.set_ylabel("Endogenous Correlation", fontsize=FS["label"])
+        ax.tick_params(labelsize=FS["ticks"])
         ax.set_xlim(-0.1, 1.05); ax.set_ylim(-0.1, 1.05)
         ax.grid(alpha=0.25)
-        ax.legend(fontsize=9, loc="lower left")
-    fig.suptitle("joint-loss weight: endogenous vs interventional (mean ± SE over neurons)",
-                 y=1.02)
+        ax.legend(fontsize=FS["legend"], loc="lower left")
     fig.tight_layout()
     path = Path(out_dir) / "weight_pareto.png"
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)

@@ -52,6 +52,14 @@ GATE_RE = re.compile(r"gate(?P<gate>on|off)")
 W_RE = re.compile(r"_w(?P<w>[0-9.]+)")
 NEURON_RE = re.compile(r"N(?P<layer>\d+)\.(?P<index>\d+)")
 TRAIN_LEN = 32          # the length the anchor is applied at during training
+SEQ_LEN = 32            # training window; titles show 0-indexed absolute positions (-1 -> 31)
+
+
+def _cell_title(cell):
+    """'N10.24 POS-1' -> 'N10.24 t=31': token position as an absolute 0-indexed index,
+    matching the layer x position heatmaps."""
+    return POS_RE.sub(lambda m: f"t={int(m['pos']) + SEQ_LEN if int(m['pos']) < 0 else m['pos']}",
+                      cell).replace(" t=", ", t=")
 
 
 def load_kl_sweep(exp_group: str, gate="off", position=None, exclude=("lrcos",)) -> pd.DataFrame:
@@ -240,7 +248,7 @@ def _target_label(t):
     return "none" if not np.isfinite(t) else f"{t:g}"
 
 
-def _facet(df, x, out_path, title, xlabel, logx=True):
+def _facet(df, x, out_path, xlabel, logx=True):
     """One panel per (neuron, position) cell; interventional and endogenous on y."""
     cells = sorted(df["cell"].unique())
     ncol = min(2, len(cells))
@@ -251,22 +259,21 @@ def _facet(df, x, out_path, title, xlabel, logx=True):
         if sub.empty:
             ax.set_visible(False)
             continue
-        for col, label, marker in (("interventional_corr", "interventional", "o"),
-                                   ("endogenous_corr", "endogenous", "s")):
+        for col, label, marker in (("interventional_corr", "Interventional", "o"),
+                                   ("endogenous_corr", "Endogenous", "s")):
             ax.plot(sub[x], sub[col], marker=marker, label=label)
         unanch = sub[~sub["anchored"]]
         if len(unanch) and np.isfinite(unanch[x]).any():
             ax.scatter(unanch[x], unanch["interventional_corr"], marker="X", s=200,
-                       color="crimson", zorder=5, label="unanchored")
+                       color="crimson", zorder=5, label="Unanchored")
         if logx:
             ax.set_xscale("log")
-        ax.set_title(cell)
-        ax.set_xlabel(xlabel); ax.set_ylabel("correlation")
+        ax.set_title(_cell_title(cell))
+        ax.set_xlabel(xlabel); ax.set_ylabel("Correlation")
         ax.set_ylim(-0.1, 1.05); ax.axhline(0, color="grey", ls="--", lw=1)
         ax.grid(alpha=0.25, which="both"); ax.legend(fontsize=10)
     for ax in axes.flat[len(cells):]:
         ax.set_visible(False)
-    fig.suptitle(title, y=1.01)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -280,8 +287,7 @@ def plot_frontier(df, out_dir, length=TRAIN_LEN):
         print(f"[kl] no measured {x} anywhere; skipping the measured-cost frontier")
         return
     _facet(df[df[x].notna()], x, Path(out_dir) / f"kl_frontier_L{length}.png",
-           "cost of introspection: performance vs MEASURED LM degradation",
-           f"measured KL(base||tuned) @L={length}, nats/token")
+           f"Measured KL(Base || Tuned) @ L={length} (nats/token)")
 
 
 def plot_frontier_by_budget(df, out_dir):
@@ -292,8 +298,7 @@ def plot_frontier_by_budget(df, out_dir):
     if sub.empty:
         return
     _facet(sub, "kl_target", Path(out_dir) / "kl_frontier_by_budget.png",
-           "performance vs KL BUDGET (knob, not measured cost)",
-           "KL budget (target, nats/token)")
+           "KL Budget (Target, nats/token)")
 
 
 def plot_controller(df, out_dir, length=TRAIN_LEN):

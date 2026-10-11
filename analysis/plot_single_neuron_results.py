@@ -618,8 +618,11 @@ def plot_gate_comparison(df_by_gate: dict, out_dir: str, expected_neurons: int =
             if sub.empty:
                 ax.set_visible(False)
                 continue
+            # absolute 0-indexed positions (-1 -> 31), as in the layer x position heatmaps
+            sub = sub.assign(position=sub["position"].map(lambda p: p + SEQ_LEN if p < 0 else p))
             sns.lineplot(data=sub, x="position", y="value", hue="layer", palette=palette,
                          marker="o", errorbar="se", ax=ax, legend=(ax is axes.flat[-1]))
+            ax.set_xticks(sorted(sub["position"].unique()))
             ax.set_title(f"LoRA Gate-{gate.capitalize()}")
             ax.set_xlabel("Token Position")
             ax.set_ylabel(panel.title())
