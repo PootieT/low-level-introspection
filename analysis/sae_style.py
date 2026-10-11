@@ -17,6 +17,29 @@ ORDER = ["12408", "1568", "978", "4120", "4854"]
 CONCEPT = {"12408": "appreciation", "1568": "limitations", "978": "statistics",
            "4120": "affiliations", "4854": "identifiers"}
 FEATURE_COLOR = dict(zip(ORDER, sns.color_palette("tab10", len(ORDER))))
+# One-word summaries of the layer x position sweep's features (scripts/sae/sweep_features.txt),
+# from each feature's Neuronpedia explanation (gemma-2-2b, <layer>-gemmascope-res-16k;
+# the first explanation when there are several), for figure legends.
+SWEEP_CONCEPT = {
+    "S5.14228": "Call-to-Action",   # calls to action or prompts to click for more information
+    "S5.86": "Licenses",            # licenses and documentation for open-source software
+    "S5.10039": "Chemicals",        # purchase and use of chemicals and reagents
+    "S10.13054": "Reviews",         # emotions or evaluations of movies and experiences
+    "S10.3151": "Negation",         # phrases indicating disagreement or negation
+    "S10.3887": "Struggle",         # dramatic conflicts: personal struggle and survival
+    "S15.12245": "Contact",         # contact information and communication-related prompts
+    "S15.12162": "Instructions",    # instructions or steps for using a system / doing a task
+    "S15.7473": "Opinions",         # statements expressing strong opinions or feelings
+    "S20.10859": "Contact",         # contact information and details for events or programs
+    "S20.8322": "Engagement",       # encouragement for audience interaction and feedback
+    "S20.7717": "Gratitude",        # expressions of gratitude and friendly communication
+}
+
+
+def sweep_feature_label(feature):
+    """'S5.14228 (Call-to-Action)', or just the id for a feature without a summary."""
+    word = SWEEP_CONCEPT.get(feature)
+    return f"{feature} ({word})" if word else feature
 BASELINE = "#7f7f7f"
 INK, INK2 = "black", "#444444"
 SPINE = "#cccccc"
