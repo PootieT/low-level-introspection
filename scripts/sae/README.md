@@ -487,3 +487,49 @@ python analysis/plot_sae_feature_generalization.py
   feature fires on, so it can be guessed without introspection.
 - **Precision is reported at each feature's natural base rate** (from TPR/FPR), since
   the endogenous eval set subsamples inactive rows.
+
+---
+
+## 9. Prompted baseline (untrained model)
+
+The SAE analogue of the neuron track's `score_prompt_baseline.py`. The UNTRAINED
+gemma-2-2b is asked with the trained runs' own prompts, on the same cache, test split
+and steering, for every (feature, position) of the layer x position grid plus the
+layer-9 reference runs: 53 runs per prompt arm.
+
+```bash
+qsub -N sae_pb_cache -v STAGE=cache -t 1-17 scripts/sae/score_sae_prompt_baseline.sh
+qsub -hold_jid sae_pb_cache -v PROMPT=index -t 1-27 scripts/sae/score_sae_prompt_baseline.sh
+qsub -hold_jid sae_pb_cache -v PROMPT=label -t 1-27 scripts/sae/score_sae_prompt_baseline.sh
+python analysis/plot_sae_prompt_baseline.py
+```
+
+**Prompt arms.** `index` is the trained prompt. `label` names the feature by its
+Neuronpedia explanation (`scripts/sae/sweep_feature_labels.json`, from
+`fetch_sae_feature_labels.py`), as in the feature-generalization label arm. Plain
+`\n\n` replaces the learned separator token, which is random noise to an untrained model.
+
+**Readouts.** Every readout makes a hard active/inactive call scored by balanced
+accuracy and precision, as the trained runs are:
+- **verbal@k**: the first k greedy tokens, matched against fixed paraphrase lists
+  (`src/introspector/verbal_lexicon.py`). It covers state words, "not <state word>", and
+  numbers (0 -> inactive, >0 -> active). Anything else is "neither", a miss.
+  - The untrained model never writes "active"/"inactive" here. It writes "not ...",
+    "a ...", "the ...", or (for "has activation level of") numbers.
+  - The lists were frozen from unlabelled continuations before any scoring.
+- **logit**: next-token logits of active- vs inactive-like words at the readout.
+  Numbers can't enter it: their first token is a bare space.
+- **probe@k**: a logistic probe on the final hidden state pooled over k generated
+  tokens, fit on the endogenous label only. The joint probe did nothing for neurons, so
+  it was dropped.
+- **no-prompt control**: the probe on the text alone.
+
+**Thresholds.** The logit and probe readouts report AUROC (no threshold) and BA at the
+threshold that maximizes BA on a validation slice of the train split. That threshold
+is applied unchanged to both test sets. The configs' dev split (2000 texts, ~2-20
+actives) is too small to place a threshold.
+
+**Extras.** A probe learning curve over the number of active rows; a steering-scale
+sweep (1-30x the median active value) that includes a probe fit on steered rows,
+i.e. whether the injected direction is linearly visible at the readout at all; and an
+alignment check.

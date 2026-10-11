@@ -44,6 +44,7 @@ reuse — migrate a script into this directory rather than running it in place.
 | `sae/train_sae_intervention_pilot.sh` | interventional SAE detection training on 3 features x 3 positions: does steering on/off during training break the bypass before the full grid is worth running |
 | `sae/build_featgen_pool_layer9.sh` | the 200-feature layer-9 POOL for feature generalization: density band + >=50 positives at the 32-token readout, Neuronpedia labels, near-duplicate labels removed, judged features first |
 | `sae/cache_sae_feature_generalization.sh` + `sae/train_sae_feature_generalization.sh` (table in `sae/featgen_common.sh`) | SAE FEATURE GENERALIZATION: N in {1,3,10,30,100} layer-9 features at 300k total rows, label-prompt arm (tasks 1-5) then index-prompt control (6-10), plus the label arm at 100k rows per feature for N=10/30/100 (11-13); scored on all 200 pool features (seen / held out) + a steer x ask distractor matrix. Aggregate with `analysis/plot_sae_feature_generalization.py`; see `sae/README.md` section 8 |
+| `sae/score_sae_prompt_baseline.sh` | SAE PROMPTED BASELINE: the untrained gemma-2-2b over the grid's 48 (feature, position) runs + the 5 layer-9 runs, index and label prompts (`PROMPT=`); verbal@k (paraphrase-matched words), logit, probe@k with val-chosen thresholds, no-prompt control, learning curve, steering-scale sweep. `STAGE=cache` builds the 17 caches first. Aggregate with `analysis/plot_sae_prompt_baseline.py`; see `sae/README.md` section 9 |
 
 Others are migrated as the experiment list for the paper firms up.
 

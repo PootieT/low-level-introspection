@@ -1,0 +1,23 @@
+{
+  "labels": {
+    "S9.1568": "phrases that indicate challenges or limitations in methods or processes",
+    "S9.4854": "identifiers related to academic or technical references",
+    "S9.4120": "names of individuals and their affiliations or achievements",
+    "S9.978": "references to statistical data or numerical information",
+    "S9.12408": "expressions of positive feedback or appreciation",
+    "S5.14228": "calls to action or prompts to click for more information",
+    "S5.86": "references to licenses and documentation for open-source software",
+    "S5.10039": "phrases related to the purchase and use of chemicals and reagents in various contexts",
+    "S10.13054": "highly descriptive phrases that express emotions or evaluations of movies and experiences",
+    "S10.3151": "phrases indicating disagreement or negation",
+    "S10.3887": "key dramatic conflicts and themes related to personal struggle and survival",
+    "S15.12245": "contact information and communication-related prompts",
+    "S15.12162": "instructions or steps related to using a system or performing a task",
+    "S15.7473": "statements expressing strong opinions or feelings",
+    "S20.10859": "contact information and details for events or programs",
+    "S20.8322": "encouragement for audience interaction and feedback on the content",
+    "S20.7717": "expressions of gratitude and friendly communication"
+  },
+  "source": "neuronpedia gemma-2-2b res-16k",
+  "fetched_at": "2026-10-11T02:10:20.575247+00:00"
+}

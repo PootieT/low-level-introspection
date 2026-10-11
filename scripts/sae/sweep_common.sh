@@ -8,7 +8,10 @@
 # plus --min-seq-length 32 so a fixed absolute position is never clamped to an earlier
 # token on a short text (the cacher falls back to the last token otherwise).
 # ============================================================================
-cd /work/neu/p2026_0061_neu/low-level-introspection
+# the collaborator's cluster checkout; elsewhere (SCC) callers run from their repo root
+if [ -d /work/neu/p2026_0061_neu/low-level-introspection ]; then
+    cd /work/neu/p2026_0061_neu/low-level-introspection
+fi
 
 LAYERS=(${LAYERS_OVERRIDE:-5 10 15 20})
 POSITIONS=(${POSITIONS_OVERRIDE:-8 16 24 31})
