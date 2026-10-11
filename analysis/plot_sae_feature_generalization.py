@@ -10,24 +10,24 @@ run_spec.json the launcher writes):
 
 SERIES. A run belongs to one series, from its table group:
   label / index      300k rows TOTAL at every N (rows per feature fall as 1/N)
-  label_d100k        label prompt at 100k rows PER FEATURE (N=3's budget) at every N.
-                     Its N=3 point is the label series' N=3 run, which has exactly that
-                     budget. Kept apart from the label series so the two never average.
+  label_d100k        label prompt at 100k rows PER FEATURE (N=3's budget), only at the N
+                     the fixed budget starved (10, 30, 100). Drawn in red on the same axes
+                     as the other two, like the extra-data series of the neuron and layer
+                     generalization figures (plot_neuron_generalization.plot_data30k). It
+                     has no N=3 point of its own: that run is the label series' N=3.
 
-FIGURES (PNG + PDF, each with the CSV it was drawn from)
-  featgen_by_n             balanced accuracy vs N, trained vs held-out, label vs index
-                           (300k-total series): endogenous (can rise from the label
-                           describing the text alone), then interventional (the headline)
-  featgen_data_matched     the same panels, label prompt: 300k total vs 100k per feature.
-                           Is the seen-feature interventional collapse at N>=10 starvation?
+FIGURES (PNG + PDF, each with the CSV it was drawn from), all three series
+  featgen_by_n             balanced accuracy vs N, trained vs held-out: endogenous (can rise
+                           from the label describing the text alone), then interventional
+                           (the headline). Red vs blue at N>=10: is the seen-feature
+                           interventional collapse starvation?
   featgen_distractor       INTERVENTIONAL eval, P("active") with the prompt naming feature i
                            while i is steered on (higher is better), a different feature j is
                            steered on (lower is better), or i is clamped to 0 -- the "off"
                            half of the interventional test, a no-op on texts where i is
                            already inactive (lower is better). A readout that reads the
                            named feature is high on the first and near the third on the
-                           second. 300k-total series.
-  featgen_distractor_data_matched   the same, label prompt: 300k total vs 100k per feature
+                           second.
   featgen_unseen_vs_similarity
                            held-out interventional BA per feature against the cosine of its
                            label to the NEAREST TRAINED label (pool label_similarity). If the
@@ -62,16 +62,16 @@ from src.introspector.sae_featgen import load_pool, nearest_label_similarity   #
 SERIES_COLOR = {"label": "#1f77b4", "index": "#ff7f0e", "label_d100k": "#d62728"}
 SERIES_NAME = {"label": "label prompt", "index": "index prompt",
                "label_d100k": "label prompt, 100k rows/feature"}
-DATA_NAME = {"label": "300k rows total", "label_d100k": "100k rows per feature"}
-FIXED = ("label", "index")
-MATCHED = ("label", "label_d100k")
+SERIES = ("label", "index", "label_d100k")
+# legend text for the paper-style N figure (title case, short enough for one row)
+LEGEND_NAME = {"label": "Label Prompt", "index": "Index Prompt",
+               "label_d100k": "Label Prompt, 100k Rows/Feature"}
 SPLIT_STYLE = {"seen": dict(ls="-", marker="o", mfc=None),
                "unseen": dict(ls="--", marker="o", mfc="white")}
 SPLIT_NAME = {"seen": "Seen", "unseen": "Unseen"}
 STIM_STYLE = {"diagonal": dict(ls="-", marker="o", name="steer the named feature ↑"),
               "own": dict(ls=":", marker="s", name="steer a different feature ↓"),
               "off": dict(ls="--", marker="^", name="named feature clamped to 0 ↓")}
-D100K_ROWS = 100_000
 
 
 def _series(spec):
@@ -106,18 +106,9 @@ def load_runs(runs_dir: Path):
             dist.append(pd.read_csv(g).assign(**meta))
     if not per:
         raise SystemExit(f"no finished runs under {runs_dir}")
-    per = with_shared_point(pd.concat(per, ignore_index=True))
-    dist = with_shared_point(pd.concat(dist, ignore_index=True)) if dist else None
+    per = pd.concat(per, ignore_index=True)
+    dist = pd.concat(dist, ignore_index=True) if dist else None
     return per, dist
-
-
-def with_shared_point(df):
-    """The label series' runs that already have 100k rows per feature (N=3) are also the
-    first point of the 100k-per-feature series; copy them in under that series."""
-    if not (df["series"] == "label_d100k").any():
-        return df
-    shared = df[(df["series"] == "label") & (df["rows_per_feature"] == D100K_ROWS)]
-    return pd.concat([df, shared.assign(series="label_d100k")], ignore_index=True)
 
 
 def macro(df, by, col):
@@ -140,8 +131,9 @@ def plot_by_n(per, out_dir, series, names, fname):
     """Balanced accuracy vs N, trained vs held-out features, one colour per series --
     formatted like the neuron/layer generalization figures (plot_neuron_generalization
     data30k_vs_scaling, plot_layer_generalization unseen_by_n): no suptitle, capitalized
-    labels, their font sizes, and one compact legend inside the interventional panel
-    (colour = series, line style = trained / held out)."""
+    labels, their font sizes, and one compact legend (colour = series, line style =
+    trained / held out) -- in one row under the panels: with three series there is no
+    region of the interventional panel that stays empty whatever the 100k runs show."""
     per = per[per["series"].isin(series)]
     if per.empty:
         return
@@ -168,14 +160,15 @@ def plot_by_n(per, out_dir, series, names, fname):
         style_axes(ax)
     axes[0].set_ylabel("Macro Accuracy\nover SAE Features", fontsize=26)
     # compact legend: series by colour, trained / held out by line style + marker fill
+    present = [ser for ser in series if (s["series"] == ser).any()]
     handles = [plt.Line2D([], [], color=SERIES_COLOR[ser], marker="o", ms=9, lw=1.8,
-                          label=names[ser].title()) for ser in series]
+                          label=LEGEND_NAME[ser]) for ser in present]
     handles += [plt.Line2D([], [], color="k", ls=SPLIT_STYLE[sp]["ls"], marker="o", ms=9, lw=1.8,
                            mfc=SPLIT_STYLE[sp]["mfc"] or "k", mec="k",
                            label=SPLIT_NAME[sp].title()) for sp in ("seen", "unseen")]
-    # one column: narrow enough to sit right of the N=1,3 points, which start near 1.0
-    axes[-1].legend(handles=handles, loc="upper right", ncol=1, fontsize=16, framealpha=0.9)
-    fig.tight_layout()
+    fig.legend(handles=handles, loc="lower center", ncol=len(handles), fontsize=16,
+               framealpha=0.9, bbox_to_anchor=(0.5, 0.0))
+    fig.tight_layout(rect=(0, 0.1, 1, 1))
     save(fig, out_dir / fname)
 
 
@@ -209,7 +202,7 @@ def plot_distractor(dist, out_dir, series, names, fname, title):
         style_axes(ax)
     axes[0].set_ylabel('P(model answers "active")')
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="outside lower center", ncol=2, frameon=True, fontsize=11)
+    fig.legend(handles, labels, loc="outside lower center", ncol=len(series), frameon=True, fontsize=11)
     fig.suptitle(title)
     save(fig, out_dir / fname)
 
@@ -220,7 +213,6 @@ def plot_similarity(per, out_dir):
         return
     u = per[(~per["is_trained"]) & (per["eval_type"] == "interventional")].dropna(
         subset=["balanced_accuracy", "nearest_trained_sim"])
-    u = u.drop_duplicates(["run", "signal"])   # the shared N=3 run once, as the label series
     u.to_csv(out_dir / "featgen_unseen_vs_similarity.csv", index=False)
     ns = sorted(u["n_features"].unique())
     if not ns:
@@ -261,17 +253,11 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     per, dist = load_runs(args.runs)
     per.to_csv(args.out / "featgen_all_features.csv", index=False)
-    plot_by_n(per, args.out, FIXED, SERIES_NAME, "featgen_by_n")
-    matched = (per["series"] == "label_d100k").any()
-    if matched:
-        plot_by_n(per, args.out, MATCHED, DATA_NAME, "featgen_data_matched")
+    plot_by_n(per, args.out, SERIES, SERIES_NAME, "featgen_by_n")
     if dist is not None:
         dist.to_csv(args.out / "featgen_distractor_all.csv", index=False)
-        plot_distractor(dist, args.out, FIXED, SERIES_NAME, "featgen_distractor",
+        plot_distractor(dist, args.out, SERIES, SERIES_NAME, "featgen_distractor",
                         "Interventional distractor control: is the readout addressed to the named feature?")
-        if matched:
-            plot_distractor(dist, args.out, MATCHED, DATA_NAME, "featgen_distractor_data_matched",
-                            "Distractor control, label prompt: 300k rows total vs 100k rows per feature")
     plot_similarity(per, args.out)
 
 

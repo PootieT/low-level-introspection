@@ -454,8 +454,10 @@ python analysis/plot_sae_feature_generalization.py
     `--signal-filter`. The table's `cache_feats` column sets this.
   - Runs over 1M rows checkpoint every 10%. One that outlives its job resumes from the
     latest checkpoint when the same task is resubmitted.
-  - Plotted as their own series (`featgen_data_matched`, `featgen_distractor_data_matched`),
-    with label_n3 as the shared N=3 point, so they never average into the 300k-total curves.
+  - Plotted in red on the same axes as the label/index series (`featgen_by_n`,
+    `featgen_distractor`), only at N=10/30/100, like the extra-data series of the neuron
+    and layer generalization figures. They are their own series, so they never average
+    into the 300k-total curves.
 - **Caches** store only what the trainer can use, via `DatasetConfig.negative_keep`
   (`--train-negative-keep`, `--test-negative-keep`):
   - Inactive rows are kept by a deterministic per-(signal, text) hash
