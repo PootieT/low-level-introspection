@@ -50,15 +50,36 @@ NAME_RE = re.compile(r"saeJoint_(S(\d+)\.\d+)_POS(-?\d+)_gateoff_w(\d+)")
 W_OF = {"10": 1.0, "09": 0.9, "075": 0.75, "05": 0.5}
 
 
+RUN_DIR_RE = re.compile(r"(S(\d+)\.\d+)_POS(-?\d+)")
+
+
 def load_baseline(root: Path):
+    """Every run's table, identified by its DIRECTORY (<prompt>/<S..>_POS<p>/, which
+    score_sae_prompt_baseline.py names) rather than by the columns inside the file.
+    A file whose own signal/position/prompt columns disagree with its directory is
+    reported, so a stray or hand-copied table cannot silently join the wrong cell."""
     frames = []
     for f in sorted(root.glob("*/*/baseline_by_k.csv")):
-        frames.append(pd.read_csv(f))
+        m = RUN_DIR_RE.fullmatch(f.parent.name)
+        if m is None:
+            print(f"[plot] SKIPPED {f}: directory is not named <S<layer>.<index>>_POS<position>")
+            continue
+        df = pd.read_csv(f)
+        ident = {"prompt": f.parent.parent.name, "signal": m.group(1), "position": int(m.group(3))}
+        for col, want in ident.items():
+            if col in df:
+                got = df[col]
+                off = got.isna() | (got.astype(str) != str(want))
+                if off.any():
+                    print(f"[plot] WARNING {f}: {int(off.sum())}/{len(df)} rows have {col}="
+                          f"{sorted(map(str, got[off].unique()))[:3]}, directory says {want!r}; "
+                          f"using the directory")
+            df[col] = want
+        df["layer"] = int(m.group(2))
+        frames.append(df)
     if not frames:
         raise SystemExit(f"no baseline results under {root}")
-    df = pd.concat(frames, ignore_index=True)
-    df["layer"] = df["signal"].str.extract(r"S(\d+)\.")[0].astype(int)
-    return df
+    return pd.concat(frames, ignore_index=True)
 
 
 def load_trained(groups: list[Path]):
