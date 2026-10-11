@@ -501,8 +501,12 @@ layer-9 reference runs: 53 runs per prompt arm.
 qsub -N sae_pb_cache -v STAGE=cache -t 1-17 scripts/sae/score_sae_prompt_baseline.sh
 qsub -hold_jid sae_pb_cache -v PROMPT=index -t 1-27 scripts/sae/score_sae_prompt_baseline.sh
 qsub -hold_jid sae_pb_cache -v PROMPT=label -t 1-27 scripts/sae/score_sae_prompt_baseline.sh
-python analysis/plot_sae_prompt_baseline.py
+python analysis/plot_sae_prompt_baseline.py          # the 48 grid runs; --include-l9 adds the 5 layer-9 runs
+python analysis/plot_sae_prompt_baseline.py --from-tables outputs/plots/sae_prompt_baseline   # re-plot a synced folder
 ```
+
+The figures compare the baseline with the trained SFT and joint arms on the grid only: the layer-9
+reference runs are scored but left out by default.
 
 **Prompt arms.** `index` is the trained prompt. `label` names the feature by its
 Neuronpedia explanation (`scripts/sae/sweep_feature_labels.json`, from

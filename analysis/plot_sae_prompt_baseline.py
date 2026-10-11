@@ -14,6 +14,10 @@ Trained arms (outputs/runs/{sae_layerpos_joint,sae_l9_joint}/saeJoint_*/sae_join
   is the shared metric; the baseline's thresholded readouts use a threshold picked on a
   validation slice of train, never on test.
 
+GRID ONLY by default: the 48 (feature, position) runs of the layer x position grid. The
+5 layer-9 reference runs (position -1) are dropped from the baseline AND the trained arms
+(--include-l9 keeps them).
+
 Writes to --out-dir (default outputs/plots/sae_prompt_baseline):
   baseline_all.csv, trained_all.csv     every row read
   ba_vs_k.{png,pdf,csv}                 BA vs k per readout x prompt, trained arms as references
@@ -24,6 +28,8 @@ Writes to --out-dir (default outputs/plots/sae_prompt_baseline):
   missing_runs.json
 
   python analysis/plot_sae_prompt_baseline.py
+  # re-plot from the tables a previous run wrote (e.g. a synced plot folder):
+  python analysis/plot_sae_prompt_baseline.py --from-tables outputs/plots/sae_prompt_baseline
 """
 from __future__ import annotations
 
@@ -43,9 +49,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from analysis.sae_style import apply_rc, chance_line, save, style_axes, INK, INK2   # noqa: E402
 
 PROMPT_COLOR = {"label": "#1f77b4", "index": "#ff7f0e"}   # same pair as the feature-gen plots
-READOUT_STYLE = {"probe": dict(ls="-", marker="o"), "verbal": dict(ls="--", marker="s"),
-                 "logit_lex": dict(ls="", marker="D"), "noprompt_probe": dict(ls="", marker="^")}
-TRAINED_STYLE = {"sft": dict(color=INK, ls="-"), "joint": dict(color=INK2, ls="-.")}
+# trained arms, named as in the neuron figures (analysis/compare_sft_vs_joint.pretty_arm);
+# both SAE arms ran gate off with the KL-0.1 anchor
+ARM_NAME = {"sft": "SFT (Gate-off, KL=0.1)", "joint": "Joint Loss (W=0.9, KL=0.1)"}
+# poster scale, identical to the neuron prompt-baseline figure (compare_sft_vs_joint.py)
+POSTER_RC = {"font.size": 20, "axes.titlesize": 26, "axes.labelsize": 22,
+             "xtick.labelsize": 18, "ytick.labelsize": 18, "legend.fontsize": 18,
+             "legend.title_fontsize": 20, "figure.titlesize": 28}
 NAME_RE = re.compile(r"saeJoint_(S(\d+)\.\d+)_POS(-?\d+)_gateoff_w(\d+)")
 W_OF = {"10": 1.0, "09": 0.9, "075": 0.75, "05": 0.5}
 
@@ -111,41 +121,64 @@ def mean_sem(df, by, col="balanced_accuracy"):
 
 
 def plot_ba_vs_k(base, trained, out_dir):
-    keys = set(map(tuple, base[["signal", "position"]].drop_duplicates().values))
-    tr = trained[[k in keys for k in zip(trained["signal"], trained["position"])]]
+    """Mean +- SE over runs vs k, laid out and worded like the neuron baseline's
+    corr_vs_k.png. Trained-arm reference lines average over the SAME runs as the curves."""
+    runs = set(map(tuple, base[["signal", "position"]].drop_duplicates().values))
+    tr = trained[[k in runs for k in zip(trained["signal"], trained["position"])]]
     s = mean_sem(base, ["prompt", "readout", "k", "eval_type"])
     s.to_csv(out_dir / "ba_vs_k.csv", index=False)
     ks = sorted(base["k"].unique())
     xpos = {k: i for i, k in enumerate(ks)}
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5.8), sharey=True, layout="constrained")
-    for ax, et in zip(axes, ("endogenous", "interventional")):
-        for arm, st in TRAINED_STYLE.items():
-            t = tr[(tr.arm == arm) & (tr.eval_type == et)]["balanced_accuracy"].dropna()
-            if len(t):
-                ax.axhline(t.mean(), lw=1.6, label=f"trained {arm} (n={len(t)})", **st)
-        for prompt in ("index", "label"):
-            for ro, st in READOUT_STYLE.items():
-                g = s[(s.prompt == prompt) & (s.readout == ro) & (s.eval_type == et)].sort_values("k")
-                if g.empty:
-                    continue
-                ax.errorbar([xpos[k] for k in g["k"]], g["mean"], yerr=g["sem"], ms=7, lw=2,
-                            capsize=3, color=PROMPT_COLOR[prompt], **st,
-                            label=f"{prompt} prompt: {ro}")
-        chance_line(ax)
-        ax.set_xticks(range(len(ks)))
-        ax.set_xticklabels([str(k) for k in ks])
-        ax.set_xlabel("generated tokens k")
-        ax.set_title(et)
-        style_axes(ax)
-    axes[0].set_ylabel("balanced accuracy (mean over feature x position)")
-    seen = {}
-    for ax in axes:                       # a series can exist in one panel only (NaN BA)
-        for h, l in zip(*ax.get_legend_handles_labels()):
-            seen.setdefault(l, h)
-    fig.legend(list(seen.values()), list(seen), loc="outside lower center", ncol=4,
-               frameon=True, fontsize=10)
-    fig.suptitle("Untrained gemma-2-2b vs trained introspectors (SAE detection)")
-    save(fig, out_dir / "ba_vs_k")
+    with plt.rc_context(POSTER_RC):
+        fig, axes = plt.subplots(1, 2, figsize=(22, 8.5), sharey=True)
+        for ax, et, title in zip(axes, ("endogenous", "interventional"),
+                                 ("Endogenous Balanced Accuracy", "Interventional Balanced Accuracy")):
+            for prompt in ("index", "label"):
+                c = PROMPT_COLOR[prompt]
+                g = s[(s.prompt == prompt) & (s.eval_type == et)]
+                pr = g[g.readout == "probe"].sort_values("k")
+                ax.errorbar([xpos[k] for k in pr["k"]], pr["mean"], yerr=pr["sem"], marker="o",
+                            markersize=9, linewidth=2.5, capsize=4, color=c, linestyle="-",
+                            label=f"endo probe, mean pool ({prompt} prompt)")
+                vb = g[g.readout == "verbal"].sort_values("k")
+                ax.errorbar([xpos[k] for k in vb["k"]], vb["mean"], yerr=vb["sem"], marker="*",
+                            markersize=18, linewidth=2.5, capsize=4, color=c, linestyle="--",
+                            label=f"verbal: written answer, no probe ({prompt} prompt)")
+                lg = g[(g.readout == "logit_lex") & (g.k == 0)]
+                if len(lg):
+                    ax.errorbar([xpos[0]], lg["mean"], yerr=lg["sem"], marker="D", markersize=12,
+                                capsize=4, color=c, markeredgecolor="k", linestyle="none", zorder=6,
+                                label=f"logit: active vs inactive words, no probe ({prompt} prompt)")
+            for (arm, name), color in zip(ARM_NAME.items(), plt.get_cmap("Greys")([0.55, 0.9])):
+                t = tr[(tr.arm == arm) & (tr.eval_type == et)]["balanced_accuracy"].dropna()
+                if len(t):
+                    ax.axhline(t.mean(), color=color, linestyle=":", linewidth=2.5,
+                               label=f"{name} (n={len(t)})")
+            # the control reads the text alone, so it is the same for both prompt arms
+            ctrl = base[(base.readout == "noprompt_probe") & (base.k == 0) & (base.eval_type == et)
+                        & (base.prompt == "index")]["balanced_accuracy"].dropna()
+            if len(ctrl):
+                ax.scatter([xpos[0]], [ctrl.mean()], marker="X", s=220, zorder=5, color="0.6",
+                           edgecolor="k", label="no prompt, endo probe")
+            ax.set_xticks(range(len(ks)))
+            ax.set_xticklabels([str(k) for k in ks])
+            ax.set_xlabel("Generated Tokens Pooled (k)")
+            ax.set_title(title)
+            ax.axhline(0.5, color="grey", lw=1)
+            ax.grid(alpha=0.25)
+        n_runs = len(runs)
+        axes[0].set_ylabel("Balanced Accuracy (Mean ± SE over Features)")
+        seen = {}
+        for ax in axes:                   # a series can exist in one panel only (NaN BA)
+            for h, l in zip(*ax.get_legend_handles_labels()):
+                seen.setdefault(l, h)
+        fig.legend(list(seen.values()), list(seen), loc="lower center", ncol=3, fontsize=15,
+                   bbox_to_anchor=(0.5, -0.2))
+        fig.tight_layout()
+        save(fig, out_dir / "ba_vs_k")
+    print(f"[plot] ba_vs_k over {n_runs} runs; mean BA (mean pool / verbal):")
+    print(s[s.readout.isin(["probe", "verbal"])].pivot_table(
+        index="k", columns=["eval_type", "prompt", "readout"], values="mean").round(3).to_string())
 
 
 def plot_heatmaps(base, trained, out_dir):
@@ -198,14 +231,22 @@ def paired_summary(base, trained, out_dir):
     pd.DataFrame(rows).to_csv(out_dir / "paired_summary.csv", index=False)
 
 
-def plot_learning_curve(root, out_dir):
-    frames = []
-    for f in root.glob("*/*/learning_curve.csv"):
-        frames.append(pd.read_csv(f).assign(prompt=f.parts[-3], run=f.parts[-2]))
-    if not frames:
+def read_per_run(root: Path, name: str) -> pd.DataFrame:
+    """<root>/<prompt>/<run>/<name> for every run, tagged with prompt, run, position."""
+    frames = [pd.read_csv(f).assign(prompt=f.parts[-3], run=f.parts[-2])
+              for f in sorted(root.glob(f"*/*/{name}"))]
+    return with_position(pd.concat(frames, ignore_index=True)) if frames else pd.DataFrame()
+
+
+def with_position(df):
+    if len(df) and "position" not in df:
+        df["position"] = df["run"].str.extract(r"_POS(-?\d+)$")[0].astype(int)
+    return df
+
+
+def plot_learning_curve(df, out_dir):
+    if df.empty:
         return
-    df = pd.concat(frames, ignore_index=True)
-    df.to_csv(out_dir / "learning_curve.csv", index=False)
     fig, ax = plt.subplots(figsize=(7.5, 5), layout="constrained")
     for prompt, g in df.groupby("prompt"):
         for col, ls in (("endo_auroc", "-"), ("interv_auroc", "--")):
@@ -224,14 +265,9 @@ def plot_learning_curve(root, out_dir):
     save(fig, out_dir / "learning_curve")
 
 
-def plot_scale_sweep(root, out_dir):
-    frames = []
-    for f in root.glob("*/*/scale_sweep.csv"):
-        frames.append(pd.read_csv(f).assign(prompt=f.parts[-3], run=f.parts[-2]))
-    if not frames:
+def plot_scale_sweep(df, out_dir):
+    if df.empty:
         return
-    df = pd.concat(frames, ignore_index=True)
-    df.to_csv(out_dir / "scale_sweep.csv", index=False)
     fig, ax = plt.subplots(figsize=(7.5, 5), layout="constrained")
     styles = {"probe_endo": dict(ls="-", marker="o"), "probe_fresh": dict(ls=":", marker="s"),
               "logit_lex": dict(ls="--", marker="D")}
@@ -259,13 +295,38 @@ def main():
     p.add_argument("--trained", type=Path, nargs="+",
                    default=[Path("outputs/runs/sae_layerpos_joint"), Path("outputs/runs/sae_l9_joint")])
     p.add_argument("--out-dir", type=Path, default=Path("outputs/plots/sae_prompt_baseline"))
+    p.add_argument("--from-tables", type=Path, default=None,
+                   help="Re-plot from baseline_all.csv / trained_all.csv / learning_curve.csv / "
+                        "scale_sweep.csv in this directory instead of reading every run.")
+    p.add_argument("--include-l9", action="store_true",
+                   help="Keep the 5 layer-9 reference runs (position -1); default is the grid only.")
     args = p.parse_args()
     apply_rc()
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    base = load_baseline(args.baseline_root)
-    trained = load_trained(args.trained)
-    base.to_csv(args.out_dir / "baseline_all.csv", index=False)
-    trained.to_csv(args.out_dir / "trained_all.csv", index=False)
+    if args.from_tables:
+        t = args.from_tables
+        base = pd.read_csv(t / "baseline_all.csv")
+        trained = pd.read_csv(t / "trained_all.csv")
+        lc = with_position(pd.read_csv(t / "learning_curve.csv")) if (t / "learning_curve.csv").exists() else pd.DataFrame()
+        sweep = with_position(pd.read_csv(t / "scale_sweep.csv")) if (t / "scale_sweep.csv").exists() else pd.DataFrame()
+    else:
+        base = load_baseline(args.baseline_root)
+        trained = load_trained(args.trained)
+        lc = read_per_run(args.baseline_root, "learning_curve.csv")
+        sweep = read_per_run(args.baseline_root, "scale_sweep.csv")
+        # unfiltered, so --from-tables can re-plot either selection later
+        base.to_csv(args.out_dir / "baseline_all.csv", index=False)
+        trained.to_csv(args.out_dir / "trained_all.csv", index=False)
+        for name, df in (("learning_curve", lc), ("scale_sweep", sweep)):
+            if len(df):
+                df.to_csv(args.out_dir / f"{name}.csv", index=False)
+    if not args.include_l9:
+        # the layer-9 reference runs are the only ones at position -1
+        keep = lambda df: df[df["position"] >= 0] if len(df) else df
+        n0 = base[["signal", "position"]].drop_duplicates().shape[0]
+        base, trained, lc, sweep = keep(base), keep(trained), keep(lc), keep(sweep)
+        print(f"[plot] grid only: {base[['signal', 'position']].drop_duplicates().shape[0]} of "
+              f"{n0} baseline runs (layer-9 reference runs dropped; --include-l9 keeps them)")
     have = set(map(tuple, base[["signal", "position"]].drop_duplicates().values))
     want = set(map(tuple, trained[["signal", "position"]].drop_duplicates().values))
     missing = sorted(f"{s}@{p}" for s, p in want - have)
@@ -275,8 +336,8 @@ def main():
     plot_ba_vs_k(base, trained, args.out_dir)
     plot_heatmaps(base, trained, args.out_dir)
     paired_summary(base, trained, args.out_dir)
-    plot_learning_curve(args.baseline_root, args.out_dir)
-    plot_scale_sweep(args.baseline_root, args.out_dir)
+    plot_learning_curve(lc, args.out_dir)
+    plot_scale_sweep(sweep, args.out_dir)
 
 
 if __name__ == "__main__":
