@@ -372,6 +372,7 @@ def verbal_preds(gen_ids, tok, k):
 # One run
 # ======================================================================
 
+@torch.no_grad()
 def alignment_check(model, tok, rows, spec, bundle, module, batch_size, out_dir, n=512):
     """Live feature value at the cached position (offsets -1/0/+1) vs the cached value,
     and the token there vs the cached token, on the prompted sequences this baseline
@@ -458,6 +459,7 @@ def score_run(spec, model, tok, args):
     sae_spec = next(s for s in config.train_signals if s.type == "sae" and s.index == spec.index
                     and s.layer == spec.layer)
     bundle = load_sae_for_spec(sae_spec, device=str(model.device))
+    bundle.sae.requires_grad_(False)   # frozen: sae_lens params require grad by default
     module = operator.attrgetter(resolve_sae_hook_path(model, spec.layer, site=sae_spec.sae_site,
                                                        path_to_output=False))(model)
     train_act = np.asarray(train_raw["activation"], float)
