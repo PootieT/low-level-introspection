@@ -37,6 +37,7 @@ they land under outputs/runs/<group>/<run>/, exactly where read_metrics already 
 from __future__ import annotations
 
 import os
+import re
 import glob
 import json
 from dataclasses import dataclass, field, replace
@@ -386,3 +387,34 @@ def runs_from_args(args, require_checkpoint: bool = True) -> list[RunSpec]:
                              output_root=getattr(args, "output_root", None),
                              require_checkpoint=require_checkpoint)
     return shard(runs, getattr(args, "task_index", None), getattr(args, "n_tasks", None))
+
+
+def pretty_run_name(name: str, seq_len: int = 32) -> str:
+    """Figure title for a run directory name, e.g.
+    'joint_N12.2721_POS-28_gateoff_scale10_kl0.1_w0.01_300K'
+        -> 'Joint Loss (KL=0.1), Single-locale N12.2721, t=4'.
+    Token positions are shown as 0-indexed absolute indices in the seq_len window
+    (POS-1 -> t=31), as in the layer x position heatmaps. Names in an unrecognised
+    scheme are returned unchanged rather than mislabelled."""
+    neuron = re.search(r"N(\d+)\.(\d+)", name)
+    pos = re.search(r"POS(-?\d+)", name)
+    kl = re.search(r"_kl([0-9.]+|none|inf)", name)
+    w = re.search(r"_w([0-9.]+)", name)
+    gate = re.search(r"gate(on|off)", name)
+    w_val = float(w.group(1)) if w else None
+    if name.startswith("joint") and w_val != 1.0:
+        k = kl.group(1) if kl else None
+        arm = f"Joint Loss (KL={'None' if k in (None, 'none', 'inf') else k})"
+    elif name.startswith(("endo", "sft")) or w_val == 1.0:       # endogenous loss only
+        arm = "SFT" + (f" (Gate-{gate.group(1).capitalize()})" if gate else "")
+    elif name.startswith("prompt"):
+        arm = "Prompt Baseline"
+    else:
+        return name
+    parts = [arm]
+    if neuron:
+        parts.append(f"Single-locale N{neuron.group(1)}.{neuron.group(2)}")
+    if pos:
+        p_ = int(pos.group(1))
+        parts.append(f"t={p_ + seq_len if p_ < 0 else p_}")
+    return ", ".join(parts)

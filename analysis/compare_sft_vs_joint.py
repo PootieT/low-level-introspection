@@ -70,6 +70,26 @@ W_RE = re.compile(r"_w(?P<w>[0-9.]+)")
 KL_RE = re.compile(r"_kl(?P<kl>[0-9.a-z]+)")
 KEY = ["layer", "position", "neuron"]
 
+# Fidelity measures carried through the whole comparison. "corr" is PEARSON and keeps
+# that name, so every existing figure, CSV column and downstream reader is unchanged;
+# the rank measures are added beside it.
+#
+# They exist only once score_rank_metrics.py has merged them into the metrics JSONs
+# (--update-metrics-json). A run without them yields NaN for those columns and is
+# skipped by paired_stats/plot_delta_heatmap rather than dropping the run, so a
+# partially-scored sweep still produces its Pearson figures.
+#
+#   spearman     monotone, rank-based: a prediction far outside the activation's range
+#                costs its rank, not its magnitude
+#   kendall_tau  tau-b, which handles the heavy TIES post-SiLU activations create
+#                (15-36% distinct values across these runs). Smaller than r by
+#                construction -- rank arms with it, do not read it as a fraction
+#   monotone_r2  cross-fit isotonic R^2, on Pearson r^2's scale: where r^2 ~= this, the
+#                relationship really is linear and nothing was lost by measuring it so
+FIDELITY_METRICS = ("corr", "spearman", "kendall_tau", "monotone_r2")
+# what the delta heatmaps are drawn for (one figure per readout per metric)
+DELTA_METRICS = ("corr", "spearman")
+
 
 # The sweeps' grid, and the neuron sampler from src/introspector/signals/resolution.py.
 #
@@ -214,9 +234,18 @@ def load_group(exp_group: str, gate="off", w=None, kl=None) -> pd.DataFrame:
         row = {"group": exp_group, "run": d.name,
                "layer": int(n["layer"]), "index": int(n["index"]),
                "neuron": f"N{n['layer']}.{n['index']}", "position": int(p["pos"]),
-               "w": float(mw["w"]) if mw else None, "kl": mkl["kl"] if mkl else None,
-               "interventional_corr": interv.get("corr"),
-               "endogenous_corr": endo.get("corr")}
+               "w": float(mw["w"]) if mw else None, "kl": mkl["kl"] if mkl else None}
+        for metric in FIDELITY_METRICS:
+            # the legacy column names stay exactly as they were for Pearson
+            suffix = "corr" if metric == "corr" else metric
+            row[f"interventional_{suffix}"] = interv.get(metric)
+            row[f"endogenous_{suffix}"] = endo.get(metric)
+        # the diagnostic, not a third score: where Pearson and Spearman disagree the
+        # cause in this project has been out-of-range predictions, not curvature
+        for readout in ("interventional", "endogenous"):
+            r, rho = row.get(f"{readout}_corr"), row.get(f"{readout}_spearman")
+            row[f"{readout}_corr_minus_spearman"] = (r - rho if r is not None and rho is not None
+                                                     else None)
         drift = js("activation_drift.json")
         if drift:
             row["drift_corr"] = drift.get("drift_tuned_vs_base", {}).get("corr")
@@ -415,8 +444,17 @@ def pretty_metric(metric: str) -> str:
     'Interventional Correlation', ood_<corpus>_endogenous -> 'Endogenous Correlation (<corpus>)'."""
     readout_names = {"interventional": "Interventional Correlation",
                      "endogenous": "Endogenous Correlation"}
-    if metric in ("interventional_corr", "endogenous_corr"):
-        return readout_names[metric.split("_")[0]]
+    metric_words = {"corr": "Pearson r", "spearman": "Spearman rho",
+                    "kendall_tau": "Kendall tau-b (smaller than r by construction)",
+                    "monotone_r2": "Monotone R2 (isotonic, cross-fit)",
+                    "corr_minus_spearman": "Pearson r - Spearman rho"}
+    for readout in ("interventional", "endogenous"):
+        if metric.startswith(f"{readout}_"):
+            tail = metric[len(readout) + 1:]
+            if tail == "corr":
+                return readout_names[readout]
+            if tail in metric_words:
+                return f"{readout.capitalize()} {metric_words[tail]}"
     if metric.startswith("ood_"):
         parts = metric.split("_")
         readout, corpus = parts[-1], "_".join(parts[1:-1])
@@ -528,7 +566,10 @@ def main(arms: dict, out_dir, pairs=None, model=None):
         print(f"\n[cmp] ---------- {label_a} vs {label_b} ----------")
         merged = pair(frames[label_a], frames[label_b], label_a, label_b)
         merged.to_csv(Path(out_dir) / f"paired_runs_{label_a}_vs_{label_b}.csv", index=False)
-        metrics = ["interventional_corr", "endogenous_corr"]
+        metrics = [f"{r}_{m if m != 'corr' else 'corr'}"
+                   for r in ("interventional", "endogenous") for m in FIDELITY_METRICS]
+        metrics += [f"{r}_corr_minus_spearman" for r in ("interventional", "endogenous")]
+        metrics = [m for m in metrics if f"{m}_{label_a}" in merged.columns]
         metrics += sorted({c.rsplit("_", 1)[0] for c in merged.columns
                            if c.startswith("ood_") and c.endswith(f"_{label_a}")
                            and "activation_std" not in c})
@@ -537,10 +578,17 @@ def main(arms: dict, out_dir, pairs=None, model=None):
         tables.append(table)
         print(table.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
         # one colour limit for both readouts, so the two delta maps share a colorbar
-        delta_metrics = ("interventional_corr", "endogenous_corr")
-        lim = delta_color_limit(merged, delta_metrics, label_a, label_b)
-        for m in delta_metrics:
-            plot_delta_heatmap(merged, m, label_a, label_b, out_dir, lim=lim)
+        # one colour limit per METRIC family, shared by its two readouts, so the
+        # interventional and endogenous maps of the same metric are comparable but a
+        # metric on a different scale (tau-b, R^2) is not forced onto Pearson's limits
+        for fam in DELTA_METRICS:
+            fam_metrics = tuple(f"{r}_{fam}" for r in ("interventional", "endogenous")
+                                if f"{r}_{fam}_{label_a}" in merged.columns)
+            if not fam_metrics:
+                continue
+            lim = delta_color_limit(merged, fam_metrics, label_a, label_b)
+            for m in fam_metrics:
+                plot_delta_heatmap(merged, m, label_a, label_b, out_dir, lim=lim)
 
     if tables:
         pd.concat(tables, ignore_index=True).to_csv(Path(out_dir) / "paired_summary.csv",
@@ -550,8 +598,11 @@ def main(arms: dict, out_dir, pairs=None, model=None):
     for label, f in frames.items():
         if not label.startswith("joint"):
             continue
-        for m in ("interventional_corr", "endogenous_corr"):
-            plot_arm_heatmap(f, m, label, out_dir)
+        for fam in FIDELITY_METRICS:
+            for r in ("interventional", "endogenous"):
+                col = f"{r}_{fam}"
+                if col in f.columns and f[col].notna().any():
+                    plot_arm_heatmap(f, col, label, out_dir)
     # one color per arm, shared by both readout panels so one legend serves both
     arm_colors = {arm: c for arm, c in zip(frames, plt.get_cmap("tab10").colors)}
     plot_ood_ladders(frames, out_dir, arm_colors=arm_colors)

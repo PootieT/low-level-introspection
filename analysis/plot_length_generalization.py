@@ -210,11 +210,11 @@ def _dot_handle(color, label):
     return plt.Line2D([], [], color=color, marker="o", ms=9, lw=1.8, label=label)
 
 
-def _single_legend(axes, handles=None):
-    """One legend, on the right-hand panel (falling back to the first panel that has
-    labelled lines), instead of a copy on every panel."""
+def _single_legend(axes, handles=None, ax_index=-1, loc="best"):
+    """One legend instead of a copy on every panel: on axes[ax_index] (default the
+    right-hand panel) at `loc`, falling back to the first panel with labelled lines."""
     if handles:
-        list(axes)[-1].legend(handles=handles, fontsize=16)
+        list(axes)[ax_index].legend(handles=handles, fontsize=16, loc=loc)
         return
     for ax in list(axes)[::-1]:
         if ax.get_legend_handles_labels()[0]:
@@ -271,26 +271,29 @@ def plot_matched_reach(b: pd.DataFrame, out_dir, eval_type="interventional"):
     if not shared:
         return
     shared = sorted(shared)
-    fig, axes = plt.subplots(1, len(shared), figsize=(4.8 * len(shared), 4.2),
+    fig, axes = plt.subplots(1, len(shared), figsize=(6.4 * len(shared), 6),
                              squeeze=False, sharey=True)
+    # one colour per training length across ALL panels, so a single legend serves them
+    tls_all = sorted(d[d["window"].isin(shared)]["train_len"].unique())
+    colors = dict(zip(tls_all, sns.color_palette("rocket", len(tls_all))))
     for i, w in enumerate(shared):
         ax = axes[0][i]
         sub = d[d["window"] == w]
-        tls = sorted(sub["train_len"].unique())
-        colors = dict(zip(tls, sns.color_palette("rocket", len(tls))))
-        for tl in tls:
+        for tl in sorted(sub["train_len"].unique()):
             s = _agg(sub[sub["train_len"] == tl], ["max_distance"]).sort_values("max_distance")
-            _draw(ax, s, colors[tl], f"train len {tl}", tl)
+            _draw(ax, s, colors[tl], f"Train Len {tl}", tl, size=70)
         ax.axvline(w - 1, color="k", ls=":", lw=1, alpha=0.6)
         ax.axhline(0, color="k", lw=0.8, alpha=0.4)
         ax.set_xscale("log", base=2)
-        ax.set_title(f"training window = {w}")
-        ax.set_xlabel("distance from readout")
+        ax.set_title(f"Training Window = {w}", fontsize=28)
+        ax.set_xlabel("Distance from Readout", fontsize=26)
+        ax.tick_params(labelsize=22)
         if i == 0:
-            ax.set_ylabel(f"{eval_type} corr")
-        ax.legend(fontsize=10)
+            ax.set_ylabel(f"{eval_type.capitalize()} Correlation", fontsize=26)
+    axes[0][0].legend(handles=[_dot_handle(colors[tl], f"Train Len {tl}") for tl in tls_all],
+                      fontsize=16, loc="upper right")
     fig.tight_layout()
-    fig.savefig(Path(out_dir) / f"matched_reach_{eval_type}.png", dpi=150)
+    fig.savefig(Path(out_dir) / f"matched_reach_{eval_type}.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -355,7 +358,11 @@ def plot_ceiling(b: pd.DataFrame, out_dir):
         ax.set_xlabel("Distance from Readout", fontsize=26)
         ax.tick_params(labelsize=22)
     axes[0].set_ylabel("Correlation", fontsize=26)
-    _single_legend(axes, [_dot_handle(colors[tl], f"Train Len {tl}") for tl in tls_all])
+    axes[0].set_ylim(bottom=-0.3)   # headroom below the data for the legend (shared y)
+    # endogenous panel, lower right: the empty corner on the real data (the right
+    # panel's upper corner holds the long-training interventional curve)
+    _single_legend(axes, [_dot_handle(colors[tl], f"Train Len {tl}") for tl in tls_all],
+                   ax_index=0, loc="lower right")
     fig.tight_layout()
     fig.savefig(Path(out_dir) / "ceiling_diagonal.png", dpi=150)
     plt.close(fig)
@@ -438,39 +445,48 @@ def plot_variance_sources(b: pd.DataFrame, out_dir, eval_type="interventional"):
 
     Companion to the table: whichever panel fans out more is the axis carrying the
     spread. The aggregate is overlaid in black so the thin lines can be read against the
-    curve the other plots show.
+    curve the other plots show. One legend per column, below the bottom row.
     """
     d = b[(b["eval_type"] == eval_type) & (b["window"] == b["train_len"])]
     if d.empty:
         return
     tls = sorted(d["train_len"].unique())
-    fig, axes = plt.subplots(len(tls), 2, figsize=(11, 3.3 * len(tls)),
+    fig, axes = plt.subplots(len(tls), 2, figsize=(15, 4.8 * len(tls)),
                              squeeze=False, sharex=True, sharey=True)
+    cols = (("neuron", "husl", "Per Neuron", "Neuron"),
+            ("eval_len", "crest", "Per Eval Length", "Eval Length"))
+    # colours fixed per column across rows, so one legend per column is enough
+    colors = {key: dict(zip(sorted(d[key].unique()), sns.color_palette(pal, d[key].nunique())))
+              for key, pal, _, _ in cols}
     for r, tl in enumerate(tls):
         sub = d[d["train_len"] == tl]
-        for c, (key, pal) in enumerate((("neuron", "husl"), ("eval_len", "crest"))):
+        for c, (key, _, title, _) in enumerate(cols):
             ax = axes[r][c]
-            levels = sorted(sub[key].unique())
-            colors = dict(zip(levels, sns.color_palette(pal, len(levels))))
-            for lv in levels:
+            for lv in sorted(sub[key].unique()):
                 q = _agg(sub[sub[key] == lv], ["max_distance"]).sort_values("max_distance")
-                ax.plot(q["max_distance"], q["mean"], lw=1.0, alpha=0.75,
-                        color=colors[lv], marker="o", ms=3, label=str(lv))
+                ax.plot(q["max_distance"], q["mean"], lw=1.4, alpha=0.75,
+                        color=colors[key][lv], marker="o", ms=5)
             agg = _agg(sub, ["max_distance"]).sort_values("max_distance")
-            ax.plot(agg["max_distance"], agg["mean"], lw=2.6, color="k", alpha=0.85,
-                    zorder=5, label="aggregate")
+            ax.plot(agg["max_distance"], agg["mean"], lw=3, color="k", alpha=0.85, zorder=5)
             ax.set_xscale("log", base=2)
             ax.axhline(0, color="k", lw=0.8, alpha=0.3)
             ax.axvline(tl, color="grey", ls=":", lw=1)
+            ax.tick_params(labelsize=18)
             if r == 0:
-                ax.set_title(f"one line per {key}")
+                ax.set_title(title, fontsize=24)
             if c == 0:
-                ax.set_ylabel(f"train len {tl}\ncorr")
+                ax.set_ylabel(f"Train Len {tl}\nCorrelation", fontsize=22)
             if r == len(tls) - 1:
-                ax.set_xlabel("distance from readout")
-            ax.legend(fontsize=7, ncol=2)
+                ax.set_xlabel("Distance from Readout", fontsize=22)
     fig.tight_layout()
-    fig.savefig(Path(out_dir) / f"variance_sources_{eval_type}.png", dpi=150)
+    for c, (key, _, _, legend_title) in enumerate(cols):
+        handles = [_dot_handle(colors[key][lv], str(lv)) for lv in sorted(d[key].unique())]
+        handles.append(plt.Line2D([], [], color="k", lw=3, label="Aggregate"))
+        axes[-1][c].legend(handles=handles, title=legend_title, fontsize=15, title_fontsize=16,
+                           ncol=3, loc="upper center", bbox_to_anchor=(0.5, -0.28),
+                           frameon=False)
+    fig.savefig(Path(out_dir) / f"variance_sources_{eval_type}.png", dpi=150,
+                bbox_inches="tight")
     plt.close(fig)
 
 
@@ -580,7 +596,10 @@ def plot_relative_generalization(pooled: pd.DataFrame, out_dir):
             ax.plot(q.loc[~ind, "ratio"], q.loc[~ind, "mean_pct"], "o", ms=9,
                     mfc="white", mec=c, mew=1.8, zorder=3)
     axes[0].set_ylabel("Relative Corr. Drop (%)", fontsize=26)   # shared y: left only
-    _single_legend(axes, [_dot_handle(colors[tl], f"Train Len {tl}") for tl in tls_all])
+    # endogenous panel, lower left: empty on the real data, whereas the right panel's
+    # interventional error bars run the full height
+    _single_legend(axes, [_dot_handle(colors[tl], f"Train Len {tl}") for tl in tls_all],
+                   ax_index=0, loc="lower left")
     # one shared scale so the two panels are directly comparable; points outside are
     # still in the CSVs and are counted here rather than dropped
     outside = int(((allv["mean_pct"] < lo) | (allv["mean_pct"] > hi)).sum())

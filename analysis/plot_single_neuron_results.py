@@ -294,9 +294,32 @@ ENDO_EVALS = [
     ("endogenous_test_metrics_endogenous.json", None, "endogenous"),
     ("interventional_test_metrics_gaussian.json", "test", "interventional"),
 ]
-ENDO_METRICS = ("corr", "l2_dist")
-# metrics whose natural range is [0, 1] -> fixed colour/axis scale
-RANGE01 = {"corr"}
+# `corr` is PEARSON and keeps that name, so every existing figure and CSV is unchanged.
+# The rank measures sit alongside it and are only present once score_rank_metrics.py has
+# merged them into the metrics JSONs (--update-metrics-json); a run without them is
+# skipped per metric, not dropped, so a partially-scored sweep still plots its Pearson.
+ENDO_METRICS = ("corr", "spearman", "kendall_tau", "monotone_r2", "l2_dist")
+
+# metrics whose natural range is [0, 1] -> fixed colour/axis scale.
+# Pearson, Spearman and tau-b are all correlations, so they share the scale and can be
+# read against each other directly. monotone_r2 is variance-explained and CAN GO
+# NEGATIVE (a monotone fit worse than predicting the mean), so it autoscales -- clipping
+# it to [0, 1] would hide exactly the runs where the readout is not monotone at all.
+RANGE01 = {"corr", "spearman", "kendall_tau"}
+
+# Shown in titles and axis labels. tau-b is smaller than r and rho BY CONSTRUCTION
+# (for bivariate normal data tau ~ (2/pi) arcsin(rho)), so the note is part of the name:
+# without it a tau heatmap on a shared [0, 1] scale reads as "uniformly worse".
+METRIC_WORDS = {
+    "corr": "Pearson r",
+    "spearman": "Spearman rho",
+    "kendall_tau": "Kendall tau-b (smaller than r by construction)",
+    "monotone_r2": "Monotone R2 (isotonic, cross-fit)",
+    "l2_dist": "L2",
+    "corr_minus_spearman": "Pearson r - Spearman rho",
+}
+# derived per run after loading; see add_rank_gap
+GAP_METRIC = "corr_minus_spearman"
 
 
 def load_endogenous_sweep(exp_group: str, metrics=ENDO_METRICS, gate="on",
@@ -382,6 +405,7 @@ def load_endogenous_sweep(exp_group: str, metrics=ENDO_METRICS, gate="on",
         print(f"[endo] WARNING: {len(pairs)} duplicated (neuron, position, metric) cell(s); "
               f"keeping the first run name alphabetically. Example: {pairs['runs'].iloc[0]}")
         df = df.sort_values("run").drop_duplicates(keys, keep="first").reset_index(drop=True)
+    df = add_rank_gap(df)
     df["panel"] = df["eval_type"] + " " + df["metric"]
     n_nan = int(df["value"].isna().sum())
     if n_nan:
@@ -390,6 +414,35 @@ def load_endogenous_sweep(exp_group: str, metrics=ENDO_METRICS, gate="on",
         print(f"[endo] dropping {n_nan} nan metric values (dead or constant neurons?)")
         df = df.dropna(subset=["value"])
     return df
+
+
+def add_rank_gap(df: pd.DataFrame) -> pd.DataFrame:
+    """Append Pearson - Spearman as its own metric row, per (run, eval_type).
+
+    This is the diagnostic, not a third score. Measured on this project's runs the two
+    agree to ~0.05 almost everywhere; where they diverge the cause has been a handful of
+    predictions far outside the activation's range rather than curvature (the gate-ON arm
+    scores r=0.33 against rho=0.72, and trimming 1% of the prediction extremes restores
+    r to 0.71). A cell that lights up here is one to inspect, in either direction.
+    """
+    if df.empty or not {"corr", "spearman"} <= set(df["metric"].unique()):
+        return df
+    # Key on (run, eval_type) ONLY -- it already identifies a row uniquely, and the
+    # descriptive columns are carried over afterwards. Keying on all of them instead
+    # silently produced nothing: lora_r/lr are null for runs whose names do not encode
+    # them, and pandas drops grouping keys that are NaN, so every row vanished.
+    wide = df.pivot_table(index=["run", "eval_type"], columns="metric", values="value",
+                          aggfunc="first")
+    if not {"corr", "spearman"} <= set(wide.columns):
+        return df
+    gap = (wide["corr"] - wide["spearman"]).dropna().reset_index(name="value")
+    if gap.empty:
+        return df
+    gap["metric"] = GAP_METRIC
+    meta_cols = [c for c in df.columns if c not in ("metric", "value", "panel")]
+    meta = df[meta_cols].drop_duplicates(subset=["run", "eval_type"], keep="first")
+    gap = gap.merge(meta, on=["run", "eval_type"], how="left")
+    return pd.concat([df, gap], ignore_index=True)
 
 
 def summarize_endogenous_sweep(df: pd.DataFrame) -> pd.DataFrame:
@@ -528,10 +581,15 @@ def plot_endogenous_heatmaps(df: pd.DataFrame, out_dir: str):
     for metric, msub in summary.groupby("metric"):
         if metric in RANGE01:
             scale[metric] = (0, 1)
+        elif metric == GAP_METRIC:
+            # signed and centred on zero, so sign is readable at a glance
+            vals = msub["mean"].dropna().abs()
+            lim = float(vals.max()) if len(vals) else 0.1
+            scale[metric] = (-lim, lim)
         else:
             vals = msub["mean"].dropna()
             scale[metric] = (float(vals.min()), float(vals.max())) if len(vals) else (None, None)
-    quantity = {"corr": "Correlation", "l2_dist": "L2"}
+    quantity = METRIC_WORDS
     for (eval_name, metric), sub in summary.groupby(["eval_type", "metric"]):
         mean_df = sub.pivot(index="layer", columns="position", values="mean")
         # ± is the std across the cell's neurons (summarize_endogenous_sweep, ddof=1)
@@ -539,8 +597,10 @@ def plot_endogenous_heatmaps(df: pd.DataFrame, out_dir: str):
         vmin, vmax = scale[metric]
         title = f"Neuron {eval_name.capitalize()} {quantity.get(metric, metric)}"
         path = f"{out_dir}/heatmap_{eval_name}_{metric}.png"
+        # the signed gap reads as a direction, so it gets a diverging map centred on 0
+        kw = dict(cmap="RdBu_r", center=0.0) if metric == GAP_METRIC else {}
         draw_layer_position_heatmap(mean_df, std_df, title, path, vmin=vmin, vmax=vmax,
-                                    seq_len=SEQ_LEN)
+                                    seq_len=SEQ_LEN, **kw)
         print(f"[endo] wrote {path}")
 
 

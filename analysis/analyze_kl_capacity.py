@@ -45,6 +45,7 @@ plt.rcParams.update({"font.size": 13, "axes.titlesize": 15, "axes.labelsize": 14
 GRID_GROUP = "mlp_joint_grid_layer_token"
 LENGTHS = (32, 128, 512)
 REF_CELL = {"layer": 4, "position": -1}    # where the multi-locale sweeps live
+L_TRAIN = 32                               # training window (positions shown absolute)
 
 
 def kl_cols(df):
@@ -107,28 +108,33 @@ def plot_multi_locale(m: pd.DataFrame, ref: pd.DataFrame, out_dir: Path, L: int)
     fams = [f for f in ("length", "neuron", "layer") if f in set(m["family"])]
     if not fams:
         return
-    fig, axes = plt.subplots(1, len(fams), figsize=(5.6 * len(fams), 5), sharey=True, squeeze=False)
+    fig, axes = plt.subplots(1, len(fams), figsize=(6.5 * len(fams), 6), sharey=True, squeeze=False)
     ref_kl = float(ref[col].mean()) if ref is not None and col in ref.columns and len(ref) else np.nan
     ref_sd = float(ref[col].std()) if ref is not None and col in ref.columns and len(ref) > 1 else 0.0
-    for ax, fam in zip(axes[0], fams):
+    # reference cell as an absolute 0-indexed position (-1 -> 31 in the 32-token window)
+    ref_t = REF_CELL["position"] + L_TRAIN if REF_CELL["position"] < 0 else REF_CELL["position"]
+    for i, (ax, fam) in enumerate(zip(axes[0], fams)):
         q = m[m["family"] == fam]
         agg = (q.groupby("n_locales")[col].agg(["mean", "std", "count"]).reset_index()
                  .sort_values("n_locales"))
-        ax.errorbar(agg["n_locales"], agg["mean"], yerr=agg["std"].fillna(0), marker="o", ms=7,
-                    capsize=3, lw=1.8, color="#d62728", label=f"{fam} sweep")
+        ax.errorbar(agg["n_locales"], agg["mean"], yerr=agg["std"].fillna(0), marker="o", ms=9,
+                    capsize=3, lw=1.8, color="#d62728", label="Multi-Locale")
         for _, r in agg.iterrows():
             ax.annotate(f"n={int(r['count'])}", (r["n_locales"], r["mean"]),
-                        textcoords="offset points", xytext=(6, -12), fontsize=8, color="grey")
+                        textcoords="offset points", xytext=(6, -16), fontsize=13, color="grey")
         if not np.isnan(ref_kl):
             ax.axhline(ref_kl, color="#1f77b4", lw=1.6, ls="--",
-                       label=f"single locale, L{REF_CELL['layer']} pos {REF_CELL['position']} (n={len(ref)})")
+                       label=f"Single Locale (L{REF_CELL['layer']}, t={ref_t}, n={len(ref)})")
             ax.axhspan(ref_kl - ref_sd, ref_kl + ref_sd, color="#1f77b4", alpha=0.12)
         ax.set_xscale("log", base=2)
-        ax.set_xlabel({"length": "positions trained (window = length)",
-                       "neuron": "neurons trained", "layer": "layers trained"}[fam])
-        ax.set_title(fam)
-        ax.legend(fontsize=9)
-    axes[0][0].set_ylabel(f"KL(base‖tuned) nats/token @{L}")
+        ax.set_xlabel({"length": "Positions Trained (Window = Length)",
+                       "neuron": "Neurons Trained", "layer": "Layers Trained"}[fam], fontsize=22)
+        # the title names the sweep; the curve itself is the same thing in every panel
+        ax.set_title(f"{fam.capitalize()} Sweep", fontsize=24)
+        ax.tick_params(labelsize=20)
+        if i == 0:                      # identical in every panel, so drawn once
+            ax.legend(fontsize=16, loc="upper left")
+    axes[0][0].set_ylabel(f"KL(Base \u2016 Tuned) @ L={L}\n(nats/token)", fontsize=22)
     fig.tight_layout()
     fig.savefig(out_dir / f"multi_locale_kl_L{L}.png", dpi=150)
     plt.close(fig)

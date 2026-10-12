@@ -186,53 +186,78 @@ def profile_frame(ckpt: Path, signal_layer: int, label: str) -> pd.DataFrame:
 # ======================================================================
 # Sweep aggregation (many runs -- one line per condition is unreadable)
 # ======================================================================
+# Formal names for figures (the CSVs keep the module keys)
+MODULE_TITLE = {"q_proj": "Attention Q Proj.", "k_proj": "Attention K Proj.",
+                "v_proj": "Attention V Proj.", "o_proj": "Attention O Proj.",
+                "gate_proj": "MLP Gate Proj.", "up_proj": "MLP Up Proj.",
+                "down_proj": "MLP Down Proj."}
+SEQ_LEN = 32      # training window: positions are shown as absolute 0-indexed indices
+GROUP_TITLE = {"signal_layer": "Signal Layer", "position": "Token Position"}
+
+
+def _group_label(group_col, g):
+    """Legend entry for one group value: plain numbers, positions made absolute."""
+    if group_col == "position" and float(g) < 0:
+        g = float(g) + SEQ_LEN
+    return f"{int(g)}" if float(g).is_integer() else f"{g}"
+
+
+def _value_label(value):
+    return r"$\|\Delta W\|_F$" + (" (Normalized)" if value == "frob_norm" else "")
+
+
 def plot_profiles_grouped(df, out_dir, group_col="signal_layer", x="rel_depth",
                           value="frob_norm"):
-    """Layer profiles averaged over a sweep, one line per `group_col` value.
+    """Layer profiles averaged over a sweep, one line per `group_col` value, every module.
 
     The per-condition version draws a line per run, which at 320 runs is a solid
     block of colour. Averaging over the OTHER coordinates (neurons always; positions
     when grouping by signal layer, and vice versa) keeps the comparison that the
-    grouping is about, with a +/- 1 sd band for the spread it hides.
+    grouping is about, with a +/- 1 sd band for the spread it hides. Formatted like
+    plot_profiles_compact (the paper version): formal module names, no suptitle.
     """
     modules = [m for m in MODULE_ORDER if m in set(df["module"])]
     ncol, nrow = 4, int(np.ceil(len(modules) / 4))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(4.6 * ncol, 3.8 * nrow), squeeze=False)
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5.0 * ncol, 4.4 * nrow), squeeze=False)
     groups = sorted(df[group_col].dropna().unique())
     palette = dict(zip(groups, sns.color_palette("viridis", len(groups))))
-    for ax, module in zip(axes.flat, modules):
+    for k, (ax, module) in enumerate(zip(axes.flat, modules)):
         sub = df[df["module"] == module]
         for g in groups:
             s = (sub[sub[group_col] == g].groupby(x)[value]
                  .agg(["mean", "std", "count"]).reset_index().sort_values(x))
-            ax.plot(s[x], s["mean"], marker="o", ms=3, label=f"{group_col}={g}", color=palette[g])
+            ax.plot(s[x], s["mean"], marker="o", ms=4, lw=1.8, label=_group_label(group_col, g),
+                    color=palette[g])
             ax.fill_between(s[x], s["mean"] - s["std"].fillna(0), s["mean"] + s["std"].fillna(0),
                             color=palette[g], alpha=0.12)
         ax.axvline(0, color="k", ls="--", lw=1, alpha=0.6)
-        ax.set_title(module)
-        ax.set_xlabel("Layer - Signal Layer" if x == "rel_depth" else "Layer")
+        ax.set_title(MODULE_TITLE.get(module, module), fontsize=18)
+        ax.set_xlabel("Layer \u2212 Signal Layer" if x == "rel_depth" else "Layer", fontsize=16)
+        if k % ncol == 0:                                    # left column only
+            ax.set_ylabel(_value_label(value), fontsize=16)
         if value == "frob_norm":
-            ax.set_ylabel("||dW||_F (normalized)"); ax.set_ylim(0, 1.05)
+            ax.set_ylim(0, 1.05)
         else:
-            ax.set_ylabel("||dW||_F (absolute)"); ax.set_yscale("log")
+            ax.set_yscale("log")
+        ax.tick_params(which="both", labelsize=13)   # log axes label minor ticks too
         ax.grid(alpha=0.25)
     # Park the legend in the first empty grid slot (7 modules -> the 8th cell is free),
     # so it never covers a panel; fall back to the first panel if the grid is full.
     empties = list(axes.flat[len(modules):])
     handles, labels = axes.flat[0].get_legend_handles_labels()
+    title = GROUP_TITLE.get(group_col, group_col.replace("_", " ").title())
     if empties and handles:
         leg_ax, *rest = empties
         leg_ax.axis("off")
-        leg_ax.legend(handles, labels, loc="center", fontsize=13,
-                      title=group_col.replace("_", " ").title(), frameon=False)
+        leg_ax.legend(handles, labels, loc="center", fontsize=14, title=title,
+                      title_fontsize=15, frameon=False)
         for ax in rest:
             ax.set_visible(False)
     else:
         for ax in empties:
             ax.set_visible(False)
         if handles:
-            axes.flat[0].legend(fontsize=8)
-    fig.suptitle(f"LoRA update magnitude by module, mean over sweep (grouped by {group_col})", y=1.01)
+            axes.flat[0].legend(fontsize=13, title=title)
     fig.tight_layout()
     suffix = "" if value == "frob_norm" else "_abs"
     path = Path(out_dir) / f"lora_profile{suffix}_by_{x}_grouped_{group_col}.png"
@@ -240,7 +265,7 @@ def plot_profiles_grouped(df, out_dir, group_col="signal_layer", x="rel_depth",
     print(f"[lora] wrote {path}")
 
 
-COMPACT_MODULES = {"q_proj": "Attention Q Proj.", "down_proj": "MLP Down Proj."}
+COMPACT_MODULES = {m: MODULE_TITLE[m] for m in ("q_proj", "down_proj")}
 
 
 def plot_profiles_compact(df, out_dir, group_col="signal_layer", x="rel_depth",
@@ -387,28 +412,35 @@ def plot_target_vs_random(t: pd.DataFrame, out_dir: Path):
     modules = [m for m in ("down_proj", "up_proj", "gate_proj") if m in set(t["module"])]
     if not modules:
         return
-    fig, axes = plt.subplots(2, len(modules), figsize=(4.8 * len(modules), 7.6), squeeze=False)
-    for j, module in enumerate(modules):
-        sub = t[t["module"] == module]
-        ax = axes[0, j]
-        for kind, color in (("random", "tab:grey"), ("target", "tab:red")):
-            v = sub.loc[sub["kind"] == kind, "rel_norm_target"]
-            v = v[v > 0]
-            if len(v):
-                ax.hist(np.log10(v), bins=40, alpha=0.6, color=color, label=kind, density=True)
-        ax.set_xlabel("log10 ||dW_i|| / ||W0_i||"); ax.set_ylabel("Density")
-        ax.set_title(f"{module}: update size"); ax.legend(fontsize=9); ax.grid(alpha=0.2)
-
-        ax = axes[1, j]
-        for kind, color in (("random", "tab:grey"), ("target", "tab:red")):
-            v = sub.loc[sub["kind"] == kind, "cosine_with_base"]
-            if len(v):
-                ax.hist(v, bins=40, alpha=0.6, color=color, label=kind, density=True)
-        ax.axvline(0, color="k", ls="--", lw=1)
-        ax.set_xlabel("cos(dW_i, W0_i)"); ax.set_ylabel("Density")
-        ax.set_title(f"{module}: direction vs base"); ax.legend(fontsize=9); ax.grid(alpha=0.2)
-    fig.suptitle("Target neuron vs random untrained indices of the same layer", y=1.01)
-    fig.tight_layout()
+    # one title per ROW (what is measured) and per COLUMN (which module), instead of
+    # repeating "<module>: <quantity>" on every panel
+    fig = plt.figure(figsize=(5.6 * len(modules), 10), layout="constrained")
+    rows = fig.subfigures(2, 1, hspace=0.06)
+    kinds = (("target", "tab:red", "Target Neuron"), ("random", "tab:grey", "Random Neurons"))
+    specs = (("Update Size", "Relative Update Norm (log$_{10}$)", "rel_norm_target", True),
+             ("Update vs. Base Direction", "Cosine Similarity to Base Weight", "cosine_with_base", False))
+    for r, (row_title, xlabel, col, log) in enumerate(specs):
+        rows[r].suptitle(row_title, fontsize=22)
+        axes = rows[r].subplots(1, len(modules))
+        for j, (ax, module) in enumerate(zip(np.atleast_1d(axes), modules)):
+            sub = t[t["module"] == module]
+            for kind, color, label in kinds[::-1]:           # random underneath
+                v = sub.loc[sub["kind"] == kind, col]
+                if log:
+                    v = np.log10(v[v > 0])
+                if len(v):
+                    ax.hist(v, bins=40, alpha=0.6, color=color, label=label, density=True)
+            if not log:
+                ax.axvline(0, color="k", ls="--", lw=1)
+            if r == 0:
+                ax.set_title(MODULE_TITLE.get(module, module), fontsize=20)
+            ax.set_xlabel(xlabel, fontsize=18)
+            ax.set_ylabel("Density" if j == 0 else "", fontsize=18)
+            ax.tick_params(labelsize=15)
+            ax.grid(alpha=0.2)
+            if r == 0 and j == len(modules) - 1:           # one legend for the figure
+                h, l = ax.get_legend_handles_labels()
+                ax.legend(h[::-1], l[::-1], fontsize=15, loc="upper left")
     path = out_dir / "lora_target_vs_random.png"
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"[lora] wrote {path}")
@@ -531,7 +563,13 @@ def replot_from_cache(out_dir, group_profiles=None):
 
     t_csv = out_dir / "lora_targeted_columns.csv"
     if t_csv.exists():
-        plot_targeted_from_t(pd.read_csv(t_csv), out_dir)
+        t = pd.read_csv(t_csv)
+        if "kind" in t.columns:
+            plot_targeted_from_t(t, out_dir)
+        else:
+            # cached before the random-index baseline existed: no target/random split
+            print(f"[lora] {t_csv.name} in {out_dir} predates the random baseline (no 'kind' "
+                  "column); skipping targeted-column plots -- rerun without --from-cache")
     else:
         print(f"[lora] no {t_csv.name} in {out_dir}; skipping targeted-column plots "
               "(the first run used --no-base-model).")

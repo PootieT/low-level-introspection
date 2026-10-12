@@ -104,7 +104,8 @@ from src.introspector.regimes import (
 from src.introspector.training.model import InterventionHook
 from src.introspector.knockout_stats import top_k_arms
 from trace_introspection_circuit import (
-    readout_scale, contribution, linfit_slope_r2, capture_live_centres, effective_weight)
+    readout_scale, contribution, linfit_slope_r2, capture_live_centres, effective_weight,
+    _regime_text)
 
 # Source positions are reported relative to t, plus the absolute specials (BOS is
 # Llama's attention sink and takes a large share of every head's mass).
@@ -1089,8 +1090,22 @@ def _head_label(L, h, why=""):
     """'L3h1 [top at t]' -- the selection criterion travels with the head everywhere it
     is drawn, because "top total" and "top at t" are different claims (see
     select_heads) and a reader cannot tell them apart from the head id alone."""
-    why = "" if not isinstance(why, str) or not why else f" [{why}]"
-    return f"L{int(L)}h{int(h)}{why}"
+    if isinstance(why, str) and why:
+        # capitalize words for figures; short tokens ('at', 't', '#1') stay as they are
+        why = " ".join(w[:1].upper() + w[1:] if len(w) > 2 and w[0].isalpha() else w
+                       for w in why.split(" "))
+        return f"L{int(L)}h{int(h)} [{why}]"
+    return f"L{int(L)}h{int(h)}"
+
+
+def _condition_title(cond):
+    """Panel title for a regime / condition: 'x10' -> 'Injection Scale 10\u00d7'."""
+    return "Endogenous" if cond == "endogenous" else _regime_text(f"_{cond}")
+
+
+def _bin_label(b):
+    return {"other_text": "Other Text", "other_prompt": "Other Prompt"}.get(
+        b, b.replace("final", "Final").replace("-", "\u2212"))
 
 
 def _plot_attention_vs_v(run, dose_df, out_dir, suffix=""):
@@ -1105,27 +1120,24 @@ def _plot_attention_vs_v(run, dose_df, out_dir, suffix=""):
     if dose_df is None or dose_df.empty:
         return
     names = list(dict.fromkeys(dose_df["regime"]))
-    fig, axes = plt.subplots(1, len(names), figsize=(1 + 4.0 * len(names), 3.4),
+    fig, axes = plt.subplots(1, len(names), figsize=(1 + 5.4 * len(names), 5.2),
                              squeeze=False, sharey=True)
     for ax, sc in zip(axes.flat, names):
         d = dose_df[dose_df["regime"] == sc]
         for (M, h), g in d.groupby(["layer", "head"]):
             g = g.sort_values("v")
             why = g["selected_as"].fillna("").iloc[0] if "selected_as" in g else ""
-            ax.plot(g["v"], g["attn_to_t"], "o-", ms=4, label=_head_label(M, h, why))
-        ax.set_xlabel("injected value (offset from centre for `local`)")
+            ax.plot(g["v"], g["attn_to_t"], "o-", ms=6, lw=1.8, label=_head_label(M, h, why))
+        ax.set_xlabel("Injected Value\n(Offset from Center for Local)", fontsize=16)
         ax.grid(alpha=0.25)
-        ax.set_title(sc, fontsize=9); ax.tick_params(labelsize=8)
-    axes.flat[0].set_ylabel("attention: readout -> t", fontsize=9)
-    fig.suptitle("Graded routing or threshold detection?\n"
-                 "attention to the introspected token vs the value injected there",
-                 fontsize=9, y=1.04)
+        ax.set_title(_condition_title(sc), fontsize=18); ax.tick_params(labelsize=13)
+    axes.flat[0].set_ylabel("Attention Score at\nIntrospection Token", fontsize=16)
     fig.tight_layout()
     # below the panels: head labels carry their selection reason (and, for knockout
     # heads, their drops), which is too long for a legend inside an axis
     handles, labels = axes.flat[-1].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.0),
-               ncol=2 if max(map(len, labels), default=0) < 60 else 1, fontsize=7,
+               ncol=2 if max(map(len, labels), default=0) < 60 else 1, fontsize=13,
                frameon=False)
     path = out_dir / f"mover_attention_vs_v{suffix}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
@@ -1157,7 +1169,7 @@ def _plot_attention_profile(run, prof_df, out_dir, suffix="", heads_desc="the mo
         return
     vmin = max(1e-6, float(d[d["mean_attention"] > 0]["mean_attention"].min()))
     vmax = float(d["mean_attention"].max())
-    fig, axes = plt.subplots(1, len(conds), figsize=(1 + 3.6 * len(conds), 0.42 * len(heads) + 2.2),
+    fig, axes = plt.subplots(1, len(conds), figsize=(1 + 4.6 * len(conds), 0.62 * len(heads) + 3.2),
                              squeeze=False, sharey=True)
     for ax, cond in zip(axes.flat, conds):
         sub = d[d["condition"] == cond]
@@ -1167,17 +1179,17 @@ def _plot_attention_profile(run, prof_df, out_dir, suffix="", heads_desc="the mo
         im = ax.imshow(np.clip(mat, vmin, None), aspect="auto", cmap="magma",
                        norm=LogNorm(vmin=vmin, vmax=max(vmax, vmin * 10)))
         ax.set_xticks(range(len(bins)))
-        ax.set_xticklabels(bins, rotation=90, fontsize=7)
+        ax.set_xticklabels([_bin_label(b) for b in bins], rotation=90, fontsize=13)
         ax.set_yticks(range(len(heads)))
         ax.set_yticklabels([_head_label(L, h, why.get((L, h), "")) for L, h in heads],
-                           fontsize=7)
-        ax.set_title(cond, fontsize=9)
+                           fontsize=13)
+        ax.set_title(_condition_title(cond), fontsize=17)
         if "t" in bins:
             ax.axvline(bins.index("t") - 0.5, color="cyan", lw=0.8)
             ax.axvline(bins.index("t") + 0.5, color="cyan", lw=0.8)
-    fig.colorbar(im, ax=axes.ravel().tolist(), label="mean attention from readout", pad=0.02)
-    fig.suptitle(f"Where {heads_desc} look, by regime -- {run.config.experiment_name}",
-                 fontsize=9, y=1.02)
+    cb = fig.colorbar(im, ax=axes.ravel().tolist(), pad=0.02)
+    cb.set_label("Mean Attention from Readout", fontsize=16)
+    cb.ax.tick_params(labelsize=13)
     path = out_dir / f"mover_attention_profile{suffix}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"[mover] wrote {path}")

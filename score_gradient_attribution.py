@@ -72,7 +72,8 @@ from torch.utils.data import DataLoader
 from src.introspector.analysis_loading import (
     load_run_for_analysis, absolute_positions, run_per_locale)
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
-from src.introspector.run_discovery import add_discovery_args, runs_from_args, resolve_run_action
+from src.introspector.run_discovery import (add_discovery_args, runs_from_args, resolve_run_action,
+                                            pretty_run_name)
 
 # Attribution is accumulated in coordinates RELATIVE to the introspected token t,
 # because t is what the prompt names and what the readout has to find; absolute
@@ -395,8 +396,9 @@ def _plot(run, args, mass, counts, pos_df, at_t, out_dir):
     """`mass` [layers, rel] and `at_t` [neurons] are the small plot-only arrays cached
     to npz (the full [layers, rel, neurons] tensor is not); `counts` [layers, rel]."""
     L, i = run.layer, run.index
-    rel0 = args.max_rel
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.4))
+    fs = dict(suptitle=22, title=18, label=17, ticks=14, legend=14)
+    fig, axes = plt.subplots(1, 3, figsize=(19, 5.6))
+    ga = r"|Grad $\times$ Act|"
 
     # 1: attribution mass by (layer, relative position), summed over neurons
     mass = np.asarray(mass, dtype=float).copy()
@@ -406,18 +408,22 @@ def _plot(run, args, mass, counts, pos_df, at_t, out_dir):
                         cmap="magma")
     axes[0].axvline(0, color="w", ls="--", lw=1)
     axes[0].axhline(L, color="cyan", ls=":", lw=1.2)
-    axes[0].set_xlabel("position relative to t"); axes[0].set_ylabel("layer")
-    axes[0].set_title("total |grad x act| by (layer, position)")
-    fig.colorbar(im, ax=axes[0])
+    axes[0].set_xlabel("Position Relative to t", fontsize=fs["label"])
+    axes[0].set_ylabel("Layer", fontsize=fs["label"])
+    axes[0].set_title(f"Total {ga} by (Layer, Position)", fontsize=fs["title"])
+    cb = fig.colorbar(im, ax=axes[0]); cb.ax.tick_params(labelsize=fs["ticks"])
 
     # 2: the target neuron across positions, against its layer's typical neuron
     axes[1].plot(pos_df["rel_position"], pos_df["mean_abs_attr"], "o-", label=f"N{L}.{i}")
     axes[1].plot(pos_df["rel_position"], pos_df["layer_median_abs_attr"], "s--",
-                 color="grey", label=f"layer {L} median neuron")
+                 color="grey", label=f"Layer {L} Median Neuron")
     axes[1].axvline(0, color="k", ls="--", lw=1)
-    axes[1].set_yscale("log"); axes[1].set_xlabel("position relative to t")
-    axes[1].set_ylabel("mean |grad x act|"); axes[1].legend(fontsize=9)
-    axes[1].set_title("target neuron across positions"); axes[1].grid(alpha=0.25)
+    axes[1].set_yscale("log")
+    axes[1].set_xlabel("Position Relative to t", fontsize=fs["label"])
+    axes[1].set_ylabel(f"Mean {ga}", fontsize=fs["label"])
+    axes[1].legend(fontsize=fs["legend"])
+    axes[1].set_title("Target Neuron across Positions", fontsize=fs["title"])
+    axes[1].grid(alpha=0.25)
 
     # 3: where the target sits in its layer's distribution at t
     v = np.asarray(at_t, dtype=float)
@@ -426,10 +432,15 @@ def _plot(run, args, mass, counts, pos_df, at_t, out_dir):
     tgt = float(at_t[i])
     if tgt > 0:
         axes[2].axvline(np.log10(tgt), color="tab:red", lw=2, label=f"N{L}.{i}")
-    axes[2].set_xlabel("log10 mean |grad x act|"); axes[2].set_ylabel("neurons")
-    axes[2].legend(fontsize=9); axes[2].set_title(f"all {len(v)} neurons of layer {L} at t")
+    axes[2].set_xlabel(f"Mean {ga} (log$_{{10}}$)", fontsize=fs["label"])
+    axes[2].set_ylabel("Neurons", fontsize=fs["label"])
+    axes[2].legend(fontsize=fs["legend"])
+    axes[2].set_title(f"All {len(v)} Neurons of Layer {L} at t", fontsize=fs["title"])
+    for ax in axes:
+        ax.tick_params(which="both", labelsize=fs["ticks"])
 
-    fig.suptitle(f"Endogenous gradient attribution: {run.config.experiment_name}", y=1.02)
+    fig.suptitle(f"Endogenous Gradient Attribution: {pretty_run_name(run.config.experiment_name)}",
+                 fontsize=fs["suptitle"], y=1.02)
     fig.tight_layout()
     path = out_dir / "gradient_attribution.png"
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)

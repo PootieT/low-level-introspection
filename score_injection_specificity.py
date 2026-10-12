@@ -91,7 +91,8 @@ from torch.utils.data import DataLoader
 from src.introspector.analysis_loading import (
     load_run_for_analysis, absolute_positions, run_per_locale)
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
-from src.introspector.run_discovery import add_discovery_args, runs_from_args, resolve_run_action
+from src.introspector.run_discovery import (add_discovery_args, runs_from_args, resolve_run_action,
+                                            pretty_run_name)
 from src.introspector.training.model import InterventionHook
 
 # Token-position offsets probed by the vary_position category, relative to the
@@ -495,9 +496,9 @@ def _summarize(df, out_dir):
 
 
 # x axis of the summary figure: the three ways a locale can be wrong.
-PLOT_CONDITIONS = [("vary_index", "wrong index\n(same layer, same token)"),
-                   ("vary_layer", "wrong layer\n(same index, same token)"),
-                   ("vary_position", "wrong token\n(same neuron)")]
+PLOT_CONDITIONS = [("vary_index", "Wrong Index\n(Same Layer,\nSame Token)"),
+                   ("vary_layer", "Wrong Layer\n(Same Index,\nSame Token)"),
+                   ("vary_position", "Wrong Token\n(Same Neuron)")]
 
 
 def _plot(df, run, out_dir):
@@ -522,7 +523,7 @@ def _plot(df, run, out_dir):
         true_corr = g[g["category"] == "true"]["corr"]
         true_corr = float(true_corr.iloc[0]) if len(true_corr) else float("nan")
 
-        fig, ax = plt.subplots(figsize=(5.2, 3.4))
+        fig, ax = plt.subplots(figsize=(8, 5.2))
         rng = np.random.RandomState(0)
         data, labels, positions = [], [], []
         for k, (cat, label) in enumerate(PLOT_CONDITIONS, 1):
@@ -533,7 +534,7 @@ def _plot(df, run, out_dir):
             if len(vals):
                 # the individual locales, so a box drawn over 3 points is not mistaken
                 # for a distribution over many
-                ax.scatter(k + rng.uniform(-0.09, 0.09, len(vals)), vals, s=14,
+                ax.scatter(k + rng.uniform(-0.09, 0.09, len(vals)), vals, s=24,
                            color="tab:blue", alpha=0.55, zorder=3, linewidths=0)
         drawn = [(p, d) for p, d in zip(positions, data) if len(d)]
         if drawn:
@@ -548,16 +549,16 @@ def _plot(df, run, out_dir):
         ax.axhline(0, color="k", lw=0.8, zorder=1)
         if np.isfinite(true_corr):
             ax.axhline(true_corr, color="tab:red", ls="--", lw=1.4, zorder=4,
-                       label=f"target locale N{run.layer}.{run.index} @t ({true_corr:.2f})")
-            ax.legend(fontsize=8, loc="best", framealpha=0.9)
-        ax.set_xticks(positions); ax.set_xticklabels(labels, fontsize=8)
-        ax.set_ylabel("corr(readout, injected v)", fontsize=9)
+                       label=f"Target Locale N{run.layer}.{run.index} @ t ({true_corr:.2f})")
+            ax.legend(fontsize=13, loc="best", framealpha=0.9)
+        ax.set_xticks(positions); ax.set_xticklabels(labels, fontsize=13)
+        ax.set_ylabel("Corr(Readout, Injected v)", fontsize=16)
         lo = min(-0.08, float(np.nanmin([v.min() for v in data if len(v)], initial=0)) - 0.05)
         ax.set_ylim(lo, max(1.02, true_corr + 0.08 if np.isfinite(true_corr) else 1.02))
-        ax.tick_params(labelsize=8)
+        ax.tick_params(axis="y", labelsize=14)
         ax.grid(axis="y", alpha=0.25)
-        ax.set_title(f"{run.config.experiment_name}\ninjection scale {scale:g}x",
-                     fontsize=8)
+        ax.set_title(f"{pretty_run_name(run.config.experiment_name)}\n"
+                     f"Injection Scale {scale:g}\u00d7", fontsize=16)
         fig.tight_layout()
         path = out_dir / f"injection_specificity_scale{scale:g}.png"
         fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)

@@ -52,6 +52,7 @@ python trace_introspection_circuit.py \
 from __future__ import annotations
 
 import os
+import re
 import pdb
 import glob
 import json
@@ -70,7 +71,8 @@ from src.introspector.analysis_loading import (
     load_run_for_analysis, absolute_positions, layer_output_is_tuple, run_per_locale)
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
 from src.introspector.run_discovery import (
-    add_discovery_args, runs_from_args, resolve_run_action, locale_out_dir, locale_tag)
+    add_discovery_args, runs_from_args, resolve_run_action, locale_out_dir, locale_tag,
+    pretty_run_name)
 from src.introspector.regimes import (
     DEFAULT_REGIMES, DEFAULT_LOCAL_DELTA_SIGMA, parse_regimes, zero_offset_index,
     identity_check, power_warning)
@@ -738,7 +740,8 @@ def trace_one_run(run, args, out_dir: Path):
       tag = f"_{regime.name}"
       _plot_attribution(attr_df, n_layers, start_layer, inject_layer, out_dir, tag)
       _plot_heads(head_slope_mat, start_layer, n_layers, n_heads, out_dir, tag)
-      _plot_decodability(dec_mat, probe_labels, n_layers, inject_layer, out_dir, tag)
+      _plot_decodability(dec_mat, probe_labels, n_layers, inject_layer, out_dir, tag,
+                         run_name=config.experiment_name)
       meta_regimes[regime.name] = {
           "kind": regime.kind, "scale": regime.scale, "delta_sigma": regime.delta_sigma,
           "grid": [float(x) for x in regime.grid],
@@ -816,22 +819,41 @@ def _plot_heads(mat, start_layer, n_layers, n_heads, out_dir, tag=""):
     plt.close()
 
 
-def _plot_decodability(mat, probe_labels, n_layers, inject_layer, out_dir, tag=""):
-    plt.figure(figsize=(1.0 * len(probe_labels) + 3, max(4, 0.35 * n_layers)))
+def _regime_text(tag):
+    """'_x1' -> 'Injection Scale 1\u00d7', '_local@0.5s' -> 'Local Perturbation (\u00b10.5\u03c3)'."""
+    name = tag.lstrip("_")
+    m = re.fullmatch(r"x([0-9.]+)", name)
+    if m:
+        return f"Injection Scale {m.group(1)}\u00d7"
+    m = re.fullmatch(r"local@([0-9.]+)s", name)
+    if m:
+        return f"Local Perturbation (\u00b1{m.group(1)}\u03c3)"
+    return name
+
+
+def _plot_decodability(mat, probe_labels, n_layers, inject_layer, out_dir, tag="",
+                       run_name=None):
+    plt.figure(figsize=(1.35 * len(probe_labels) + 4, max(6, 0.55 * n_layers)))
+    shown = [lbl.replace("last", "Last").replace("-", "\u2212") for lbl in probe_labels]
     ax = sns.heatmap(mat, cmap="viridis", vmin=0, vmax=1, annot=True, fmt=".2f",
-                     annot_kws={"size": 7},
-                     yticklabels=list(range(n_layers)), xticklabels=probe_labels,
-                     cbar_kws={"label": "probe corr (v decodability)"})
+                     annot_kws={"size": 12},
+                     yticklabels=list(range(n_layers)), xticklabels=shown,
+                     cbar_kws={"label": "Probe Corr. (v Decodability)"})
+    ax.figure.axes[-1].yaxis.label.set_size(16)          # colorbar label
+    ax.figure.axes[-1].tick_params(labelsize=14)
+    ax.tick_params(labelsize=14)
     plt.axhline(inject_layer + 0.5, color="w", ls="--", lw=1)
     # the causal null: nothing left of this line can carry v, so its column is the
     # floor the rest of the map is read against
     if "t-1" in probe_labels:
         ax.axvline(probe_labels.index("t-1") + 1, color="w", ls=":", lw=1.5)
-    plt.ylabel("layer"); plt.xlabel("probe position")
-    plt.title(f"Injected-value decodability by (layer, probe position){tag}\n"
-              "t-1 = causal null | t = origin | last = readout", fontsize=10)
+    plt.ylabel("Layer", fontsize=17); plt.xlabel("Probe Position", fontsize=17)
+    head = f"{pretty_run_name(run_name)}\n" if run_name else ""
+    regime = f", {_regime_text(tag)}" if tag else ""
+    plt.title(f"{head}Injected-Value Decodability{regime}\n"
+              "t\u22121 = Causal Null | t = Origin | Last = Readout", fontsize=16)
     plt.tight_layout()
-    plt.savefig(out_dir / f"decodability{tag}.png", dpi=150)
+    plt.savefig(out_dir / f"decodability{tag}.png", dpi=150, bbox_inches="tight")
     plt.close()
 
 
@@ -868,7 +890,8 @@ def replot_circuit(spec, out_dir: Path, args) -> bool:
         _plot_attribution(attr_df[attr_df["regime"] == regime], n_layers, start_layer,
                           inject_layer, out_dir, tag)
         _plot_heads(head_mat, start_layer, n_layers, n_heads, out_dir, tag)
-        _plot_decodability(dec_mat, probe_labels, n_layers, inject_layer, out_dir, tag)
+        _plot_decodability(dec_mat, probe_labels, n_layers, inject_layer, out_dir, tag,
+                           run_name=spec.config.experiment_name)
     return True
 
 

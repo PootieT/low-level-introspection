@@ -202,21 +202,27 @@ def _draw_row(axes, runs, xcol, xlabel, panels, fonts, titles=True, legends=True
                 ax.legend(fontsize=fonts["legend"], loc="best")
 
 
+SEQ_LEN = 32      # token positions are drawn as 0-indexed absolute indices (-1 -> 31)
+
+
 def agreement_by_locale(runs: pd.DataFrame, k: int, q: float, out: Path):
-    """The overview (both locale axes as two rows) plus one figure per locale axis."""
+    """The overview (both locale axes as two rows) plus one figure per locale axis, all in
+    the paper style: large fonts, two-line titles, legends below, no suptitle."""
     panels = _agreement_panels(k, q)
+    runs = runs.assign(position=runs["position"].where(runs["position"] >= 0,
+                                                       runs["position"] + SEQ_LEN))
     xs = [("signal_layer", "Signal Layer", "knockout_agreement_by_signal_layer.png"),
           ("position", "Token Position", "knockout_agreement_by_position.png")]
 
-    fig, axes = plt.subplots(len(xs), len(panels), figsize=(4.0 * len(panels), 3.3 * len(xs)),
+    fig, axes = plt.subplots(len(xs), len(panels), figsize=(4.6 * len(panels), 5.2 * len(xs)),
                              squeeze=False)
     for r, (xcol, xlabel, _) in enumerate(xs):
-        _draw_row(axes[r], runs, xcol, xlabel, panels, FONTS_OVERVIEW,
-                  titles=r == 0, legends=r == 0, one_line_titles=True)
-    fig.suptitle("Endogenous vs Interventional Head Importance, per Run (Bar = Median)",
-                 y=1.01)
-    fig.tight_layout()
-    fig.savefig(out / "knockout_agreement_by_locale.png", dpi=150, bbox_inches="tight")
+        last = r == len(xs) - 1
+        # titles once (top row); legends once per column, below the bottom row
+        _draw_row(axes[r], runs, xcol, xlabel, panels, FONTS_PAPER,
+                  titles=r == 0, legends=last, legend_below=last)
+    fig.subplots_adjust(left=0.04, right=0.99, top=0.92, bottom=0.2, wspace=0.32, hspace=0.42)
+    fig.savefig(out / "knockout_agreement_by_locale.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
     for xcol, xlabel, fname in xs:
