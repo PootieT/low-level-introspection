@@ -1,0 +1,455 @@
+#!/bin/bash -l
+#$ -P multilm
+#$ -N attn_w_pilot
+#$ -pe omp 8
+#$ -l gpus=1
+#$ -l gpu_c=8.5
+#$ -l gpu_memory=47G
+#$ -l h_rt=4:00:00
+# SGE writes one file per task into this DIRECTORY. It must already exist -- if it
+# does not, SGE treats the value as a filename and every task dumps into one file
+# instead (which is how the stray `log` file in the repo root came to be).
+#$ -o logs
+#$ -j y
+
+# ============================================================================
+# PILOT: one (layer, head, source offset) cell of the attention-WEIGHT experiment.
+#
+# The post-softmax counterpart of scripts/attention/pilot/pilot_attn_logit_one_cell.sh.
+# Run it BEFORE the Stage-2 training arms. It prints a verdict per question, so nobody
+# has to grep a log to find out whether it worked:
+#
+#   1. ALIGNMENT (the one that matters). Does the live model reproduce the cached
+#      attention weight, at the cached (dst, src)? measure_attention_alignment sweeps
+#      the destination offset and exactly +0 must win with corr ~1.0. This is the only
+#      automatic check that the extraction path reads what cache_signals wrote.
+#      It matters MORE here than for the logit: a post-softmax value depends on its
+#      whole row, so a mismatch in attention implementation or padding corrupts the
+#      NORMALIZING CONSTANT rather than the position -- which keeps the best offset at
+#      +0 and only dents the correlation. That reads as noise, not as a bug.
+#   2. ROW SUM. After an injection the destination row must still sum to 1. A weight
+#      port that overwrote one cell instead of renormalizing would leave a row no logit
+#      row can produce, and nothing downstream would raise.
+#   3. DOMAIN. Every sampled target must be a valid probability at every injection
+#      scale. The built-in gaussian/extreme distributions are NOT (see
+#      make_bounded_prob_intervention_fn); this confirms the log-odds sampler is the one
+#      actually in use.
+#   4. INTERVENTION SATURATION. interventional_scale_sweep at several injection scales.
+#      A probability is bounded, so at a large scale draws pile up against the guard
+#      band -- read the saturated fraction alongside the correlation, or a scale whose
+#      corr reflects "the model learned the clamp" looks like a reading result.
+#   5. COST. Wall time per caching pass and per training run, extrapolated to a Stage-2
+#      cell, so h_rt can be sized from a measurement.
+#
+# NOT A WARM-UP FOR THE SWEEP. The pilot uses TRAIN_SAMPLES=3000 while the sweep uses
+# 300000, and max_samples is part of the dataset identity -- so this builds its OWN
+# cache directory and the sweep will still cache from scratch. That is deliberate
+# (fast feedback). Set TRAIN_SAMPLES=300000 if you want this cell's real cache built
+# here instead, and expect it to take as long as a sweep task.
+#
+# PICK THE CELL FROM THE SCAN, not from this file's defaults. Stage 1
+# (scan_attention_weight_spread.py) ranks all 16 x 32 x 10 cells by spread and prints a
+# recommendation; the defaults below are only a plausible mid-stack cell to smoke-test
+# the pipeline with before the scan has run.
+#
+# Usage
+#   qsub scripts/attention_weight/pilot/pilot_attn_weight_one_cell.sh
+#   bash scripts/attention_weight/pilot/pilot_attn_weight_one_cell.sh   # interactive GPU node
+#   LAYER=8 HEAD=5 SRC_OFFSET=-3 bash scripts/attention_weight/pilot/pilot_attn_weight_one_cell.sh
+#
+# Every knob below is overridable from the environment (qsub -v LAYER=0,...).
+# ============================================================================
+
+echo "=========================================================="
+echo "Start date : $(date)"
+echo "Job name : $JOB_NAME"
+echo "Job ID : $JOB_ID"
+echo "=========================================================="
+nvidia-smi
+
+# Same environment as the sweep script, and deliberately NOT the one the neuron/SAE
+# scripts use (they charge llamagrp and activate peter's env). Keep these in sync with
+# scripts/attention/train_single_attn_logit_introspector_endogenous_sweep_layer_srctoken.sh
+# -- a pilot that passes under a different env has not tested the sweep.
+module load cuda/12.8
+module load miniconda/23.11.0
+conda activate /projectnb/multilm/jongin/anaconda3/envs/introspection
+
+export HF_HOME=/projectnb/ivc-ml/SharedHuggingFaceCache
+export WANDB_PROJECT=low-level-introspection
+export WANDB_RUN_GROUP=attn_w_pilot
+
+set -e
+# Capture $? on the FIRST line of the trap: every command inside it (the bare `echo`
+# included) overwrites $?, so reading it later reports the echo's status and the banner
+# printed "exit 0" for a run that had just died.
+trap 'rc=$?; echo; echo "############################################################"; \
+      echo "### PILOT FAILED (exit $rc) -- see the traceback above."; \
+      echo "############################################################"' ERR
+
+## ---- the cell ----
+# Defaults picked on purpose:
+#   GATE=off       the alignment/drift check auto-runs when the adapter is active over
+#                  the input text; --force-drift-eval is passed anyway.
+#   SRC_OFFSET=-3  neither 0 (self-attention) nor the BOS sink, so the pipeline is
+#                  tested on an ordinary cell without the low-variance confound that
+#                  makes a BOS correlation hard to read.
+#   LAYER=8        mid-stack. Layer 0 would be the text-only ceiling control.
+LAYER=${LAYER:-8}
+SRC_OFFSET=${SRC_OFFSET:--3}
+GATE=${GATE:-off}
+DST_POS=${DST_POS:--1}
+
+HEAD_SELECT=${HEAD_SELECT:-random}          # random | fixed  (matches the sweep's arms)
+FIXED_HEADS=(0 4 8 12 16 20 24 28)
+
+## ---- size (small = fast feedback; see "NOT A WARM-UP" above) ----
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-3000}
+DEV_SAMPLES=${DEV_SAMPLES:-200}
+TEST_SAMPLES=${TEST_SAMPLES:-500}
+# Dev skips this many RAW documents. Must clear train's raw span (TRAIN_SAMPLES divided
+# by the ~99% length-filter pass rate), or cache_signals refuses the config outright.
+DEV_OFFSET=${DEV_OFFSET:-20000}
+
+# The cache always holds the full 8 heads (that is what a sweep cell caches, and it is
+# one forward pass either way); only the number TRAINED is cut down. 2 is enough to
+# check that --signal-filter really splits the shared cache AND that the second run
+# reuses it instead of rebuilding.
+N_HEADS_CACHE=${N_HEADS_CACHE:-8}
+N_HEADS_TRAIN=${N_HEADS_TRAIN:-2}
+
+## ---- everything else mirrors the sweep ----
+SEQ=32                   # max AND min: every cached document is exactly this long
+W=1.0                    # pure endogenous
+SEED=21
+LR=5e-5
+LORA_R=16
+LORA_ALPHA=$((LORA_R * 2))
+LORA_DO=0.0
+BS=32
+# 4, not the logit experiment's 10. `scale` now multiplies the spread in LOG-ODDS space
+# (see SCALE_SWEEP below); at 10 nearly every draw lands on the guard band, so the
+# "extreme" arm would be a point mass at 0 and 1 rather than a wide distribution.
+SCALE=${SCALE:-4}
+# LOG-ODDS units, not the logit sweep's 1,3,10,30,100. The sampler draws
+# u ~ N(mean_logit, scale*std_logit) and maps t = sigmoid(u), so `scale` multiplies the
+# spread in log-odds space. 100 there would put essentially every draw on the guard band.
+SCALE_SWEEP=${SCALE_SWEEP:-1,2,4,8,16}
+# --precision 6, not the logit experiment's 3. The regressor loss reads the float
+# `activation` column so the main result is unaffected either way, but at precision 3 a
+# weight of 0.0014 renders as the STRING "+0.001" and most cells collapse to "+0.000",
+# which silently guts any generation-mode eval or metrics.py parsing path. Precision is
+# part of the cache identity, so this forks a fresh cache -- free for a new experiment.
+PRECISION=${PRECISION:-6}
+# A reduced corpus set: enough to exercise score_ood_generalization's derived-config
+# path (which had to be fixed to carry min_seq_length through, and would otherwise fail
+# for attention signals), without paying for all six corpora in a pilot.
+OOD_CORPORA=${OOD_CORPORA:-shuffled,wikipedia}
+RUN_OOD=${RUN_OOD:-1}
+# Re-running the pilot reuses whatever cache is already on disk. Set to
+# --overwrite-cache to force a rebuild (e.g. after changing the extraction code).
+CACHE_OVERWRITE=${CACHE_OVERWRITE:-}
+
+if [ "$GATE" = "on" ]; then GATE_FLAG="--disable-adapter-in-input"; else GATE_FLAG=""; fi
+
+EXP_GROUP=attn_weight_pilot
+CELL="l${LAYER}_src${SRC_OFFSET}"
+OUT_ROOT=outputs/runs/$EXP_GROUP
+
+if [ "$HEAD_SELECT" = "fixed" ]; then
+  HEAD_JSON=$(IFS=,; echo "[${FIXED_HEADS[*]}]")
+  SAMPLER="{\"type\":\"attention_layer_sampler\",\"signal_type\":\"attention_weight\",\"layers\":[${LAYER}],\"heads\":${HEAD_JSON},\"src_offsets\":[${SRC_OFFSET}],\"seed\":${SEED}}"
+else
+  SAMPLER="{\"type\":\"attention_layer_sampler\",\"signal_type\":\"attention_weight\",\"layers\":[${LAYER}],\"heads_per_layer\":${N_HEADS_CACHE},\"src_offsets\":[${SRC_OFFSET}],\"seed\":${SEED}}"
+fi
+
+echo
+echo "=== PILOT CELL ==========================================="
+echo "  layer=$LAYER  src_offset=$SRC_OFFSET  dst=$DST_POS  gate=$GATE"
+echo "  heads: $HEAD_SELECT, cache $N_HEADS_CACHE / train $N_HEADS_TRAIN"
+echo "  samples: train=$TRAIN_SAMPLES dev=$DEV_SAMPLES test=$TEST_SAMPLES  seq=$SEQ"
+echo "  output: $OUT_ROOT"
+echo "=========================================================="
+
+## ---- resolve this cell's head set ONCE ----
+# Generated, not run: it keeps resolution.py the single source of truth for which heads
+# a (seed, layer) maps to, instead of duplicating the selection in shell.
+CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL}.json
+python generate_experiment_config.py \
+    --experiment-name "_cell_${CELL}" \
+    --model meta-llama/Llama-3.2-1B \
+    --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples $TRAIN_SAMPLES \
+    --dev-max-samples $DEV_SAMPLES --dev-offset-from-train $DEV_OFFSET \
+    --test-dataset allenai/c4 --test-dataset-split "validation" --test-max-samples $TEST_SAMPLES \
+    --max-seq-length $SEQ --min-seq-length $SEQ \
+    --hf-data-kwargs '{"config": "en", "streaming": true}' \
+    --train-signals "$SAMPLER" \
+    --test-signals "$SAMPLER" \
+    --same-train-test-signals \
+    --train-token-selector $DST_POS \
+    --test-token-selector $DST_POS \
+    --precision $PRECISION \
+    --cache-dir data --output-dir $OUT_ROOT \
+    --output "$CELL_CONFIG" \
+    --overwrite-cache
+
+SIGNALS=($(python -c "
+import json
+cfg = json.load(open('$CELL_CONFIG'))
+print(' '.join(f\"P{s['layer']}.{s['index']}@{s['src_offset']}\" for s in cfg['train_signals']))
+"))
+SIGNAL_LIST=$(IFS=,; echo "${SIGNALS[*]}")
+echo "cell $CELL signals: $SIGNAL_LIST"
+
+CACHE_SECONDS=0
+TRAIN_SECONDS=0
+LAST_RUN_DIR=""
+
+for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
+  SIG=${SIGNALS[$SAMPLE]}
+  EXP_NAME="pilot_${SIG}_POS${DST_POS}_gate${GATE}_w${W}_${TRAIN_SAMPLES}"
+  CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
+  LAST_RUN_DIR=$OUT_ROOT/$EXP_NAME
+  echo
+  echo "=== [$CELL sample $SAMPLE] $EXP_NAME ==="
+
+  # Every sample passes the SAME signal list so all heads resolve to one cached
+  # dataset; --signal-filter is what differs and is not part of the cache identity.
+  python generate_experiment_config.py \
+      --experiment-name "$EXP_NAME" \
+      --model meta-llama/Llama-3.2-1B \
+      --train-dataset allenai/c4 \
+      --train-dataset-split "train" \
+      --train-max-samples $TRAIN_SAMPLES \
+      --dev-max-samples $DEV_SAMPLES \
+      --dev-offset-from-train $DEV_OFFSET \
+      --test-dataset allenai/c4 \
+      --test-dataset-split "validation" \
+      --test-max-samples $TEST_SAMPLES \
+      --max-seq-length $SEQ --min-seq-length $SEQ \
+      --hf-data-kwargs '{"config": "en", "streaming": true}' \
+      --train-signals "$SIGNAL_LIST" \
+      --test-signals "$SIGNAL_LIST" \
+      --signal-filter "$SIG" \
+      --train-token-selector $DST_POS \
+      --test-token-selector $DST_POS \
+      --precision $PRECISION \
+      --train-batch-size $BS \
+      --eval-batch-size 128 \
+      --num-epochs 1 \
+      --lora-r $LORA_R \
+      --lora-alpha $LORA_ALPHA \
+      --lora-dropout $LORA_DO \
+      $GATE_FLAG \
+      --bf16 \
+      --learning-rate $LR \
+      --warmup-ratio 0.03 \
+      --lr-scheduler-type cosine \
+      --save-steps 0 \
+      --use-regressor \
+      --intervention-signal-distribution extreme \
+      --intervention-extreme-scale $SCALE \
+      --cache-dir data \
+      --output-dir $OUT_ROOT \
+      --output "$CONFIG" \
+      --overwrite-cache
+
+  # Builds the cell's 8-head dataset on SAMPLE=0 and no-ops afterwards. If the second
+  # sample re-caches, --signal-filter has leaked into the dataset identity.
+  t0=$SECONDS
+  python cache_signals.py --config "$CONFIG" $CACHE_OVERWRITE
+  dt=$((SECONDS - t0))
+  if [ "$SAMPLE" -eq 0 ]; then
+    CACHE_SECONDS=$dt
+    echo "[pilot] caching took ${dt}s"
+    # The most dangerous single misconfiguration: a cache built under sdpa would make
+    # every attention logit a different quantity from the one training reads.
+    python - <<PYEOF
+import json, sys
+from pathlib import Path
+from src.introspector.config import ExperimentConfig
+from src.introspector.dataset_utils import canonical_dataset_name
+cfg = ExperimentConfig.model_validate_json(Path("$CONFIG").read_text())
+meta = json.load(open(Path(cfg.cache_dir) / canonical_dataset_name(cfg) / "metadata.json"))
+impl = meta["capture"].get("attn_implementation")
+print(f"[pilot] cache capture: {meta['capture']['signal_site']}")
+print(f"[pilot] cache attn_implementation: {impl}")
+if "post-softmax" not in meta["capture"]["signal_site"]:
+    sys.exit(f"FAIL: cache capture site is {meta['capture']['signal_site']!r}, not the "
+             f"post-softmax weight. The P specs were routed through the logit port, so "
+             f"the cache holds PRE-softmax logits under a 'P' name.")
+rate = meta["realized"]["train"].get("src_token_unique_rate")
+if rate is not None:
+    # The prompt names the source token by string only, so a token that occurs more than
+    # once in the 32-token context does not identify a position. Not a failure -- an
+    # accepted confound -- but the size of it belongs in the pilot log.
+    print(f"[pilot] src_token_unique_rate: {rate:.4f} "
+          f"({(1 - rate) * 100:.1f}% of rows name an ambiguous source token)")
+if impl != "introspection_logit":
+    # The registered NAME is "introspection_logit" for both signal codes -- one custom
+    # attention function carries both port sites. A weight run under this name is
+    # correct; it is any OTHER value (sdpa, eager) that means the ports never fired.
+    sys.exit(f"FAIL: cache was built with attn_implementation={impl!r}. Both attention "
+             f"signal types need 'introspection_logit' (the shared implementation that "
+             f"carries the pre- and post-softmax ports).")
+PYEOF
+  elif [ "$dt" -gt 60 ]; then
+    # Sample 0 built the cell; every later sample must find it and no-op. If it rebuilt,
+    # --signal-filter has leaked into the dataset identity -- which would silently turn
+    # the sweep's 80 shared caches into 1280 separate ones.
+    echo "[pilot] *** WARNING: sample $SAMPLE re-cached (${dt}s), it should have reused"
+    echo "[pilot] *** sample 0's dataset. Check that --signal-filter is still excluded"
+    echo "[pilot] *** from dataset_identity() in src/introspector/dataset_utils.py."
+  else
+    echo "[pilot] cache step took ${dt}s (correctly reused sample 0's dataset)"
+  fi
+
+  t0=$SECONDS
+  python train_introspector_joint.py \
+      --config "$CONFIG" \
+      --joint-loss-weight $W \
+      --force-drift-eval \
+      --scale-sweep "$SCALE_SWEEP" \
+      $( [ "$RUN_OOD" = "1" ] && echo "--ood-eval --ood-corpora $OOD_CORPORA" )
+  dt=$((SECONDS - t0))
+  TRAIN_SECONDS=$((TRAIN_SECONDS + dt))
+  echo "[pilot] training + eval took ${dt}s"
+done
+
+## ---- verdict ----
+# The point of a pilot is a decision, not a log. Everything above can succeed while the
+# alignment check quietly reports the wrong offset, so read it back and say so plainly.
+echo
+echo "=========================================================="
+echo "=== PILOT VERDICT"
+echo "=========================================================="
+python - <<PYEOF
+import json, sys
+from pathlib import Path
+
+run = Path("$LAST_RUN_DIR")
+ok = True
+
+drift_path = run / "activation_drift.json"
+if not drift_path.exists():
+    sys.exit(f"FAIL: {drift_path} missing -- the alignment check did not run. "
+             f"With gate={'on' if '$GATE' == 'on' else 'off'} it should have.")
+d = json.loads(drift_path.read_text())
+best, corr = d["best_alignment_offset"], d["best_alignment_corr"]
+print(f"[1] ALIGNMENT  best offset {best:+d}, corr={corr:.6f}, alignment_ok={d['alignment_ok']}")
+print(f"        signal_type recorded by the diagnostic: {d.get('signal_type')}")
+for row in d["alignment"]:
+    print(f"        offset {row['offset']:+d}: corr={row['corr']:.6f}")
+if d.get("signal_type") != "attention_weight":
+    ok = False
+    print(f"    *** FAIL. The alignment check ran for {d.get('signal_type')!r}, so it")
+    print("        compared the cached weight against a live LOGIT. The site did not")
+    print("        reach measure_attention_alignment.")
+elif not d["alignment_ok"]:
+    ok = False
+    print("    *** FAIL. Expected offset +0 with corr > 0.99. For a post-softmax weight")
+    print("        the likely cause is NOT an off-by-one: check whether best offset is")
+    print("        still +0 (it usually is) and the correlation is merely low -- that is")
+    print("        a NORMALIZATION mismatch, i.e. caching and training disagreed about")
+    print("        the attention implementation or the padding, so the row the softmax")
+    print("        divided by was not the same row.")
+else:
+    print("    PASS -- the live weight is the quantity the cache holds.")
+
+drift = d["drift_tuned_vs_base"]
+print(f"\n[2] DRIFT      tuned vs base @offset 0: corr={drift['corr']:.4f} "
+      f"std_ratio={drift['std_ratio']:.3f}")
+print("    (gate off lets the adapter move the signal the target was frozen from;")
+print("     a low corr here with a high endogenous score means recompute, not readout.)")
+
+endo = run / "endogenous_test_metrics_endogenous.json"
+if endo.exists():
+    m = json.loads(endo.read_text())
+    print(f"\n[3] ENDOGENOUS corr={m.get('corr')}  l2={m.get('l2_dist')}")
+
+preds = run / "endogenous_test_predictions_endogenous.csv"
+if preds.exists():
+    import csv
+    acts = [float(r["activation"]) for r in csv.DictReader(open(preds))]
+    lo, hi = min(acts), max(acts)
+    mean = sum(acts) / len(acts)
+    var = sum((a - mean) ** 2 for a in acts) / max(len(acts) - 1, 1)
+    std = var ** 0.5
+    print(f"\n[3b] TARGET RANGE  n={len(acts)} min={lo:.6g} max={hi:.6g} "
+          f"mean={mean:.6g} std={std:.3g} cv={std / mean if mean else float('nan'):.3g}")
+    if not (0.0 <= lo and hi <= 1.0):
+        ok = False
+        print("    *** FAIL. The cached targets are not probabilities. The cache holds")
+        print("        pre-softmax logits under a 'P' name -- rebuild it.")
+    else:
+        print("    PASS -- every cached target is a probability.")
+    if mean < 1e-3:
+        print(f"    NOTE: mean {mean:.3g} < 1e-3. This cell carries almost no attention")
+        print("        mass; a correlation on it is close to meaningless. Prefer a cell")
+        print("        the Stage-1 scan did not mark `dead`.")
+
+# [4] ROW SUM and [5] DOMAIN: properties of the write path, checked directly rather
+# than inferred from a metric. validate_attention_weights.py is the full version; this
+# re-runs its two load-bearing checks against THIS cell's trained checkpoint context so
+# a pilot log is self-contained.
+print("\n[4] ROW SUM / [5] DOMAIN -- see validate_attention_weights.py, run below.")
+
+sweep = run / "interventional_scale_sweep.csv"
+if sweep.exists():
+    print(f"\n[6] SATURATION (interventional corr vs injection scale, LOG-ODDS units)")
+    print("    A probability is bounded, so a large scale pushes draws onto the guard")
+    print("    band. Rising corr there can mean 'learned the clamp', not 'read the")
+    print("    value' -- pick the largest scale before the curve flattens.")
+    print("    " + sweep.read_text().strip().replace("\n", "\n    "))
+else:
+    print(f"\n[6] SATURATION missing ({sweep})")
+
+print()
+sys.exit(0 if ok else "PILOT FAILED: do not launch the Stage-2 arms.")
+PYEOF
+
+## ---- cost extrapolation ----
+# A sweep task caches 300K examples and trains 8 heads. Scale what we just measured so
+# h_rt in the sweep script is set from a measurement rather than from the neuron sweep's.
+python - <<PYEOF
+cache_s, train_s = $CACHE_SECONDS, $TRAIN_SECONDS
+n_trained, train_n = $N_HEADS_TRAIN, $TRAIN_SAMPLES
+sweep_n, sweep_heads = 300_000, 8
+f = sweep_n / train_n
+cache_est = cache_s * f
+per_run = train_s / max(n_trained, 1)
+# training cost scales with the data; the eval suite is a fixed cost per run, so this
+# over-estimates a little -- fine for sizing h_rt, which wants headroom anyway.
+train_est = per_run * f * sweep_heads
+total = cache_est + train_est
+print()
+print("=========================================================="
+      "\n=== COST (measured here, extrapolated to one sweep task)"
+      "\n==========================================================")
+print(f"  measured: caching {cache_s}s @ {train_n} samples, "
+      f"{per_run:.0f}s per training run")
+print(f"  a sweep task ({sweep_n} samples, {sweep_heads} heads) would be roughly:")
+print(f"      caching  ~{cache_est/3600:6.2f} h")
+print(f"      training ~{train_est/3600:6.2f} h")
+print(f"      TOTAL    ~{total/3600:6.2f} h   (sweep script currently sets h_rt=24:00:00)")
+if total > 24 * 3600:
+    print("  *** over h_rt=24:00:00. Raise it, or split the heads across two array")
+    print("      dimensions (320 tasks x 4 heads) in the sweep script.")
+PYEOF
+
+## ---- port-level checks (row sum, write locality, equivalence, domain) ----
+# Cheap (one small model load, no training) and they check the write path directly
+# rather than through a metric, so a pilot log answers "is the injection well formed?"
+# without a second command.
+echo
+echo "=========================================================="
+echo "=== PORT CHECKS (validate_attention_weights.py)"
+echo "=========================================================="
+python validate_attention_weights.py --layer $LAYER --src-offset $SRC_OFFSET
+
+echo
+echo "=========================================================="
+echo "PILOT PASSED. Next:"
+echo "  qsub scripts/attention_weight/2_train_attn_weight_endogenous_picked_cells.sh"
+echo "End date : $(date)"
+echo "=========================================================="

@@ -186,6 +186,13 @@ def compute_metrics_from_numericals(pred_nums: List[float], label_nums:List[floa
     }
     # `corr` stays Pearson so every existing reader and plot is unchanged; the rank
     # measures are added alongside. Cheap at these sizes (<1 ms each at n=3000).
+    #
+    # Attention weights need this most: a post-softmax weight is heavily right-skewed
+    # (the BOS sink sits at 0.3-0.9 while mid-context cells sit at 1e-4-1e-1). Pearson
+    # and the training loss _var_norm_mse are both squared-scale, so a handful of large
+    # rows decide the reported value, and a model that has learned only "is this the
+    # sink" scores nearly as well as one that reads the whole range. The Pearson -
+    # Spearman gap measures how much the tail is carrying.
     if len(pred_nums) >= 2:
         out.update(rank_metrics(pred_nums, label_nums))
         out["pearson_minus_spearman"] = (out["corr"] - out["spearman"]

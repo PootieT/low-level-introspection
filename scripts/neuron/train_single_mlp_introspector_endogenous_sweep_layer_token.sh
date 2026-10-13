@@ -68,10 +68,10 @@ set -e
 # cell share its cached dataset, so keeping them 64 tasks apart stops concurrent slots
 # racing to build the same directory. Set "#$ -t 1-128" for the full sweep.
 index=$(($SGE_TASK_ID-1))
-LAYERS=(0 2 4 6 8 10 12 14)
-POSS=(-1 -4 -8 -12 -16 -20 -24 -28)
+LAYERS=(0 2 4 6 8 10 12 14) # 8
+POSS=(-1 -4 -8 -12 -16 -20 -24 -28) # 8
 GATES=(on off)
-GATE=${GATES[$((index / 64))]}
+GATE=${GATES[$((index / 64))]} # task 1-64 = on, 65-128 = off
 cell_idx=$((index % 64))
 LAYER=${LAYERS[$((cell_idx / 8))]}
 TOKEN_POS=${POSS[$((cell_idx % 8))]}
@@ -106,7 +106,7 @@ if [ "$GATE" = "on" ]; then GATE_FLAG="--disable-adapter-in-input"; else GATE_FL
 
 EXP_GROUP=mlp_endo_sweep_layer_token
 CELL="l${LAYER}_pos${TOKEN_POS}"
-SAMPLER="{\"type\":\"uniform_layer_sampler\",\"signal_type\":\"mlp\",\"layers\":[${LAYER}],\"signals_per_layer\":${N_NEURONS_CACHE},\"seed\":${SEED}}"
+SAMPLER="{\"type\":\"uniform_layer_sampler\",\"signal_type\":\"mlp\",\"layers\":[${LAYER}],\"signals_per_layer\":${N_NEURONS_CACHE},\"seed\":${SEED}}" # SAMPLER = {"type":"uniform_layer_sampler","signal_type":"mlp","layers":[LAYER],"signals_per_layer":10,"seed":21}
 
 ## ---- resolve this layer's neuron set ONCE (identical at every position) ----
 # generated, not run: it exists so resolution.py stays the single source of truth for
@@ -134,8 +134,8 @@ NEURONS=($(python -c "
 import json
 cfg = json.load(open('$CELL_CONFIG'))
 print(' '.join(f\"N{s['layer']}.{s['index']}\" for s in cfg['train_signals']))
-"))
-NEURON_LIST=$(IFS=,; echo "${NEURONS[*]}")
+")) # (N4.1013 N4.7742 ... )
+NEURON_LIST=$(IFS=,; echo "${NEURONS[*]}") # "N4.1013,N4.7742,..."
 echo "cell $CELL neurons: $NEURON_LIST"
 
 for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do

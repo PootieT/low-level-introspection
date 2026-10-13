@@ -55,6 +55,7 @@ from datasets import load_from_disk
 
 from src.introspector.config import ExperimentConfig, DatasetConfig
 from src.introspector.dataset_utils import apply_signal_filter, canonical_dataset_name
+from src.introspector.signals.schema import is_pair_selector
 
 # name -> how to load it. Dataset ids drift between releases; each corpus is attempted
 # independently and a failure is reported without taking the others down.
@@ -103,6 +104,10 @@ def build_shuffled_corpus(base_config: ExperimentConfig, out_path: Path, seed: i
 
 
 DEFAULT_N_TEST = 3000        # same size as the in-domain test split
+# PAIR MODE: a document carries every grid pair (135-527 prompts at n <= 32), so the
+# corpus is sized in documents x pairs, not documents. 300 documents x 527 pairs is
+# still ~160K prompts per corpus per eval pass.
+PAIR_MODE_N_TEST = 300
 
 
 def derive_config(base_config: ExperimentConfig, corpus: str, spec: dict,
@@ -116,10 +121,28 @@ def derive_config(base_config: ExperimentConfig, corpus: str, spec: dict,
     cfg = base_config.model_copy(deep=True)
     test = spec.copy()
     test.pop("shuffled", None)
+    floor = base_config.test_dataset.min_seq_length
+    pair_mode = is_pair_selector(base_config.train_token_selector)
+    if pair_mode:
+        # PAIR MODE (3-1) runs keep a 512-token floor so every eval length streams the
+        # same documents, but an OOD corpus is only read at the run's own length n. At
+        # 512 the shuffled control would be empty -- it is rebuilt from the cached test
+        # texts, which are n tokens long -- and the short-document corpora would starve.
+        # So the floor drops to n, on every split (cache_signals requires one floor).
+        floor = base_config.test_dataset.max_seq_length
+        n_test = PAIR_MODE_N_TEST
+        cfg.train_dataset = cfg.train_dataset.model_copy(update={"min_seq_length": floor})
+        cfg.dev_dataset = cfg.dev_dataset.model_copy(update={"min_seq_length": floor})
     cfg.test_dataset = DatasetConfig(
         name=test["name"], split=test["split"], text_field=test["text_field"],
         max_samples=n_test,
         max_seq_length=base_config.test_dataset.max_seq_length,
+        # Carry the length floor. Constructing a fresh DatasetConfig defaults it to None,
+        # which drops the run's floor -- for an attention signal that is fatal (its source
+        # offset needs documents of a guaranteed length, and cache_signals refuses the
+        # config), and for any run it silently changes which documents the OOD corpus
+        # contributes relative to the in-distribution split it is compared against.
+        min_seq_length=floor,
         hf_data_kwargs=test["hf_data_kwargs"],
     )
     # Dev is only built because cache_signals builds all three splits; nothing here

@@ -45,6 +45,17 @@ reuse — migrate a script into this directory rather than running it in place.
 | `sae/build_featgen_pool_layer9.sh` | the 200-feature layer-9 POOL for feature generalization: density band + >=50 positives at the 32-token readout, Neuronpedia labels, near-duplicate labels removed, judged features first |
 | `sae/cache_sae_feature_generalization.sh` + `sae/train_sae_feature_generalization.sh` (table in `sae/featgen_common.sh`) | SAE FEATURE GENERALIZATION: N in {1,3,10,30,100} layer-9 features at 300k total rows, label-prompt arm (tasks 1-5) then index-prompt control (6-10), plus the label arm at 100k rows per feature for N=10/30/100 (11-13); scored on all 200 pool features (seen / held out) + a steer x ask distractor matrix. Aggregate with `analysis/plot_sae_feature_generalization.py`; see `sae/README.md` section 8 |
 | `sae/score_sae_prompt_baseline.sh` | SAE PROMPTED BASELINE: the untrained gemma-2-2b over the grid's 48 (feature, position) runs + the 5 layer-9 runs, index and label prompts (`PROMPT=`); verbal@k (paraphrase-matched words), logit, probe@k with val-chosen thresholds, no-prompt control, learning curve, steering-scale sweep. `STAGE=cache` builds the 17 caches first. Aggregate with `analysis/plot_sae_prompt_baseline.py`; see `sae/README.md` section 9 |
+| `attention/train_single_attn_logit_introspector_endogenous_sweep_layer_srctoken.sh` | ATTENTION LOGIT grid: 8 layers x 10 source offsets x 8 heads x {gate on, off} = 1280 runs, destination pinned to the last token. `HEAD_SELECT=random` (default) samples 8 heads per layer; `HEAD_SELECT=fixed` pins (0 4 8 12 16 20 24 28) -- the same file is both experiments |
+| `attention/pilot/pilot_attn_logit_one_cell.sh` | **run this first.** One cell of the above at 3K samples / 2 heads, with a printed PASS/FAIL verdict on cache alignment, the injection-scale saturation table, and a wall-time extrapolation for sizing `h_rt` |
+| `attention_weight/1_scan.sh` | **run this first for `P`.** Measures the post-softmax weight over the WHOLE 16 layer x 32 head x 10 offset grid (one forward per batch) and recommends three cells -- low / mid / upper layer -- to train on. Writes nothing to `data/` |
+| `attention_weight/pilot/pilot_attn_weight_one_cell.sh` | the `P` pilot: one picked cell end to end, with verdicts on alignment, cached-target range, row-sum preservation, injection domain and saturation, plus `validate_attention_weights.py` |
+| `attention_weight/2_train_attn_weight_endogenous_picked_cells.sh` | ATTENTION WEIGHT, endogenous: 3 picked cells x 3 arms (gate off + KL 0.1, gate off unanchored, gate on) x 5 heads. `-t 1-3` |
+| `attention_weight/3_train_attn_weight_joint_weight_sweep.sh` | joint-loss weight `W` at the 3 picked cells x 6 weights x 5 heads = 90 runs; the `P` analogue of the neuron weight sweep, and what fixes `W` for stage 4. `-t 1-18` |
+| `attention_weight/4_train_attn_weight_interventional_picked_cells.sh` | interventional training at the chosen `W`, 3 cells x {KL 0.1, unanchored}. `-t 1-6` |
+| `attention_weight/L7H4M1/{1,2,4}_*.sh` | L7 h4 @-1 only, W in {0, .01, .03, .1, .3}, one head, Stage 3 settings otherwise. 1 = sigmoid head, 2 = training injection U(0,1) in probability space (`prob_uniform`), 4 = 1 + 2 + empirical eval. Shared body in `_common.sh`. `-t 1-5`; `SMOKE=1` for a 2000-row check |
+| `attention_weight/L7H4M1/3_empirical_logit_eval.sh` | no training: re-evaluates Stage 3's L7 h4 checkpoints with injection drawn from the cell's own log-odds histogram (`empirical_logit`). One job |
+| `attention_weight/7-0_cache_dst_src_grid_300K.sh` | builds the nine per-DESTINATION 300K/30K caches for 7-1 (3 pinned heads x every reachable source offset each) by running 7-1 with `CACHE_ONLY=1`. `-t 1-9` |
+| `attention_weight/7-1_train_dst_src_grid_endogenous_300K.sh` | (destination, source) PAIR GRID, endogenous, gate off unanchored: every `src <= dst` pair over absolute offsets {0 -1 -3 -7 -11 -15 -19 -23 -27 -31} (0 = last token, -31 = BOS) minus the constant (-31,-31) = 54 pairs x 3 pinned heads (L2 h20, L7 h9, L11 h25). Absolute dst `D` is token selector `D-1`, src `S` is `@(S-D)`. Holds on 7-0. `-t 1-54`; plot with `analysis/plot_attention_dst_src_grid.py` |
 
 Others are migrated as the experiment list for the paper firms up.
 
@@ -69,3 +80,105 @@ rate. The same conventions above apply, plus:
   undefined AP, not a bad one — filter on `base_rate_positive`.
 - **`score_lm_degradation.py` / `score_lighteval_benchmarks.py`** are signal-agnostic
   and apply unchanged, but only to **gate-off** checkpoints.
+
+## Attention-specific notes
+
+The signal is the PRE-SOFTMAX attention logit, `q.k/sqrt(d_head)` after RoPE and before
+the causal mask and the softmax, at one `(layer, head, destination token, source token)`
+cell. Signals are named **`A<layer>.<head>@<src_offset>`** (e.g. `A10.5@-3`), where the
+offset is the source token's distance behind the destination token and the destination
+comes from the token selector as usual. `P<layer>.<head>@<src>` is reserved for the
+post-softmax weight. The same conventions as above apply, plus:
+
+- **`--min-seq-length` must equal `--max-seq-length`** (32 in the sweep). The deepest
+  offset is meant to be BOS, and `sample_token_position` CLAMPS a destination that a
+  short document cannot support -- so without a floor, offset -31 silently resolves to
+  position 0 on a short document and to an ordinary token on a long one, and the
+  attention-sink measurement is right only by accident. `cache_signals.py` refuses an
+  attention config whose offsets the floor cannot honour. Note the neuron sweeps set no
+  floor, so the two families do not draw from an identical document population.
+- **`--signal-filter A<layer>.<head>@<src>` must include the offset.** A cell caches 8
+  heads at one offset and each run trains one of them; a filter without `@<src>` is
+  rejected rather than matching every offset in the cell.
+- **`--force-drift-eval` runs `measure_attention_alignment`**, the attention analogue of
+  the neuron drift check. Want best offset `+0`, corr ~0.9999, `alignment OK`. This is
+  the ONLY automatic check that the live logit is the quantity `cache_signals` wrote: a
+  failure here usually means caching and training ran under different attention
+  implementations (compare `capture.attn_implementation` in the cache's `metadata.json`)
+  or the `(dst, src)` pair is off by one.
+- **The attention implementation is chosen from the config's signal types**, not by a
+  flag: attention runs load with `attn_implementation="introspection_logit"` (an eager
+  variant carrying the read/write port), neuron and SAE runs keep loading under sdpa and
+  their numbers do not move. Both cache and trainer derive it the same way, so they
+  cannot disagree unless one of them is edited.
+- **`--intervention-extreme-scale` does not mean the same thing here.** `extreme` draws
+  uniformly from `scale x` the empirical RANGE, so a logit range of ~30 at scale 10
+  injects +/-150 -- past which the softmax saturates and different injected values give
+  the SAME forward pass, i.e. a value the model cannot report even in principle. At
+  `W=1.0` the flag is inert (no interventional training; `evaluate_interventional_test`
+  forces gaussian at scale 1.0) but it does reach `interventional_scale_sweep`. Read that
+  sweep before choosing a scale for any joint (`W<1`) follow-up.
+- **Reading the grid.** Layer 0 is a text-only CEILING CONTROL (its logit is a function of
+  embeddings and RoPE alone, hence determined by the two token strings the prompt already
+  names), and the BOS offset is a separate regime whose small variance can make corr
+  meaningless -- check the per-signal `std` in `dataset_signal_stats.json`.
+  `analysis/plot_attention_srctoken_sweep.py` marks both.
+- **Prompt ambiguity is measured, not assumed.** The prompt names the source token by
+  string only, so a token repeated in the 32-token context does not identify a position.
+  `cache_signals` records `src_token_unique_rate` in the cache metadata; split on it
+  rather than assuming the cost is zero.
+- The neuron analysis scripts parse `N<layer>.<index>` out of run names and skip
+  non-matching directories **without warning**, so they ignore attention runs. Use
+  `analysis/plot_attention_srctoken_sweep.py`, which owns its own pattern; do not widen
+  the neuron regexes in place.
+
+## Attention-weight (`P`) specifics, on top of the above
+
+The signal is the POST-SOFTMAX weight `p = softmax(z + mask)` at one
+`(layer, head, destination, source)` cell -- a probability, and a function of the WHOLE
+causal row rather than of two positions. Everything in the attention section still
+applies; these are the places where being a probability changes something.
+
+- **One custom attention implementation, two port sites.** `attn_implementation` is
+  `introspection_logit` for BOTH codes; the difference is which attribute the port is
+  installed under (`installed_ports(..., site="logit"|"weight")`). `port_site()` maps
+  signal type to site and is the single source of truth. Routing a `P` spec through the
+  logit port caches the PRE-softmax value under a `P` name and an "attention weight"
+  prompt, and **raises nothing** -- the trainer now asserts the cached activations lie in
+  [0,1] to catch exactly that.
+- **`--precision 6`, not 3.** A weight of 0.0014 renders as the string `"+0.001"` at
+  precision 3 and most cells collapse to `"+0.000"`. The regressor loss reads the float
+  `activation` column, so the headline result is unaffected either way, but any
+  generation-mode eval or `metrics.py` parsing path is silently gutted. Precision is part
+  of the cache identity, so this forks a fresh cache -- free for a new experiment, and it
+  must NOT be changed for the `A` runs, whose caches are already on disk.
+- **Intervention is a row RENORMALIZATION, not an overwrite.** Setting one cell to `t`
+  would leave the row summing to `1 - p_j + t`, which no logit row softmaxes to.
+  `AttentionWeightPort` scales the rest by `(1-t)/(1-p_j)`, which is provably identical
+  to shifting that cell's attention logit by `logit(t) - logit(p_j)` -- so `A` and `P`
+  intervene in the same way and their numbers are comparable.
+  `validate_attention_weights.py` checks that equality numerically; run it before
+  trusting any interventional `P` result.
+- **Injected values are drawn in LOG-ODDS space.** All three built-in distributions leave
+  `(0,1)`: `gaussian` on a mean-1e-3 cell draws negatives about half the time, and
+  `extreme` is not a probability at any scale. The trainer installs
+  `make_bounded_prob_intervention_fn`, which samples `u` and sets `t = sigmoid(u)`.
+  **`--scale-sweep` is therefore in log-odds units** (`1,2,4,8,16`), not the `A`
+  experiment's `1,3,10,30,100`. The sampler counts how often a draw hits its guard band,
+  because at a large scale a rising correlation can mean the model learned the clamp.
+- **KL only applies with the gate OFF**, and now says so. The anchor needs
+  `anchor_region_mask`, which only `UngatedCollator` emits; with the gate on the term is
+  dropped silently and the run still writes a directory named `_kl<budget>_`. It is also
+  vacuous there -- the gate pins text behaviour to the base model, so KL is 0 by
+  construction. Pass **`--require-kl-anchor`** on any arm that names a budget.
+- **`low_variance` is judged per signal code.** `A` uses an absolute std threshold (its
+  std is ~1.6); `P` uses the coefficient of variation plus a dead-cell floor on the mean,
+  because a weight's std is ~1e-4 and the absolute rule would flag every cell.
+- **Pick cells from the scan, do not sample them.** `scan_attention_weight_spread.py`
+  ranks all 5120 cells by spread. Measured on C4 at length 32: the BOS offset carries a
+  mean weight of ~0.65 against 0.005-0.07 elsewhere, and ~5% of cells are dead
+  (`p95 < 1e-3`). Both are reasons a randomly chosen cell is usually not worth training.
+- **Report Spearman next to Pearson.** `compute_metrics_from_numericals` now emits both.
+  The weight distribution is heavily right-skewed and both the loss (`_var_norm_mse`) and
+  Pearson are squared-scale, so a few large rows can decide the score; the gap between
+  the two correlations measures how much the tail is carrying.

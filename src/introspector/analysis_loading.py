@@ -44,14 +44,17 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import ExperimentConfig
 from .dataset_utils import apply_signal_filter
+from .models.attention_logits import is_attention_type
 from .run_discovery import find_checkpoint, resolve_locales, locale_tag, plan_locales
 from .training.collator import LoRAGatingCollator
 from .training.model import (
     IntrospectionRegressionModel,
     load_added_token_embeddings,
     load_regression_head,
+    logit_moments,
     replace_lora_with_gated_version,
     replace_model_with_gated_version,
+    signal_range_key,
 )
 
 
@@ -122,21 +125,39 @@ def _row_seed(ex) -> int:
 
 
 def compute_signal_ranges(raw) -> dict:
-    """{(layer, index): {min,max,mean,std}} from a cached split.
+    """{signal_range_key: {min,max,mean,std}} from a cached split.
 
     Taken from the TRAIN split by every caller, because that is the distribution the
     intervention sampler was configured against during training; using test stats
     would quietly change the injected values relative to what the run saw.
+
+    Keyed exactly as the model's sampler looks it up (signal_range_key): (layer, index)
+    for MLP/SAE, but (layer, head, source offset) for attention. A cell holds ten offsets
+    whose ranges differ by an order of magnitude between the BOS sink and a mid-context
+    token, and grouping on (layer, head) alone pools all ten into one range -- every
+    intervention would be drawn from the wrong distribution, silently, because the
+    resulting numbers are still plausible. For attention_weight the log-odds moments ride
+    along too: that signal lives in (0,1) and make_bounded_prob_intervention_fn samples
+    in log-odds space.
     """
-    # only the three columns the stats need: a cached split also carries `text` and
+    signal_type = raw[0]["signal_type"] if len(raw) else None
+    attention = is_attention_type(signal_type)
+    group_cols = ["signal_layer", "signal_index"] + (["src_offset"] if attention else [])
+    # only the columns the stats need: a cached split also carries `text` and
     # `text_input_ids`, and materializing those for 300k rows costs seconds and
     # hundreds of MB per run -- once per run, times every run in a sweep.
-    cols = [c for c in ("signal_layer", "signal_index", "activation") if c in raw.column_names]
+    cols = [c for c in group_cols + ["activation"] if c in raw.column_names]
     df = raw.select_columns(cols).to_pandas()
+    if attention:
+        assert "src_offset" in df and df["src_offset"].notna().all(), (
+            "attention rows without src_offset -- cache predates attention signals")
     ranges = {}
-    for key, vals in df.groupby(["signal_layer", "signal_index"])["activation"]:
-        ranges[key] = {"min": float(vals.min()), "max": float(vals.max()),
-                       "mean": float(vals.mean()), "std": float(vals.std())}
+    for key, vals in df.groupby(group_cols)["activation"]:
+        stats = {"min": float(vals.min()), "max": float(vals.max()),
+                 "mean": float(vals.mean()), "std": float(vals.std())}
+        if signal_type == "attention_weight":
+            stats.update(logit_moments(vals.tolist()))
+        ranges[signal_range_key(*key)] = stats
     return ranges
 
 

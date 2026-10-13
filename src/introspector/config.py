@@ -104,6 +104,8 @@ class TrainingConfig(BaseModel):
     # "uniform": U(min, max) of the neuron's empirical range
     # "gaussian": N(mean, std) fit to the neuron's empirical activations
     # "extreme": U over a range intervention_extreme_scale x wider than empirical (sanity check)
+    # "empirical_prob": one of the cell's own train-split attention weights, as-is
+    # (attention_weight only; train_introspector_joint.py)
     intervention_signal_distribution: str = "uniform"
     # how much wider than the empirical range to sample from when
     # intervention_signal_distribution == "extreme"
@@ -117,6 +119,14 @@ class TrainingConfig(BaseModel):
     intervention_anneal_schedule: str = "log"   # log | linear | cosine
     intervention_anneal_start_frac: float = 0.0
     intervention_anneal_end_frac: float = 1.0
+    # regression head: "identity" = linear (the default every earlier run used),
+    # "sigmoid" = logistic probe for probability targets (SigmoidRegressionHead)
+    regression_head_activation: str = "identity"
+    # regression loss, read ONLY by train_introspector_joint.py (other trainers refuse a
+    # non-default value): "var_norm_mse" = MSE / var(target), "norm_deviance" = the
+    # Bernoulli deviance KL(p||q) / KL(p||p_bar), for a sigmoid head on probability targets.
+    # Both read as ~1 - R^2, so a joint loss mixes them at a balance set by w, not by scale.
+    regression_loss: str = "var_norm_mse"
 
 
 class EvalConfig(BaseModel):

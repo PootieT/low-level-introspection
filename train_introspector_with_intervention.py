@@ -59,6 +59,7 @@ from src.introspector.config import ExperimentConfig
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
 from src.introspector.prompts import PROMPT_REGISTRY
 from src.introspector.training.collator import LoRAGatingCollator
+from src.introspector.training.pair_metrics import attach_provenance, write_pair_outputs
 from src.introspector.training.metrics import (
     compute_metrics,
     compute_metrics_from_numericals,
@@ -214,10 +215,14 @@ def evaluate_interventional_test(
     output_dir: str,
     distribution: str = "gaussian",
     suffix: str = "_gaussian",
+    provenance=None,
 ):
     """
     Evaluate the CURRENT (trained) regression head on the test split under
     intervention drawn from `distribution`.
+
+    `provenance` (PAIR MODE): per-row doc_index / *_token_unique aligned to
+    `eval_dataset`, joined into the predictions CSV (pair_metrics.attach_provenance).
 
     With distribution="gaussian" the injected values match the neuron's endogenous
     N(mean, std) -- i.e. the same range the model sees naturally. Because the
@@ -229,6 +234,13 @@ def evaluate_interventional_test(
     model.intervention_distribution = distribution
     model.intervention_scale = 1.0   # endogenous-matched, regardless of the annealed training scale
     model.seed_intervention_rng(config.seed)
+    # The bounded (attention_weight) sampler counts guard-band clamps. Reset and record
+    # them here: a corr computed on draws that mostly sat on the clamp measures "the model
+    # learned the clamp", and without the count that is indistinguishable from reading.
+    fn = getattr(model, "intervention_fn", None)
+    counts = hasattr(fn, "reset_counts")
+    if counts:
+        fn.reset_counts()
     X, y_inj = _extract_readout_features(model, eval_dataset, collator, config, do_intervention=True)
     model.intervention_distribution, model.intervention_scale = prev_dist, prev_scale
 
@@ -239,8 +251,14 @@ def evaluate_interventional_test(
     print(f"[interventional test eval | {distribution} injection] "
           f"corr={metrics['corr']:.4f}  l2={metrics['l2_dist']:.4f}")
 
+    record = {"distribution": distribution, "test": metrics}
+    if counts:
+        record.update({"n_drawn": fn.n_drawn, "n_clamped": fn.n_clamped,
+                       "clamped_frac": fn.n_clamped / max(fn.n_drawn, 1)})
+        print(f"[interventional test eval | {distribution}] clamped "
+              f"{fn.n_clamped}/{fn.n_drawn} draws")
     with open(str(Path(output_dir) / f"interventional_test_metrics{suffix}.json"), "w") as f:
-        json.dump({"distribution": distribution, "test": metrics}, f, indent=2)
+        json.dump(record, f, indent=2)
     df = pd.DataFrame({"predictions": pred.numpy(), "injected": y_inj.numpy()})
     # Position provenance, so a length-generalization run can bin this by how far back
     # the introspected token sat. _extract_readout_features iterates with shuffle=False,
@@ -259,6 +277,18 @@ def evaluate_interventional_test(
         if "frozen_input_len" in cols:
             df["text_len"] = list(eval_dataset["frozen_input_len"])
             df["distance_from_end"] = df["text_len"] - 1 - df["token_position"]
+        # attention: the source too (in pair mode it differs on every row)
+        if "src_token_position" in cols:
+            df["src_token_position"] = list(eval_dataset["src_token_position"])
+            df["src_offset"] = df["src_token_position"] - df["token_position"]
+    df = attach_provenance(df, provenance)
+    pair_summary = write_pair_outputs(
+        df, "predictions", "injected", model,
+        Path(output_dir) / f"interventional_test_by_pair{suffix}.csv")
+    if pair_summary is not None:
+        record["pairs"] = pair_summary
+        with open(str(Path(output_dir) / f"interventional_test_metrics{suffix}.json"), "w") as f:
+            json.dump(record, f, indent=2)
     df.to_csv(str(Path(output_dir) / f"interventional_test_predictions{suffix}.csv"), index=False)
     plt.figure()
     sns.scatterplot(data=df, x="injected", y="predictions")
@@ -492,6 +522,11 @@ def main():
     args = parse_args()
 
     config = ExperimentConfig.model_validate_json(args.config.read_text())
+    # this trainer always takes the model's plain MSE; a config asking for another loss
+    # would otherwise train on MSE and be reported as if it had not
+    if config.training_config.regression_loss != "var_norm_mse":
+        raise ValueError(f"regression_loss {config.training_config.regression_loss!r} is only "
+                         f"implemented in train_introspector_joint.py")
 
     cache_dir = config.dataset_cache_dir
     train_path = cache_dir / "train"

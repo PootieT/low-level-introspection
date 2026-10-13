@@ -34,8 +34,10 @@ from src.introspector.utils import int_or_str
 from src.introspector.dataset_utils import canonical_dataset_name, parse_signal_filters
 from src.introspector.config import DatasetConfig, ExperimentConfig, TrainingConfig, EvalConfig
 from src.introspector.signals.schema import ExplicitSignalSpec, FixedTokenSelector, RandomRangeTokenSelector, \
-    ExplicitSignalSpec, UniformLayerSampler, SignalSource
+    RandomPairTokenSelector, PairListTokenSelector, \
+    ExplicitSignalSpec, UniformLayerSampler, AttentionLayerSampler, SignalSource
 from src.introspector.signals.resolution import resolve_signal_source
+from src.introspector.signals.pair_grid import pair_grid
 
 
 def parse_args() -> argparse.Namespace:
@@ -163,13 +165,24 @@ def parse_args() -> argparse.Namespace:
                              "--max-seq-length. 30 fits the index prompts; a label prompt needs "
                              "room for the label.")
     parser.add_argument("--intervention-signal-distribution", type=str, default="uniform",
-                        choices=["uniform", "gaussian", "extreme", "empirical"],
+                        choices=["uniform", "gaussian", "extreme", "empirical", "prob_uniform",
+                                 "empirical_prob"],
                         help="Distribution to sample the injected value from at intervention time. "
                              "'uniform' draws U(min, max); 'gaussian' fits N(mean, std) to the neuron's "
                              "empirical activations (better matches the real, skewed activation distribution); "
                              "'extreme' draws uniformly from a range intervention-extreme-scale x wider than "
                              "the empirical range (sanity check: does an exaggerated signal force the model "
-                             "to learn to read it).")
+                             "to learn to read it). 'empirical_prob' (attention_weight, joint trainer "
+                             "only) draws one of the cell's own train-split weights as-is.")
+    parser.add_argument("--regression-head-activation", type=str, default="identity",
+                        choices=["identity", "sigmoid"],
+                        help="'sigmoid' => logistic probe sigmoid(Wh+b) for probability targets "
+                             "(attention_weight). 'identity' is the linear head every earlier run used.")
+    parser.add_argument("--regression-loss", type=str, default="var_norm_mse",
+                        choices=["var_norm_mse", "norm_deviance"],
+                        help="Joint trainer only. 'var_norm_mse' = MSE / var(target) (every earlier "
+                             "run). 'norm_deviance' = KL(p||q) / KL(p||p_bar), the Bernoulli deviance "
+                             "normalized by the null model's; needs --regression-head-activation sigmoid.")
     parser.add_argument("--intervention-extreme-scale", type=float, default=1000.0,
                         help="Multiplier on the empirical range width used when "
                              "--intervention-signal-distribution=extreme. Sweep this to find where the "
@@ -224,26 +237,50 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Sampler classes by their `type` discriminator. Dispatching through a table instead of
+# an if/else on "explicit" means adding a sampler is one entry here, and an unknown type
+# fails with a list of what IS supported rather than a pydantic error about the fields of
+# whichever class the else-branch happened to pick.
+_SIGNAL_SOURCE_BY_TYPE = {
+    "explicit": ExplicitSignalSpec,
+    "uniform_layer_sampler": UniformLayerSampler,
+    "attention_layer_sampler": AttentionLayerSampler,
+}
+
+
+def _validate_signal_source(spec_dict: dict):
+    kind = spec_dict.get("type")
+    if kind not in _SIGNAL_SOURCE_BY_TYPE:
+        raise ValueError(
+            f"Unknown signal source type {kind!r}; expected one of "
+            f"{sorted(_SIGNAL_SOURCE_BY_TYPE)}.")
+    return _SIGNAL_SOURCE_BY_TYPE[kind].model_validate(spec_dict)
+
+
 def load_spec(value: str):
     if value.endswith(".json"):
-        spec_dict= json.loads(Path(value).read_text())
-        return ExplicitSignalSpec.model_validate(spec_dict) if spec_dict["type"]=="explicit" else UniformLayerSampler.model_validate(spec_dict)
+        return _validate_signal_source(json.loads(Path(value).read_text()))
     else:
         try:
             spec_dict = json.loads(value)
-            return SignalSource.model_validate(spec_dict) if spec_dict["type"]=="explicit" else UniformLayerSampler.model_validate(spec_dict)
         except json.decoder.JSONDecodeError:
             print(f"{value} is not a valid JSON, assuming it is a single signal or comma separated list of signals.")
             if any(s in value for s in ["[", "{","t"]):
                 raise ValueError(f"Not a comma separated list: {value}")
             return ExplicitSignalSpec(type="explicit", signals=value.split(","))
+        return _validate_signal_source(spec_dict)
 
 def load_token_selector(value: Union[int,str]):
     if isinstance(value, int):
         return FixedTokenSelector(type="fixed", position=value)
-    else:
-        start, stop = value.split(":")
-        return RandomRangeTokenSelector(type="random_range", start=start, stop=stop)
+    # PAIR MODE (experiment 3-1): "random_pair" draws one (dst, src) pair per document;
+    # "pair_grid:<m>" evaluates the fixed grid of eval length m (signals/pair_grid.py).
+    if value == "random_pair":
+        return RandomPairTokenSelector()
+    if value.startswith("pair_grid:"):
+        return PairListTokenSelector(pairs=list(pair_grid(int(value.split(":", 1)[1]))))
+    start, stop = value.split(":")
+    return RandomRangeTokenSelector(type="random_range", start=start, stop=stop)
 
 def main() -> None:
     args = parse_args()
@@ -328,6 +365,8 @@ def main() -> None:
             intervention_anneal_schedule=args.intervention_anneal_schedule,
             intervention_anneal_start_frac=args.intervention_anneal_start_frac,
             intervention_anneal_end_frac=args.intervention_anneal_end_frac,
+            regression_head_activation=args.regression_head_activation,
+            regression_loss=args.regression_loss,
             learning_rate=args.learning_rate,
             warmup_ratio=args.warmup_ratio,
             lr_scheduler_type=args.lr_scheduler_type,
