@@ -30,6 +30,7 @@ import re
 import sys
 import json
 import glob
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -50,7 +51,15 @@ KL_RE = re.compile(r"_kl(?P<kl>[0-9.]+)")
 POS_RE = re.compile(r"POS(?P<pos>-?\d+)")
 GATE_RE = re.compile(r"gate(?P<gate>on|off)")
 W_RE = re.compile(r"_w(?P<w>[0-9.]+)")
-NEURON_RE = re.compile(r"N(?P<layer>\d+)\.(?P<index>\d+)")
+# Every signal family, not just MLP neurons: N = MLP neuron, A = attention logit,
+# P = attention weight, S = SAE feature. The attention families add `@<src offset>`, and
+# that offset is part of the cell identity -- two offsets in the same head are two
+# different signals. Widened rather than left MLP-only because this regex is OPTIONAL
+# below (the row keeps `signal=None` on a miss) rather than a filter, so an attention
+# sweep did not get skipped here, it got silently merged: every run collapsed to the one
+# cell label "None POS-1" and the frontier averaged 6 cells x 3 arms into a single curve.
+SIGNAL_RE = re.compile(r"(?P<code>[NAPS])(?P<layer>\d+)\.(?P<index>\d+)"
+                       r"(?:@(?P<src>-?\d+))?")
 TRAIN_LEN = 32          # the length the anchor is applied at during training
 
 
@@ -58,7 +67,12 @@ def load_kl_sweep(exp_group: str, gate="off", position=None, exclude=("lrcos",))
     """One row per run. Runs without a _kl tag are the UNANCHORED control and are kept
     with kl_target = inf, since they anchor the right-hand end of the frontier."""
     rows, skipped = [], []
-    for d in sorted(Path(f"{ROOT}/outputs/runs/{exp_group}").iterdir()):
+    group_dir = Path(f"{ROOT}/outputs/runs/{exp_group}")
+    if not group_dir.is_dir():
+        raise SystemExit(f"No run group at {group_dir}. Pass --exp-group with one of: "
+                         + ", ".join(sorted(p.name for p in (ROOT / "outputs/runs").iterdir()
+                                            if p.is_dir())))
+    for d in sorted(group_dir.iterdir()):
         if not d.is_dir() or any(x in d.name for x in exclude):
             continue
         g, p = GATE_RE.search(d.name), POS_RE.search(d.name)
@@ -82,14 +96,20 @@ def load_kl_sweep(exp_group: str, gate="off", position=None, exclude=("lrcos",))
             skipped.append((d.name, "missing introspection metrics"))
             continue
 
-        m_kl, m_n, m_w = KL_RE.search(d.name), NEURON_RE.search(d.name), W_RE.search(d.name)
+        m_kl, m_n, m_w = KL_RE.search(d.name), SIGNAL_RE.search(d.name), W_RE.search(d.name)
+        signal = None
+        if m_n:
+            signal = f"{m_n['code']}{m_n['layer']}.{m_n['index']}"
+            if m_n["src"] is not None:
+                signal += f"@{m_n['src']}"
         row = {
             "run": d.name,
             "kl_target": float(m_kl["kl"]) if m_kl else np.inf,   # inf == unanchored
             "anchored": bool(m_kl),
             "position": int(p["pos"]) if p else None,
             "gate": g["gate"] if g else None,
-            "neuron": f"N{m_n['layer']}.{m_n['index']}" if m_n else None,
+            "signal": signal,
+            "neuron": signal,          # back-compat: the old column name, same value
             "w": float(m_w["w"]) if m_w else None,
             "interventional_corr": interv.get("corr"),
             "endogenous_corr": endo.get("corr"),
@@ -108,6 +128,10 @@ def load_kl_sweep(exp_group: str, gate="off", position=None, exclude=("lrcos",))
                 if entry.get("ppl_base"):
                     row[f"ppl_ratio@{L}"] = entry["ppl_tuned"] / entry["ppl_base"]
         else:
+            # Not necessarily an error. The attention-weight Stage 2 script scores the
+            # unanchored arm on two heads (its measured KL is the result, so it needs an
+            # error bar) and the anchored arm on one, so most gate-off runs legitimately
+            # have no lm_degradation.json.
             skipped.append((d.name, "no lm_degradation.json -- run score_lm_degradation.py"))
         rows.append(row)
 
@@ -116,7 +140,12 @@ def load_kl_sweep(exp_group: str, gate="off", position=None, exclude=("lrcos",))
     df = pd.DataFrame(rows).sort_values("kl_target").reset_index(drop=True)
     if df.empty:
         raise SystemExit(f"No runs matched under outputs/runs/{exp_group} (gate={gate}).")
-    df["cell"] = df["neuron"].astype(str) + " POS" + df["position"].astype(str)
+    if df["signal"].isna().all():
+        raise SystemExit(
+            f"No run name under outputs/runs/{exp_group} carries a signal tag "
+            f"(N/A/P/S<layer>.<index>). Every row would collapse into one cell and the "
+            f"frontier would average unrelated signals into a single curve.")
+    df["cell"] = df["signal"].astype(str) + " POS" + df["position"].astype(str)
     if "kl@32" in df:
         no_kl = sorted(df[df["kl@32"].isna()]["cell"].unique())
         if no_kl:
@@ -420,11 +449,28 @@ def report(df, length=TRAIN_LEN):
                   + (f", top-1 {knee[top1]:.3f}" if top1 in knee else ""))
 
 
+def parse_args():
+    """Defaults reproduce the pre-CLI behaviour exactly, so the neuron figures keep
+    regenerating from a bare `python analysis/plot_kl_tradeoff.py`."""
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--exp-group", default="mlp_joint_prev_token_hyper",
+                    help="run group under outputs/runs/")
+    # the anchor only applies where the adapter touches the text, so gate on has nothing
+    # to measure: KL there is 0 by construction, not by optimization
+    ap.add_argument("--gate", default="off", choices=("on", "off"))
+    ap.add_argument("--position", type=int, default=None,
+                    help="restrict to one destination position (default: all cells)")
+    ap.add_argument("--out-dir", default=None,
+                    help="default outputs/plots/<exp-group>")
+    return ap.parse_args()
+
+
 if __name__ == "__main__":
-    EXP_GROUP = "mlp_joint_prev_token_hyper"
-    GATE = "off"            # the anchor only applies where the adapter touches the text
-    POSITION = None         # all cells; set an int to restrict
-    OUT_DIR = f"{ROOT}/outputs/plots/{EXP_GROUP}"
+    args = parse_args()
+    EXP_GROUP = args.exp_group
+    GATE = args.gate
+    POSITION = args.position
+    OUT_DIR = args.out_dir or f"{ROOT}/outputs/plots/{EXP_GROUP}"
     os.makedirs(OUT_DIR, exist_ok=True)
 
     df = load_kl_sweep(EXP_GROUP, gate=GATE, position=POSITION)

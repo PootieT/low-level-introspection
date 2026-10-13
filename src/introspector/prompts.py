@@ -17,6 +17,21 @@ def _display_token_index(token_index: int) -> int:
     return max(0, int(token_index) - BOS_OFFSET)
 
 
+def _pick_template(templates, template_idx):
+    """Draw a template, or take a pinned one.
+
+    `None` keeps `random.choice` -- byte-identical to what every prompt family did before
+    pinning existed, so no cached dataset or trained run changes. An explicit index is
+    for analyses that average over examples position by position.
+    """
+    if template_idx is None:
+        return random.choice(templates)
+    if not 0 <= template_idx < len(templates):
+        raise ValueError(
+            f"template_idx {template_idx} out of range for {len(templates)} templates")
+    return templates[template_idx]
+
+
 def mlp_prompt_with_token_index(
     layer: int,
     signal_index: int,
@@ -96,17 +111,24 @@ def attention_weight_prompt(
     signal_index: int,
     src_token: str,
     dst_token: str,
+    template_idx: int | None = None,
 ) -> str:
     """Post-softmax counterpart of attention_score_prompt. Worded as a *weight* (a
     probability), not a score, so the two signal types are not asked for in the same
-    words -- a model trained on one should not be able to mistake it for the other."""
+    words -- a model trained on one should not be able to mistake it for the other.
+
+    `template_idx` pins the wording instead of drawing it. Training leaves it None and
+    keeps drawing at random; ATTRIBUTION sets it, because an averaged per-token
+    attribution map needs the same token index to mean the same word in every example,
+    and four templates of different lengths put different words at the same offset.
+    """
     templates = [
         'At token "{DST_TOKEN}", the attention weight for head {HEAD} at layer {LAYER} on token "{SRC_TOKEN}" is',
         'The attention weight for head {HEAD} at layer {LAYER}, from token "{DST_TOKEN}" to token "{SRC_TOKEN}", is',
         'Attention head {LAYER}.{HEAD} at token "{DST_TOKEN}", attending to token "{SRC_TOKEN}", has attention weight of',
         'Head {HEAD} at layer {LAYER} puts, at token "{DST_TOKEN}", an attention weight on token "{SRC_TOKEN}" of',
     ]
-    return random.choice(templates).format(
+    return _pick_template(templates, template_idx).format(
         SRC_TOKEN=src_token, HEAD=signal_index, LAYER=layer, DST_TOKEN=dst_token,
     )
 

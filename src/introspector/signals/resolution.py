@@ -16,8 +16,11 @@ from .schema import (
 # `signal[1:].split(".")`, which assumed exactly two dot-separated parts and blew up with
 # an unhelpful unpack error on anything richer.
 _SIGNAL_RE = re.compile(
-    r"^(?P<code>[NARSP])(?P<layer>\d+)\.(?P<index>\d+)(?:@(?P<src>[+-]?\d+))?$"
+    r"^(?P<code>[NARSP])(?P<layer>\d+)\.(?P<index>\d+)(?:@(?P<src>[+-]?\d+|pairs))?$"
 )
+# "@pairs": PAIR MODE. The spec names only (layer, head); the (dst, src) pair of each row
+# comes from a pair token selector (see schema.RandomPairTokenSelector).
+PAIRS_SUFFIX = "pairs"
 
 _CODE_TO_SPEC = {
     "N": MLPNeuronSpec,
@@ -38,6 +41,8 @@ def parse_signal(signal: str, precision: int) -> SignalSpec:
       N10.24     MLP neuron 24 at layer 10
       A10.5@-3   attention logit, layer 10 head 5, source 3 tokens before the destination
       P10.5@0    post-softmax attention weight, layer 10 head 5, source == destination
+      P6.3@pairs post-softmax attention weight, layer 6 head 3, (dst, src) from the
+                 pair token selector, one pair per row (PAIR MODE)
       S9.12102   SAE feature (identity fields take SAEFeatureSpec defaults)
 
     This is user input (CLI / config), so failures raise rather than assert.
@@ -52,7 +57,12 @@ def parse_signal(signal: str, precision: int) -> SignalSpec:
     layer, index, src = int(m.group("layer")), int(m.group("index")), m.group("src")
     if code in ATTENTION_CODES:
         # src is optional so a bare "A10.5" still parses, taking the spec default.
-        kwargs = {} if src is None else {"src_offset": int(src)}
+        if src is None:
+            kwargs = {}
+        elif src == PAIRS_SUFFIX:
+            kwargs = {"src_offset": None}
+        else:
+            kwargs = {"src_offset": int(src)}
         return _CODE_TO_SPEC[code](layer=layer, index=index, precision=precision, **kwargs)
     if src is not None:
         raise ValueError(

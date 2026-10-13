@@ -19,7 +19,9 @@ python scripts/cache_signals.py \
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+from collections import Counter
 import operator
 import pdb
 import random
@@ -29,7 +31,7 @@ from pathlib import Path
 from typing import Any, List, Dict
 
 from tqdm import tqdm
-from datasets import Dataset, load_dataset
+from datasets import Dataset, concatenate_datasets, load_dataset
 from nnsight import LanguageModel
 import torch
 import transformers
@@ -44,14 +46,18 @@ from src.introspector.models.signal_paths import (
     resolve_mlp_signal_path, resolve_resid_signal_path, resolve_sae_hook_path,
 )
 from src.introspector.models.attention_logits import (
-    AttentionLogitPort, attention_model_kwargs, fan_out_ports, installed_ports,
-    is_attention_type,
+    AttentionCellGridTap, AttentionLogitPort, AttentionWeightPort, attention_model_kwargs,
+    fan_out_ports, installed_ports, is_attention_type, port_site,
 )
 from src.introspector.prompts import PROMPT_REGISTRY
-from src.introspector.signals.schema import SignalSpec, TokenSelector
+from src.introspector.signals.schema import SignalSpec, TokenSelector, is_pair_selector
+from src.introspector.signals.pair_grid import all_pairs
 from src.introspector.signals.sae import load_sae
 from src.introspector.utils import get_quantization_config, float_to_str_target
 
+
+# build_split flushes accumulated rows to an Arrow chunk at this size (see there).
+ROWS_PER_CHUNK = 200_000
 
 # One SAE per (release, site, width, layer), loaded lazily and reused across
 # batches. Keyed off the SAEFeatureSpec so different SAEs never get mixed up.
@@ -140,6 +146,7 @@ def extract_activations_batch(
     signal_specs: List[SignalSpec],
     batch_token_positions: List[int],
     seq_lens=None,
+    batch_src_positions: List[int] | None = None,
 ) -> Dict[SignalSpec, List[float]]:
     """
     Extract internal signals using NNsight.
@@ -150,6 +157,8 @@ def extract_activations_batch(
         for attention signals).
     :param seq_lens: unpadded length per example; required when attention signals are
         present, to bound-check the source positions.
+    :param batch_src_positions: PAIR MODE only (specs with src_offset=None): the absolute
+        SOURCE position per example, shared by every attention spec of the batch.
     :return: Extracted signals.
     """
     signal_activations = {}
@@ -164,12 +173,36 @@ def extract_activations_batch(
     # ports. They all read the same [B, Hq, L, L] tensor that the single forward already
     # computes, so k costs k gathers, not k forwards -- which is what makes caching a
     # whole cell (8 heads x 10 offsets) as cheap as caching one signal.
-    att_ports = {}   # spec -> AttentionLogitPort
+    #
+    # SPLIT BY SITE. attention_score lives before the mask and the softmax,
+    # attention_weight after both, so they are two different tensors at two different
+    # points of the same forward and need two port families on two attributes. Grouping
+    # them by `is_attention_type` alone -- which is what this did before P was wired --
+    # sends a `P` spec through AttentionLogitPort and caches the PRE-softmax value under
+    # a `P` name with an "attention weight" prompt. Nothing raises; the dataset is just
+    # the wrong quantity. `port_site` is the single source of truth for the mapping.
+    att_ports = {"logit": {}, "weight": {}}   # site -> {spec: port}
+    _PORT_CLS = {"logit": AttentionLogitPort, "weight": AttentionWeightPort}
     if att_signal_specs:
         assert seq_lens is not None, "attention signals need seq_lens for bound checks"
         for spec in att_signal_specs:
-            src = attention_src_positions(spec, batch_token_positions, seq_lens)
-            att_ports[spec] = AttentionLogitPort(
+            if spec.src_offset is None:
+                # PAIR MODE: the source is per row, not dst + a fixed offset.
+                assert batch_src_positions is not None, (
+                    f"{spec} is a pair-mode spec but no batch_src_positions were given")
+                src = list(batch_src_positions)
+                assert len(src) == bs, f"{len(src)} src positions for a batch of {bs}"
+                for i, (s_pos, dst, seq_len) in enumerate(
+                        zip(src, batch_token_positions, seq_lens)):
+                    assert 0 <= s_pos <= dst < int(seq_len), (
+                        f"pair out of range for example {i}: src={s_pos}, dst={dst}, "
+                        f"seq_len={int(seq_len)}")
+            else:
+                assert batch_src_positions is None, (
+                    f"{spec} has a fixed src_offset but per-row src positions were given")
+                src = attention_src_positions(spec, batch_token_positions, seq_lens)
+            site = port_site(spec.type)
+            att_ports[site][spec] = _PORT_CLS[site](
                 heads=torch.full((bs,), spec.index, dtype=torch.long),
                 dst=torch.tensor(batch_token_positions, dtype=torch.long),
                 src=torch.tensor(src, dtype=torch.long),
@@ -185,9 +218,16 @@ def extract_activations_batch(
 
     # ports are keyed by layer, but several specs can share a layer, so wrap the
     # per-layer port in a fan-out that feeds each spec's own port.
-    layer_ports = fan_out_ports(att_ports)
+    # Two managers, one per site. An empty dict attaches nothing, so a run with no
+    # weight signals (every MLP, SAE and attention_score run that exists today) enters
+    # and leaves the second manager without touching the model.
+    logit_layer_ports = fan_out_ports(att_ports["logit"])
+    weight_layer_ports = fan_out_ports(att_ports["weight"])
 
-    with torch.no_grad(), installed_ports(model, layer_ports), model.trace(batch_tokens):
+    with torch.no_grad(), \
+         installed_ports(model, logit_layer_ports, site="logit"), \
+         installed_ports(model, weight_layer_ports, site="weight"), \
+         model.trace(batch_tokens):
         for layer in range(model.config.num_hidden_layers): # TODO llama3 path here, not sure for others
             # extract MLPs
             if mlp_signal_specs:
@@ -237,12 +277,14 @@ def extract_activations_batch(
                 acts = feats_at_tok[:, signal_spec.index]
                 signal_activations[signal_spec] = acts.float().cpu().tolist()
 
-    for spec, port in att_ports.items():
-        assert port.read is not None, (
-            f"port for {spec} never fired -- the model is not running the introspection "
-            f"attention implementation, so nothing was captured")
-        assert len(port.read) == bs, f"port read {len(port.read)} values, expected {bs}"
-        signal_activations[spec] = port.read.cpu().tolist()
+    # both sites, or a P run would report "never fired" for signals nobody collected
+    for site, ports in att_ports.items():
+        for spec, port in ports.items():
+            assert port.read is not None, (
+                f"{site} port for {spec} never fired -- the model is not running the "
+                f"introspection attention implementation, so nothing was captured")
+            assert len(port.read) == bs, f"port read {len(port.read)} values, expected {bs}"
+            signal_activations[spec] = port.read.cpu().tolist()
 
     return signal_activations
 
@@ -253,6 +295,7 @@ def create_batch_example(
     token_selector: TokenSelector,
     model: LanguageModel,
     max_seq_length: int = 512,
+    doc_offset: int = 0,
 ) -> List[dict[str, Any]]:
     """
     Create a single example of (text, signal, token_position, value)
@@ -261,17 +304,37 @@ def create_batch_example(
     :param token_selector: how to pick which token(s) to use
     :param model: NNsight model wrapper
     :param max_seq_length: maximum sequence length
+    :param doc_offset: index of texts[0] within its split, recorded as `doc_index`
     :return:
     """
+    if token_selector.type == "pair_list":
+        return create_pair_list_examples(texts, signals, token_selector, model,
+                                         max_seq_length, doc_offset)
     encoded = model.tokenizer(texts, truncation=True, padding=True, return_tensors="pt", max_length=max_seq_length, padding_side="right")
     seq_lens = encoded["attention_mask"].sum(1)
-    batch_token_positions = [sample_token_position(seq_len=l, token_selector=token_selector) for l in seq_lens]
+    batch_src_positions = None
+    if token_selector.type == "random_pair":
+        # PAIR MODE training rows: one (dst, src) pair per document, uniform over all
+        # causal pairs except (0, 0), SHARED by every signal of the document so the three
+        # heads of a cell see the same pairs. Every document is exactly max_seq_length
+        # tokens (validate_attention_offsets requires min_seq_length >= max_seq_length),
+        # so the pair set is the same for all of them -- asserted, because a short
+        # document would silently draw from a smaller set and skew the dst distribution.
+        assert bool((seq_lens == max_seq_length).all()), (
+            f"random_pair needs every document at exactly {max_seq_length} tokens, got "
+            f"lengths {sorted(set(seq_lens.tolist()))}")
+        pairs = [random.choice(all_pairs(int(l))) for l in seq_lens]
+        batch_token_positions = [d for d, _ in pairs]
+        batch_src_positions = [src for _, src in pairs]
+    else:
+        batch_token_positions = [sample_token_position(seq_len=l, token_selector=token_selector) for l in seq_lens]
     signals_activations = extract_activations_batch(
         model=model,
         batch_tokens=encoded,
         signal_specs=signals,
         batch_token_positions=batch_token_positions,
         seq_lens=seq_lens,
+        batch_src_positions=batch_src_positions,
     )
     out = []
 
@@ -285,23 +348,37 @@ def create_batch_example(
         # Duplicated across a text's signal rows -- a few hundred bytes/row, worth it
         # against the cost of an undetected off-by-one.
         row_input_ids = encoded["input_ids"][data_idx][:int(seq_lens[data_idx])].tolist()
+        id_counts = Counter(row_input_ids)
         for signal in signals:
             token_position = batch_token_positions[data_idx]
             token_str = model.tokenizer.decode(encoded["input_ids"][data_idx][token_position], clean_up_tokenization_spaces=False)
             # SOURCE token, attention signals only. `token_position`/`token` keep meaning
             # the DESTINATION for every signal type, so nothing that reads them changes.
-            # The three columns are emitted on EVERY row (None for non-attention): rows
+            # The columns are emitted on EVERY row (None for non-attention): rows
             # of one Dataset.from_list must share a key set or Arrow's schema inference
             # breaks, and nothing on the MLP path reads them.
-            src_offset = getattr(signal, "src_offset", None) if is_attention_type(signal.type) else None
-            if src_offset is None:
-                src_position, src_token_str = None, None
+            if not is_attention_type(signal.type):
+                src_offset = src_position = src_token_str = None
+                dst_unique = src_unique = None
             else:
-                src_position = token_position + src_offset
+                if batch_src_positions is not None:
+                    # pair mode: the row's REALIZED offset, so offset-keyed readers
+                    # (report_signal_statistics, the alignment check) still see one
+                    src_position = batch_src_positions[data_idx]
+                    src_offset = src_position - token_position
+                else:
+                    src_offset = signal.src_offset
+                    src_position = token_position + src_offset
                 src_token_str = model.tokenizer.decode(
                     encoded["input_ids"][data_idx][src_position], clean_up_tokenization_spaces=False)
+                # PROMPT AMBIGUITY: the prompt names both tokens by string only, so a
+                # token that occurs more than once in the text does not say which
+                # occurrence is meant. Recorded per row so the analysis can split on it.
+                dst_unique = id_counts[row_input_ids[token_position]] == 1
+                src_unique = id_counts[row_input_ids[src_position]] == 1
             out.append({
                 "text": truncated_texts[data_idx],
+                "doc_index": doc_offset + data_idx,
                 "signal_type": signal.type,
                 "signal_layer": signal.layer,
                 "signal_index": signal.index,
@@ -310,11 +387,103 @@ def create_batch_example(
                 "src_offset": src_offset,
                 "src_token_position": src_position,
                 "src_token": src_token_str,
+                "dst_token_unique": dst_unique,
+                "src_token_unique": src_unique,
                 "text_input_ids": row_input_ids,
                 "activation": signals_activations[signal][data_idx],
                 "target": float_to_str_target(signals_activations[signal][data_idx], signal.precision) #f"{'+' if signals_activations[signal][data_idx]>0 else ''}{signals_activations[signal][data_idx]:.{signal.precision}f}",
             })
 
+    return out
+
+
+def extract_attention_grid(model, batch_tokens, signal_specs, pairs, seq_lens) -> dict:
+    """{spec: [B][P] values}: every (dst, src) of `pairs` for every pair-mode spec, read
+    out of ONE forward pass by one AttentionCellGridTap per (site, layer).
+
+    Runs the dispatched HF module directly rather than through model.trace: the taps do
+    all the reading, so there is nothing for an nnsight trace body to do, and an empty
+    traced block is not something nnsight's source tracing is guaranteed to accept.
+    """
+    assert signal_specs, "no signals"
+    for spec in signal_specs:
+        assert is_attention_type(spec.type) and spec.src_offset is None, (
+            f"pair_list caches hold pair-mode attention specs only (e.g. 'P6.3@pairs'), "
+            f"got {spec}")
+    max_d = max(d for d, _ in pairs)
+    assert int(seq_lens.min()) > max_d, (
+        f"a document has {int(seq_lens.min())} tokens but the grid reaches dst={max_d}")
+    dst = torch.tensor([d for d, _ in pairs], dtype=torch.long)       # [P]
+    src = torch.tensor([s_ for _, s_ in pairs], dtype=torch.long)     # [P]
+
+    groups: dict = {}                                    # (site, layer) -> sorted heads
+    for spec in signal_specs:
+        groups.setdefault((port_site(spec.type), spec.layer), set()).add(spec.index)
+    groups = {k: sorted(v) for k, v in groups.items()}
+    taps = {"logit": {}, "weight": {}}                   # site -> {layer: tap}
+    for (site, layer), heads in groups.items():
+        taps[site][layer] = AttentionCellGridTap(torch.tensor(heads, dtype=torch.long), dst, src)
+
+    with torch.no_grad(), \
+         installed_ports(model, taps["logit"], site="logit"), \
+         installed_ports(model, taps["weight"], site="weight"):
+        hf = model._model
+        hf(input_ids=batch_tokens["input_ids"].to(hf.device),
+           attention_mask=batch_tokens["attention_mask"].to(hf.device))
+
+    bs = int(batch_tokens["input_ids"].shape[0])
+    out = {}
+    for spec in signal_specs:
+        site = port_site(spec.type)
+        tap = taps[site][spec.layer]
+        assert tap.read is not None, (
+            f"{site} grid tap for {spec} never fired -- the model is not running the "
+            f"introspection attention implementation")
+        assert tuple(tap.read.shape) == (bs, len(groups[(site, spec.layer)]), len(pairs)), (
+            f"grid read {tuple(tap.read.shape)} != (B={bs}, H, P={len(pairs)})")
+        h = groups[(site, spec.layer)].index(spec.index)
+        out[spec] = tap.read[:, h, :].cpu().tolist()     # [B][P]
+    return out
+
+
+def create_pair_list_examples(texts, signals, token_selector, model, max_seq_length,
+                              doc_offset=0) -> List[dict[str, Any]]:
+    """PAIR MODE evaluation rows: one row per (document, signal, pair), same keys as
+    create_batch_example so the two can share the downstream code."""
+    encoded = model.tokenizer(texts, truncation=True, padding=True, return_tensors="pt",
+                              max_length=max_seq_length, padding_side="right")
+    seq_lens = encoded["attention_mask"].sum(1)
+    pairs = [tuple(p) for p in token_selector.pairs]
+    values = extract_attention_grid(model, encoded, signals, pairs, seq_lens)
+
+    out = []
+    truncated_texts = model.tokenizer.decode(encoded["input_ids"], skip_special_tokens=True)
+    for data_idx in range(len(texts)):
+        row_input_ids = encoded["input_ids"][data_idx][:int(seq_lens[data_idx])].tolist()
+        id_counts = Counter(row_input_ids)
+        # decode each position once; a 527-pair grid would otherwise decode ~1K times/doc
+        tok_str = [model.tokenizer.decode([t], clean_up_tokenization_spaces=False)
+                   for t in row_input_ids]
+        for signal in signals:
+            vals = values[signal][data_idx]
+            for (d, src), v in zip(pairs, vals):
+                out.append({
+                    "text": truncated_texts[data_idx],
+                    "doc_index": doc_offset + data_idx,
+                    "signal_type": signal.type,
+                    "signal_layer": signal.layer,
+                    "signal_index": signal.index,
+                    "token_position": d,
+                    "token": tok_str[d],
+                    "src_offset": src - d,
+                    "src_token_position": src,
+                    "src_token": tok_str[src],
+                    "dst_token_unique": id_counts[row_input_ids[d]] == 1,
+                    "src_token_unique": id_counts[row_input_ids[src]] == 1,
+                    "text_input_ids": row_input_ids,
+                    "activation": v,
+                    "target": float_to_str_target(v, signal.precision),
+                })
     return out
 
 
@@ -341,7 +510,7 @@ def build_split(
     :param config: ExperimentConfig
     :return:
     """
-    rows = []
+    rows, chunks, n_docs = [], [], 0
     n_batches = dataset_config.max_samples // config.training_config.eval_batch_size
     for batch in tqdm(hf_dataset.batch(config.training_config.eval_batch_size), total=n_batches):
         text_batch = batch[dataset_config.text_field]
@@ -351,21 +520,31 @@ def build_split(
             token_selector=token_selector,
             model=model,
             max_seq_length=dataset_config.max_seq_length,
+            doc_offset=n_docs,
         )
+        n_docs += len(text_batch)
 
         rows.extend(batch_row)
+        # A pair-list split is documents x signals x pairs rows (3M at 2K docs, 3 heads,
+        # 527 pairs); holding them all as python dicts until the end costs tens of GB.
+        if len(rows) >= ROWS_PER_CHUNK:
+            chunks.append(Dataset.from_list(rows))
+            rows = []
+    if rows or not chunks:
+        chunks.append(Dataset.from_list(rows))
+    return chunks[0] if len(chunks) == 1 else concatenate_datasets(chunks)
 
-    return Dataset.from_list(rows)
 
-
-def report_signal_statistics(dataset: Dataset):
+def report_signal_statistics(dataset: Dataset, pair_mode: bool = False):
     df = dataset.to_pandas()
     assert len(df) > 0, "dataset is empty!"
     # src_offset joins the key when present: two attention signals of the same
     # (layer, head) at different source offsets are DIFFERENT signals, and grouping
     # without it would average them into one meaningless std.
     keys = ["signal_type", "signal_layer", "signal_index"]
-    if "src_offset" in df.columns and df["src_offset"].notna().all():
+    # Not in pair mode, where src_offset is each row's REALIZED offset (hundreds of
+    # values, one signal) rather than part of the signal identity.
+    if "src_offset" in df.columns and df["src_offset"].notna().all() and not pair_mode:
         keys.append("src_offset")
     dscr = df.groupby(keys)["activation"].describe()
     print(dscr)
@@ -412,6 +591,14 @@ def validate_attention_offsets(config, signal_specs) -> None:
     exactly BOS. Config input, so this raises rather than asserts.
     """
     att = [s for s in signal_specs if is_attention_type(s.type)]
+    selectors = (("train", config.train_dataset, config.train_token_selector),
+                 ("dev", config.dev_dataset, config.dev_token_selector),
+                 ("test", config.test_dataset, config.test_token_selector))
+    pair_specs = [s for s in att if s.src_offset is None]
+    pair_sels = [name for name, _, sel in selectors if is_pair_selector(sel)]
+    if pair_specs or pair_sels:
+        _validate_pair_mode(att, pair_specs, selectors)
+        return
     if not att:
         return
     deepest = min(s.src_offset for s in att)          # most negative
@@ -434,6 +621,41 @@ def validate_attention_offsets(config, signal_specs) -> None:
                 f"{name} token selector is fixed at position {sel.position}, so a source "
                 f"offset of {deepest} lands at {sel.position + deepest} (before BOS). "
                 f"Use a negative (end-relative) destination or a shallower offset.")
+
+
+def _validate_pair_mode(att, pair_specs, selectors) -> None:
+    """PAIR MODE config checks (experiment 3-1). Config input, so raise.
+
+    A pair-mode spec ("P6.3@pairs") has no offset of its own, so it is meaningless
+    without a pair selector, and a pair selector has nothing to read from a fixed-offset
+    spec. Mixing the two would cache rows whose `src_offset` means different things.
+    """
+    if len(pair_specs) != len(att):
+        raise ValueError(
+            f"pair-mode attention specs (@pairs) cannot be mixed with fixed-offset ones in "
+            f"one config: {[str(s) for s in att if s.src_offset is not None][:5]}")
+    for name, ds_cfg, sel in selectors:
+        if not is_pair_selector(sel):
+            raise ValueError(
+                f"{name} token selector is {sel.type!r}, but @pairs signals need a pair "
+                f"selector (random_pair or pair_grid:<m>) on every split")
+        floor, cap = ds_cfg.min_seq_length, ds_cfg.max_seq_length
+        if sel.type == "random_pair":
+            # Every document must be exactly `cap` tokens: then all of them share one
+            # pair set and the uniform-over-pairs draw means what it says. A shorter
+            # document would draw from a smaller set and skew dst toward the front.
+            if not floor or floor < cap:
+                raise ValueError(
+                    f"{name}: random_pair needs min_seq_length >= max_seq_length "
+                    f"({cap}) so every document is exactly {cap} tokens; got "
+                    f"min_seq_length={floor!r}")
+        else:
+            max_d = max(d for d, _ in sel.pairs)
+            if not (max_d < cap and floor and cap <= floor):
+                raise ValueError(
+                    f"{name}: pair_list reaches dst={max_d}, which needs "
+                    f"max_d < max_seq_length <= min_seq_length; got max_seq_length={cap}, "
+                    f"min_seq_length={floor!r}")
 
 
 def _raw_span(n_filtered: int, floor, config, tokenizer, probe: int = 2000) -> int:
@@ -517,14 +739,12 @@ def _realized_stats(dataset) -> dict:
             # meant. That is a confound the MLP experiments never had (they name one
             # token). Recording the rate here lets the analysis split corr by
             # unique/duplicated instead of guessing how much it costs.
-            ids = dataset["text_input_ids"]
-            n_uni = n_tot = 0
-            for row_ids, sp in zip(ids, dataset["src_token_position"]):
-                if sp is None:
-                    continue
-                n_tot += 1
-                n_uni += int(row_ids.count(row_ids[sp]) == 1)
-            out["src_token_unique_rate"] = round(n_uni / n_tot, 4) if n_tot else None
+            # create_batch_example records the flags per row; recounting here would
+            # walk text_input_ids once per row (900K rows x 512 tokens on a pair grid).
+            for col in ("src_token_unique", "dst_token_unique"):
+                if col in dataset.column_names:
+                    flags = [x for x in dataset[col] if x is not None]
+                    out[f"{col}_rate"] = round(float(np.mean(flags)), 4) if flags else None
     return out
 
 
@@ -532,7 +752,9 @@ _SIGNAL_SITES = {
     "mlp": "mlp.act_fn output (post-activation neuron)",
     "attention_score": "pre-softmax attention logit q.k/sqrt(d_head), after RoPE, "
                        "before causal mask and softmax",
-    "attention_weight": "post-softmax attention weight",
+    "attention_weight": "post-softmax attention weight (probability over the causal "
+                        "row, read in fp32 before the dtype cast and before dropout; "
+                        "rows sum to 1)",
     "residual_stream": "decoder layer output (residual stream)",
     "sae": "SAE feature activation at the SAE's hook site",
 }
@@ -601,6 +823,99 @@ def write_dataset_metadata(config: ExperimentConfig, output_dir: Path, model,
     print(f"Wrote dataset metadata to: {path}")
 
 
+def build_pair_pool(config: ExperimentConfig, out_dir: Path) -> None:
+    """Write the PAIR MODE injection pool (see dataset_utils.POOL_DOCS for what and why).
+
+    Compact columns only -- no text, no token ids: 4K documents x 3 heads x ~600 pairs is
+    7M rows, which with the usual per-row text_input_ids would be ~50 GB of copies that
+    nothing reads. Written to a temporary directory and renamed, so a reader can never
+    see a half-written pool.
+    """
+    import numpy as np
+    from src.introspector.dataset_utils import POOL_DOCS, POOL_SEQ_LEN, pair_pool_identity
+    from src.introspector.signals.pair_grid import pool_pairs
+
+    specs = list(config.train_signals)
+    if not specs or any(not is_attention_type(s.type) or s.src_offset is not None for s in specs):
+        raise ValueError(f"--pair-pool needs pair-mode attention signals (e.g. P6.3@pairs), "
+                         f"got {[str(s) for s in specs]}")
+    floor = config.train_dataset.min_seq_length
+    if not floor or floor < POOL_SEQ_LEN:
+        raise ValueError(f"the pool reads {POOL_SEQ_LEN}-token documents, so the corpus floor "
+                         f"must be >= {POOL_SEQ_LEN}; got min_seq_length={floor!r}")
+    pairs = list(pool_pairs())
+    set_seed(config.seed)
+
+    ds_cfg = config.train_dataset
+    kwargs = dict(ds_cfg.hf_data_kwargs)
+    name_config = kwargs.pop("config", None)
+    args = (ds_cfg.name, name_config) if name_config else (ds_cfg.name,)
+    stream = load_dataset(*args, split=ds_cfg.split, **kwargs)
+    tok = AutoTokenizer.from_pretrained(config.model_name)
+    stream = stream.filter(lambda ex: len(tok(ex[ds_cfg.text_field],
+                                              add_special_tokens=True)["input_ids"]) >= floor)
+    stream = stream.take(POOL_DOCS)
+
+    model = LanguageModel(config.model_name, device_map="auto",
+                          quantization_config=get_quantization_config(config),
+                          **attention_model_kwargs(specs))
+    if model.tokenizer.pad_token is None:
+        model.tokenizer.pad_token = model.tokenizer.eos_token
+
+    cols = {k: [] for k in ("doc_index", "signal_layer", "signal_index", "token_position",
+                            "src_token_position", "activation")}
+    n_docs, bs = 0, config.training_config.eval_batch_size
+    for batch in tqdm(stream.batch(bs), total=POOL_DOCS // bs):
+        texts = batch[ds_cfg.text_field]
+        encoded = model.tokenizer(texts, truncation=True, padding=True, return_tensors="pt",
+                                  max_length=POOL_SEQ_LEN, padding_side="right")
+        seq_lens = encoded["attention_mask"].sum(1)
+        assert bool((seq_lens == POOL_SEQ_LEN).all()), (
+            f"pool documents must be {POOL_SEQ_LEN} tokens, got {sorted(set(seq_lens.tolist()))}")
+        values = extract_attention_grid(model, encoded, specs, pairs, seq_lens)
+        B, P = len(texts), len(pairs)
+        d_col = np.array([d for d, _ in pairs] * B)                  # [B*P]
+        s_col = np.array([s_ for _, s_ in pairs] * B)                # [B*P]
+        doc_col = np.repeat(np.arange(n_docs, n_docs + B), P)        # [B*P]
+        for spec in specs:
+            v = np.asarray(values[spec], dtype=np.float32)           # [B, P]
+            assert v.shape == (B, P), f"{spec}: {v.shape} != {(B, P)}"
+            cols["doc_index"].append(doc_col)
+            cols["signal_layer"].append(np.full(B * P, spec.layer))
+            cols["signal_index"].append(np.full(B * P, spec.index))
+            cols["token_position"].append(d_col)
+            cols["src_token_position"].append(s_col)
+            cols["activation"].append(v.reshape(-1))
+        n_docs += B
+    if n_docs != POOL_DOCS:
+        raise RuntimeError(f"pool stream yielded {n_docs} documents, wanted {POOL_DOCS}")
+
+    data = {k: np.concatenate(v) for k, v in cols.items()}
+    n = len(data["activation"])
+    data["signal_type"] = [specs[0].type] * n
+    data["src_offset"] = data["src_token_position"] - data["token_position"]
+    lo, hi = float(data["activation"].min()), float(data["activation"].max())
+    assert 0.0 <= lo and hi <= 1.0, f"pool values outside [0, 1]: [{lo}, {hi}]"
+
+    tmp = out_dir.with_name(out_dir.name + ".tmp")
+    if tmp.exists():
+        import shutil
+        shutil.rmtree(tmp)
+    Dataset.from_dict(data).save_to_disk(str(tmp))
+    with open(tmp / "pool_metadata.json", "w") as f:
+        json.dump({"identity": pair_pool_identity(config), "n_rows": n, "n_docs": n_docs,
+                   "n_pairs": len(pairs), "value_range": [lo, hi],
+                   "created_at": datetime.now(timezone.utc).isoformat(),
+                   "git_sha": _git_sha()}, f, indent=2, default=str)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    if out_dir.exists():                 # only reachable under --overwrite-cache
+        import shutil
+        shutil.rmtree(out_dir)
+    tmp.rename(out_dir)
+    print(f"[pool] wrote {n} rows ({n_docs} docs x {len(specs)} signals x {len(pairs)} pairs) "
+          f"-> {out_dir}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -610,6 +925,10 @@ def parse_args():
     )
     parser.add_argument("--overwrite-cache", action="store_true",
                         help="Whether to overwrite cached dataset files if there exist one")
+    parser.add_argument("--pair-pool", action="store_true",
+                        help="PAIR MODE: build ONLY the injection pool for this config's "
+                             "signals (dataset_utils.pair_pool_dir), not the train/dev/test "
+                             "cache. Skips if the pool exists.")
 
     return parser.parse_args()
 
@@ -617,6 +936,15 @@ def parse_args():
 def main():
     args = parse_args()
     config = ExperimentConfig.model_validate_json(Path(args.config).read_text())
+
+    if args.pair_pool:
+        from src.introspector.dataset_utils import pair_pool_dir
+        pool_dir = pair_pool_dir(config)
+        if pool_dir.exists() and not args.overwrite_cache:
+            print(f"Pair pool cached, skipping ... {pool_dir}")
+            return
+        build_pair_pool(config, pool_dir)
+        return
 
     output_dir = config.dataset_cache_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -786,11 +1114,12 @@ def main():
         config=config,
     )
     print("Training data signal statistics:")
-    train_stats = report_signal_statistics(train_dataset)
+    pair_mode = is_pair_selector(config.train_token_selector)
+    train_stats = report_signal_statistics(train_dataset, pair_mode)
     print("Dev data signal statistics:")
-    dev_stats = report_signal_statistics(dev_dataset)
+    dev_stats = report_signal_statistics(dev_dataset, pair_mode)
     print("Test data signal statistics:")
-    test_stats = report_signal_statistics(test_dataset)
+    test_stats = report_signal_statistics(test_dataset, pair_mode)
 
     print("Train dev overlap:")
     train_dev_overlap = report_token_overlap(train_dataset, dev_dataset)

@@ -56,17 +56,24 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 
 from src.introspector.config import ExperimentConfig
-from src.introspector.dataset_utils import apply_signal_filter
+from src.introspector.dataset_utils import apply_signal_filter, pair_pool_dir
+from src.introspector.signals.schema import is_pair_selector
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
 from src.introspector.models.attention_logits import (
-    AttentionLogitPort, PortFanOut, attention_model_kwargs, installed_ports,
-    is_attention_type,
+    AttentionLogitPort, AttentionWeightPort, PortFanOut, attention_model_kwargs,
+    installed_ports, is_attention_type, port_site,
 )
 from src.introspector.prompts import PROMPT_REGISTRY
 from src.introspector.training.collator import LoRAGatingCollator
 from src.introspector.training.metrics import compute_metrics, compute_metrics_from_numericals
+from src.introspector.training.pair_metrics import attach_provenance, write_pair_outputs
 from src.introspector.training.model import (
     signal_range_key,
+    logit_moments,
+    logit_histogram,
+    empirical_prob_values,
+    EMPIRICAL_EPS,
+    make_bounded_prob_intervention_fn,
     IntrospectionRegressionModel,
     RegressionHeadSaveCallback,
     InterventionAnnealCallback,
@@ -104,6 +111,12 @@ def parse_args():
                    help="Text positions sampled per sequence for the KL estimate. A full-vocab "
                         "fp32 KL over every position is ~GBs; a random subset is unbiased and "
                         "cheap. Raise for a lower-variance estimate.")
+    p.add_argument("--require-kl-anchor", action="store_true",
+                   help="Fail instead of training if a KL anchor was requested but cannot "
+                        "apply. The anchor needs `anchor_region_mask`, which only "
+                        "UngatedCollator emits, so with the input gate ON the KL term is "
+                        "skipped SILENTLY and the run still writes a directory named "
+                        "_kl<budget>_. Pass this on any gated arm that names a budget.")
     p.add_argument("--kl-anchor-coef-init", type=float, default=1.0)
     p.add_argument("--kl-anchor-coef-range", type=str, default="0.0001,1000",
                    help="Clamp for the adaptive coefficient (min,max).")
@@ -112,6 +125,12 @@ def parse_args():
                         "corpora (see score_ood_generalization.py). Endogenous corr is the "
                         "discriminating metric: a context-predicting readout collapses under "
                         "shift, a causal one does not.")
+    p.add_argument("--prepare-only", action="store_true",
+                   help="Build the eval caches that --length-eval / --ood-eval would build "
+                        "(see prepare_length_caches / prepare_ood_caches), then exit -- no "
+                        "model, no training. Exits non-zero if any of them failed. Lets a "
+                        "cache job build them once for several runs that share them, "
+                        "instead of those runs racing to build them concurrently.")
     p.add_argument("--ood-only", action="store_true",
                    help="Load the checkpoint and run ONLY the OOD eval -- no training, and "
                         "none of the other diagnostics. Results are written into the RUN dir "
@@ -171,6 +190,17 @@ def parse_args():
                         "0 disables PCA).")
     p.add_argument("--scale-sweep", type=str, default="1,3,10,30,100",
                    help="Comma-separated injection scales for the interventional scale sweep.")
+    p.add_argument("--interv-eval-distributions", type=str, default="gaussian",
+                   help="Comma-separated injection distributions for the headline interventional "
+                        "test eval, each written as interventional_test_metrics_<dist>.json. "
+                        "'empirical_logit' (attention_weight only) draws from the cell's own "
+                        "train log-odds histogram and also writes "
+                        "interventional_ceiling_empirical_logit.json. 'empirical_prob' "
+                        "(attention_weight only) draws one of the cell's own train weights "
+                        "as-is (bootstrap, no clamp).")
+    p.add_argument("--interv-eval-only", action="store_true",
+                   help="Load --checkpoint (e.g. another run's) and run ONLY the interventional "
+                        "test evals, writing into THIS config's output dir. No training.")
     p.add_argument("--diag-fp32", action="store_true",
                    help="Also re-run the diagnostics (scale sweep + routing probe) with the model cast "
                         "to fp32, to test whether natural-scale failure is a bf16 numerical floor. "
@@ -190,6 +220,32 @@ def _var_norm_mse(pred, target):
     target = target.float()
     var = torch.clamp(target.var(), min=1e-8)
     return nn.functional.mse_loss(pred, target) / var
+
+
+def _norm_deviance(z, target):
+    """Normalized Bernoulli deviance D / D_null = mean KL(p||sigmoid(z)) / mean KL(p||p_bar).
+
+    The probability-target counterpart of _var_norm_mse: 0 = perfect, 1 = predicting the
+    batch mean, so a joint loss mixes two terms at the balance set by w, not by scale.
+    Takes the head's LOG-ODDS z, not its probability: BCE through a sigmoid has gradient
+    (q - p) in z, where MSE through it has (q - p) q (1 - q) and stalls on the many
+    attention weights near 0. H(p) is subtracted so the minimum is 0 for soft targets
+    (plain BCE bottoms out at the targets' entropy).
+    """
+    z = z.float()                                                       # [B]
+    p = target.float()                                                  # [B]
+    assert z.shape == p.shape and z.ndim == 1, f"z {tuple(z.shape)} vs target {tuple(p.shape)}"
+    assert ((p >= 0) & (p <= 1)).all(), (
+        f"norm_deviance needs probability targets, got range [{p.min():.4g}, {p.max():.4g}]")
+    ent = -(torch.special.xlogy(p, p) + torch.special.xlogy(1 - p, 1 - p))  # [B], H(p)
+    kl = nn.functional.binary_cross_entropy_with_logits(z, p, reduction="none") - ent  # [B]
+    # p_bar is the null model's prediction: a constant, so no gradient flows through it
+    p_bar = p.mean().clamp(1e-7, 1 - 1e-7)
+    kl_null = -(p * torch.log(p_bar) + (1 - p) * torch.log1p(-p_bar)) - ent  # [B]
+    return kl.mean() / torch.clamp(kl_null.mean(), min=1e-12)
+
+
+REGRESSION_LOSSES = ("var_norm_mse", "norm_deviance")
 
 
 def _lm_head(model):
@@ -287,13 +343,16 @@ class UngatedCollator(LoRAGatingCollator):
 
 
 class JointInterventionTrainer(InterventionTrainer):
-    """Two-forward joint loss: w*endogenous + (1-w)*interventional (both var-normed)."""
+    """Two-forward joint loss: w*endogenous + (1-w)*interventional, both normalized
+    (var-normed MSE, or normalized deviance for a sigmoid head; see `regression_loss`)."""
 
     def __init__(self, *args, joint_loss_weight=0.5, kl_anchor_target=None,
                  kl_anchor_weight=0.0, kl_anchor_positions=4, kl_anchor_coef_init=1.0,
-                 kl_anchor_coef_range=(0.01, 1000.0), **kwargs):
+                 kl_anchor_coef_range=(0.01, 1000.0), regression_loss="var_norm_mse", **kwargs):
         super().__init__(*args, **kwargs)
         self.joint_loss_weight = joint_loss_weight
+        assert regression_loss in REGRESSION_LOSSES, f"regression_loss {regression_loss!r}"
+        self.regression_loss = regression_loss
         # anchor: adaptive to a KL budget if a target is set, else a fixed weight
         self.kl_anchor_target = kl_anchor_target
         self.kl_anchor_positions = kl_anchor_positions
@@ -319,6 +378,13 @@ class JointInterventionTrainer(InterventionTrainer):
         elif kl_value < self.kl_anchor_target / 1.5:
             self.kl_anchor_coef = max(self.kl_anchor_coef / 1.5, lo)
 
+    def _regression_loss(self, out, target):
+        if self.regression_loss == "var_norm_mse":
+            return _var_norm_mse(out.logits, target)
+        z = out.get("regression_pre_activation")
+        assert z is not None, "norm_deviance needs the sigmoid head's log-odds; the forward gave none"
+        return _norm_deviance(z, target)
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         inputs = inputs.copy()
         # not a model input: the patched forward only understands `lora_token_mask`
@@ -337,7 +403,7 @@ class JointInterventionTrainer(InterventionTrainer):
             endo_inputs["labels"] = inputs["activation"]
             endo_inputs["do_intervention"] = False
             endo_out = model(**endo_inputs)
-            L_endo = _var_norm_mse(endo_out.logits, inputs["activation"])
+            L_endo = self._regression_loss(endo_out, inputs["activation"])
 
         if w < 1.0:
             # interventional forward: inject, target = injected value
@@ -345,7 +411,7 @@ class JointInterventionTrainer(InterventionTrainer):
             interv_inputs["labels"] = inputs["activation"]   # forward overwrites with injected value
             interv_inputs["do_intervention"] = True
             interv_out = model(**interv_inputs)
-            L_interv = _var_norm_mse(interv_out.logits, interv_out.intervention_values)
+            L_interv = self._regression_loss(interv_out, interv_out.intervention_values)
 
         loss = 0.0
         if L_endo is not None:
@@ -435,10 +501,14 @@ def _per_signal_metrics(df: pd.DataFrame, value_col: str = "predictions",
 
 
 @torch.no_grad()
-def eval_endogenous_test(model, dataset, collator, config, output_dir, suffix="_endogenous"):
+def eval_endogenous_test(model, dataset, collator, config, output_dir, suffix="_endogenous",
+                         provenance=None):
     """
     Endogenous eval (no injection): full metrics (corr, l2_dist, avg/std diff, ...)
     matching the interventional eval, plus a predicted-vs-actual scatter.
+
+    `provenance` (PAIR MODE): per-row doc_index / *_token_unique, aligned to `dataset`
+    (see pair_metrics.attach_provenance).
     """
     # dropout is a no-op under eval(); before the GatedLinear dropout fix it was a
     # no-op either way, so these forwards used to inherit train mode harmlessly.
@@ -446,7 +516,7 @@ def eval_endogenous_test(model, dataset, collator, config, output_dir, suffix="_
     dl = DataLoader(dataset, batch_size=config.training_config.eval_batch_size,
                     collate_fn=collator, shuffle=False)
     head = model.regression_head
-    preds, acts, layers, idxs, tokpos, seqlens = [], [], [], [], [], []
+    preds, acts, layers, idxs, tokpos, seqlens, srcpos = [], [], [], [], [], [], []
     for batch in dl:
         batch = batch.to(model.device)
         activation = batch["activation"]
@@ -471,6 +541,11 @@ def eval_endogenous_test(model, dataset, collator, config, output_dir, suffix="_
         # model(**inputs) during training.
         tokpos.append(batch["token_position"].cpu())
         seqlens.append(_text_len_from_mask(batch).cpu())
+        # attention: the SOURCE position too. With a fixed offset it was recoverable as
+        # dst + offset; in pair mode every row has its own, and without it the by-pair
+        # breakdown (and any dst x src plot) cannot be built.
+        if "src_token_position" in batch:
+            srcpos.append(batch["src_token_position"].cpu())
     pred, act = torch.cat(preds).numpy(), torch.cat(acts).numpy()
     layer_col = torch.cat(layers).numpy(); index_col = torch.cat(idxs).numpy()
     pos_col = torch.cat(tokpos).numpy(); len_col = torch.cat(seqlens).numpy()
@@ -481,6 +556,15 @@ def eval_endogenous_test(model, dataset, collator, config, output_dir, suffix="_
                        "token_position": pos_col, "text_len": len_col})
     df["distance_from_end"] = np.where(df["text_len"] > 0,
                                        df["text_len"] - 1 - df["token_position"], -1)
+    if srcpos:
+        df["src_token_position"] = torch.cat(srcpos).numpy()
+        assert len(df["src_token_position"]) == len(df), "src positions misaligned"
+        df["src_offset"] = df["src_token_position"] - df["token_position"]
+    df = attach_provenance(df, provenance)
+    pair_summary = write_pair_outputs(df, "predictions", "activation", model,
+                                      Path(output_dir) / f"endogenous_test_by_pair{suffix}.csv")
+    if pair_summary is not None:
+        metrics["pairs"] = pair_summary
     per_signal = _per_signal_metrics(df)
     if per_signal is not None:
         per_signal.to_csv(
@@ -652,8 +736,9 @@ def _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offs
 
 
 def _capture_attention_logits(model, batch, abs_dst, abs_src, signal_layer,
-                              signal_index, offsets):
-    """One forward capturing the introspected attention logit at several offsets.
+                              signal_index, offsets, port_cls=AttentionLogitPort,
+                              site="logit"):
+    """One forward capturing the introspected attention signal at several offsets.
 
     The attention analogue of _capture_activations. It cannot reuse that function at
     all: an attention logit is not a module output (see models/attention_logits.py), so
@@ -669,6 +754,12 @@ def _capture_attention_logits(model, batch, abs_dst, abs_src, signal_layer,
     Positions are clamped, and only for the diagnostic offsets: at offset +1 the
     destination of a pos=-1 row runs past the end of the sequence. Offset 0 is never
     clamped in practice, and it is the only offset the verdict depends on.
+
+    `port_cls`/`site` select which of the two attention sites to read: the pre-softmax
+    logit (default, and what every caller meant before the weight port existed) or the
+    post-softmax weight. Reading a P run through the logit port would compare a cached
+    probability against a live logit, so the alignment corr would be near zero and the
+    verdict would read as "the positions are off by one" -- the wrong diagnosis.
     """
     bs = abs_dst.shape[0]
     seq_len = batch["input_ids"].shape[1]
@@ -682,10 +773,10 @@ def _capture_attention_logits(model, batch, abs_dst, abs_src, signal_layer,
             dst = (abs_dst[m] + off).clamp(0, seq_len - 1)
             # keep the source at the same distance behind the destination
             src = (abs_src[m] + off).clamp(0, seq_len - 1).minimum(dst)
-            ports.append(AttentionLogitPort(heads=signal_index[m], dst=dst, src=src))
+            ports.append(port_cls(heads=signal_index[m], dst=dst, src=src))
         layer_ports[layer] = PortFanOut(ports)
         port_index[layer] = (rows, ports)
-    with installed_ports(model, layer_ports):
+    with installed_ports(model, layer_ports, site=site):
         outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
                         lora_token_mask=batch.get("lora_token_mask"), do_intervention=False)
     for layer, (rows, ports) in port_index.items():
@@ -710,7 +801,7 @@ def _capture_attention_logits(model, batch, abs_dst, abs_src, signal_layer,
 # read-only diagnostic; there is never a backward pass here.
 @torch.no_grad()
 def measure_attention_alignment(model, dataset, collator, config, output_dir, suffix="",
-                                offsets=DRIFT_OFFSETS):
+                                offsets=DRIFT_OFFSETS, signal_type="attention_score"):
     """Attention counterpart of measure_activation_drift.
 
     Answers the same two questions with the same numbers, minus the MLP-specific
@@ -727,7 +818,17 @@ def measure_attention_alignment(model, dataset, collator, config, output_dir, su
 
     Writes activation_drift{suffix}.{json,csv,png} under the same names as the MLP
     version so the existing analysis scripts keep finding it.
+
+    `signal_type` picks the port site. It matters MORE for attention_weight than for
+    attention_score: a post-softmax value depends on the whole row, so if caching and
+    training ran under different attention implementations or different padding, what
+    breaks is the NORMALIZING CONSTANT, not the offset. That failure keeps the best
+    offset at 0 and only pulls the correlation down a little -- it looks like noise, not
+    like a bug, which is exactly why this has to run.
     """
+    site = port_site(signal_type)
+    port_cls = AttentionWeightPort if site == "weight" else AttentionLogitPort
+    quantity = "attention weight" if site == "weight" else "attention logit"
     model.eval()
     dl = DataLoader(dataset, batch_size=config.training_config.eval_batch_size,
                     collate_fn=collator, shuffle=False)
@@ -745,10 +846,12 @@ def measure_attention_alignment(model, dataset, collator, config, output_dir, su
         signal_layer, signal_index = batch["signal_layer"], batch["signal_index"]
 
         tuned, preds = _capture_attention_logits(model, batch, abs_dst, abs_src,
-                                                 signal_layer, signal_index, offsets)
+                                                 signal_layer, signal_index, offsets,
+                                                 port_cls=port_cls, site=site)
         with model.disable_adapter():
             base, _ = _capture_attention_logits(model, batch, abs_dst, abs_src,
-                                                signal_layer, signal_index, offsets)
+                                                signal_layer, signal_index, offsets,
+                                                port_cls=port_cls, site=site)
         cached_all.append(batch["activation"].float().cpu())
         pred_all.append(preds)
         pos_all.append(token_position.cpu())
@@ -778,6 +881,7 @@ def measure_attention_alignment(model, dataset, collator, config, output_dir, su
 
     metrics = {
         "signal_family": "attention",
+        "signal_type": signal_type,
         "train_offset": TRAIN_OFFSET,
         "alignment": alignment,
         "best_alignment_offset": int(best),
@@ -800,7 +904,7 @@ def measure_attention_alignment(model, dataset, collator, config, output_dir, su
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
     axes[0].scatter(cached, base[best], s=10, alpha=0.4)
-    axes[0].set_xlabel("cached attention logit")
+    axes[0].set_xlabel(f"cached {quantity}")
     axes[0].set_ylabel(f"live, adapters OFF (offset {best:+d})")
     axes[0].set_title(f"cache alignment (corr={best_corr:.4f})")
     axes[1].scatter(base[TRAIN_OFFSET], tuned[TRAIN_OFFSET], s=10, alpha=0.4)
@@ -814,7 +918,7 @@ def measure_attention_alignment(model, dataset, collator, config, output_dir, su
     plt.savefig(out / f"activation_drift{suffix}.png", dpi=150)
     plt.close()
 
-    print("[drift] attention-logit cache alignment (adapters OFF vs cached column):")
+    print(f"[drift] {quantity} cache alignment (adapters OFF vs cached column):")
     print(align_df.to_string(index=False))
     if metrics["alignment_ok"]:
         print(f"[drift] alignment OK: offset {TRAIN_OFFSET:+d} reproduces the cache "
@@ -1246,19 +1350,126 @@ def interventional_scale_sweep(model, dataset, collator, config, output_dir, sca
     return df
 
 
+def _logit(p):
+    p = np.clip(p, EMPIRICAL_EPS, 1 - EMPIRICAL_EPS)
+    return np.log(p / (1 - p))
+
+
+def interventional_ceiling(model, dataset, collator, config, output_dir, distribution,
+                           n_pca=256):
+    """Ceiling probe and head at scale 1 under `distribution`, in BOTH t and logit(t).
+
+    Why logit(t) too: a sigmoid head is linear in log-odds, and so is the weight port's
+    intervention (a shift of one attention logit). A ceiling that is ~0 in t but high in
+    logit(t) would mean the value IS routed and only the probability-space probe misses
+    it; ~0 in both means it is not routed to the readout at all.
+    """
+    X, inj, hpred, _ = _extract_interv_readout(model, dataset, collator, config, 1.0,
+                                               distribution=distribution)
+    assert inj.shape == hpred.shape == (X.shape[0],), f"{inj.shape} {hpred.shape} {X.shape}"
+    c_t, h_t, a_t = _ceiling_and_head(X, inj, hpred, config.seed, n_pca)
+    # the head's prediction is only a probability under a sigmoid head; a linear head
+    # can predict <= 0, where logit is undefined, so its logit-space corr is left NaN
+    sigmoid_head = type(model.regression_head).__name__ == "SigmoidRegressionHead"
+    c_l, h_l, a_l = _ceiling_and_head(X, _logit(inj), _logit(hpred) if sigmoid_head else hpred,
+                                      config.seed, n_pca)
+    out = {"distribution": distribution, "scale": 1.0, "n": int(len(inj)),
+           "ceiling_corr_t": c_t, "head_corr_t": h_t, "best_alpha_t": a_t,
+           "ceiling_corr_logit": c_l, "head_corr_logit": h_l if sigmoid_head else float("nan"),
+           "best_alpha_logit": a_l,
+           "inj_mean": float(inj.mean()), "inj_std": float(inj.std()),
+           "inj_logit_mean": float(_logit(inj).mean()), "inj_logit_std": float(_logit(inj).std())}
+    with open(Path(output_dir) / f"interventional_ceiling_{distribution}.json", "w") as f:
+        json.dump(out, f, indent=2)
+    print(f"[joint] interventional ceiling ({distribution}@1): "
+          f"t: ceiling={c_t:.4f} head={h_t:.4f} | logit: ceiling={c_l:.4f} head={out['head_corr_logit']:.4f}")
+    return out
+
+
+# Per-row columns the predictions CSVs need but the model must not see (see
+# pair_metrics.attach_provenance for why they cannot ride in the batch).
+PROVENANCE_COLS = ("doc_index", "dst_token_unique", "src_token_unique")
+
+
+def eval_provenance(raw, preprocessed):
+    """Provenance frame for an eval split, aligned row-for-row with what
+    drop_invalid_positions will keep. Call BEFORE drop_invalid_positions: it reads the
+    same `position_valid` flag that function filters on. None when the cache predates
+    these columns."""
+    cols = [c for c in PROVENANCE_COLS if c in raw.column_names]
+    if not cols:
+        return None
+    side = raw.select_columns(cols).to_pandas()
+    assert len(side) == len(preprocessed), (
+        f"raw {len(side)} rows vs preprocessed {len(preprocessed)}: preprocess is 1:1")
+    if "position_valid" in preprocessed.column_names:
+        valid = np.asarray(preprocessed["position_valid"], dtype=bool)
+        side = side[valid].reset_index(drop=True)
+    return side
+
+
+def run_interventional_evals(model, dataset, collator, config, output_dir, distributions,
+                             n_pca=256, source_checkpoint=None, provenance=None):
+    """Headline interventional test eval, once per distribution (suffix _<dist>)."""
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    if source_checkpoint is not None:
+        # an eval-only pass writes next to nothing else; record whose weights these are
+        with open(Path(output_dir) / "interv_eval_source.json", "w") as f:
+            json.dump({"checkpoint": str(source_checkpoint)}, f, indent=2)
+    for d in distributions:
+        evaluate_interventional_test(model, eval_dataset=dataset, collator=collator,
+                                     config=config, output_dir=output_dir,
+                                     distribution=d, suffix=f"_{d}", provenance=provenance)
+        if d == "empirical_logit":
+            interventional_ceiling(model, dataset, collator, config, output_dir, d, n_pca=n_pca)
+
+
 def main():
     args = parse_args()
     config = ExperimentConfig.model_validate_json(args.config.read_text())
     if not config.use_regressor:
         raise SystemExit("Joint training targets the regressor head (use_regressor must be True).")
 
+    interv_eval_dists = [d.strip() for d in args.interv_eval_distributions.split(",") if d.strip()]
+    allowed = {"gaussian", "uniform", "extreme", "prob_uniform", "empirical_logit",
+               "empirical_prob"}
+    bad = [d for d in interv_eval_dists if d not in allowed]
+    if bad or not interv_eval_dists:
+        raise ValueError(f"--interv-eval-distributions {interv_eval_dists} has {bad} "
+                         f"(allowed: {sorted(allowed)})")
+    if args.interv_eval_only and args.checkpoint is None:
+        raise ValueError("--interv-eval-only needs --checkpoint (the run to evaluate)")
+
     cache_dir = config.dataset_cache_dir
     output_dir = Path(config.output_dir) / config.experiment_name
     output_dir.mkdir(parents=True, exist_ok=True)
     if ((output_dir / "routing_probe_by_position.csv").exists()
             and not args.overwrite_cache and not args.diag_only and not args.ood_only
-            and not args.length_only and not args.neuron_gen_only):
+            and not args.length_only and not args.neuron_gen_only
+            and not args.interv_eval_only):
         print(f"Experiments ran already, skipping.. {output_dir}")
+        return
+
+    if args.prepare_only:
+        # Only the config is needed: the derived caches are keyed by its content, and
+        # cache_signals builds them in subprocesses. Failures are collected rather than
+        # raised by the prepare functions, so turn them into an exit code here.
+        failed = {}
+        if args.length_eval:
+            import score_length_generalization as slg
+            lengths = ([int(x) for x in args.eval_lengths.split(",")]
+                       if args.eval_lengths else list(slg.DEFAULT_EVAL_LENGTHS))
+            slg.prepare_length_caches(config, eval_lengths=lengths)
+            failed.update({f"len{k}": v for k, v in slg.prepare_length_caches.errors.items()})
+        if args.ood_eval:
+            import score_ood_generalization as sog
+            corpora = ([c.strip() for c in args.ood_corpora.split(",")]
+                       if args.ood_corpora else list(sog.DEFAULT_CORPORA))
+            sog.prepare_ood_caches(config, corpora=corpora)
+            failed.update({f"ood_{k}": v for k, v in sog.prepare_ood_caches.errors.items()})
+        if failed:
+            raise SystemExit(f"[joint] --prepare-only: {len(failed)} cache(s) failed: {failed}")
+        print("[joint] --prepare-only: every requested eval cache is ready")
         return
 
     # ---- tokenizer ----
@@ -1302,11 +1513,94 @@ def main():
         group_cols = ["signal_layer", "signal_index", "src_offset"]
     else:
         group_cols = ["signal_layer", "signal_index"]
+    # A post-softmax weight lives in (0,1), and every built-in intervention distribution
+    # leaves that interval (see make_bounded_prob_intervention_fn). Its sampler works in
+    # log-odds space, so the log-odds moments ride along in the same dict. They are EXTRA
+    # keys: sample_intervention_values forwards stats as **kwargs and its own branches
+    # index by name, so nothing that does not ask for them can see them, and no MLP, SAE
+    # or attention_score run gets them at all.
+    signal_type = df["signal_type"].iloc[0] if len(df) else None
+    prob_signal = signal_type == "attention_weight"
+    # The log-odds histogram is read ONLY by the `empirical_logit` sampler. Building it
+    # unconditionally made every attention_weight run depend on logit_histogram, so a bug
+    # there killed plain endogenous runs that never draw from it (7-1 tasks 45/52/54). If
+    # this condition ever misses a caller, the sampler's own assert names the missing keys.
+    need_logit_hist = ("empirical_logit" in interv_eval_dists or
+                       config.training_config.intervention_signal_distribution == "empirical_logit")
+    # Same rule for `empirical_prob`'s copy of the train weights: 300K floats per cell
+    # that only that sampler reads.
+    need_prob_values = ("empirical_prob" in interv_eval_dists or
+                        config.training_config.intervention_signal_distribution == "empirical_prob")
+    # PAIR MODE (3-1): the ranges come from the injection pool, keyed per absolute
+    # (dst, src). The run's own train split cannot supply them: it holds ONE random pair
+    # per document (300K rows over up to 8K pairs) and no pair with dst >= n at all,
+    # while the length eval injects at every grid pair up to dst = 511.
+    pair_mode = is_pair_selector(config.train_token_selector)
+    if pair_mode:
+        pool_dir = pair_pool_dir(config)
+        if not pool_dir.exists():
+            raise SystemExit(f"pair mode needs the injection pool at {pool_dir}; build it "
+                             f"with `python cache_signals.py --config {args.config} --pair-pool`")
+        pool = apply_signal_filter(load_from_disk(str(pool_dir)), config.signal_filter, "pool")
+        df = pool.to_pandas()
+        group_cols = ["signal_layer", "signal_index", "token_position", "src_token_position"]
+        print(f"[joint] pair mode: intervention ranges from {pool_dir} "
+              f"({len(df)} rows, {df.groupby(group_cols).ngroups} (head, dst, src) cells)")
+        pool_keys = set(df.groupby(group_cols).groups)
+        # Every pair an eval reads must come from the pool, so that the supplement below
+        # can never reach a test metric. Holds by construction: test pairs are
+        # pair_grid(n) and pool_pairs() is the union of the grids.
+        test_keys = set(test_raw.select_columns(group_cols).to_pandas().groupby(group_cols).groups)
+        assert test_keys <= pool_keys, (
+            f"{len(test_keys - pool_keys)} test (head, dst, src) cells are not in the pool, "
+            f"e.g. {sorted(test_keys - pool_keys)[:3]}")
+        if args.joint_loss_weight < 1.0:
+            # The pool holds the EVAL grid only (all pairs up to m=32, a log grid above),
+            # but at W < 1 every train/dev row is injected at its own random pair. 3-1
+            # (W=1) never injected during training, so this never showed; at n=64/128 the
+            # first off-grid pair, e.g. (37, 20), raised KeyError in
+            # sample_intervention_values. Off-grid cells take their ranges from the run's
+            # own train+dev rows (dev too: mid-training eval injects, and a smoke run's
+            # dev pairs need not occur in its 2000 train rows). Grid cells keep the pool's.
+            own = pd.concat([r.select_columns(group_cols + ["activation"]).to_pandas()
+                             for r in (train_raw, dev_raw)], ignore_index=True)
+            own_keys = pd.MultiIndex.from_frame(own[group_cols])
+            extra = own[~own_keys.isin(list(pool_keys))]
+            sizes = extra.groupby(group_cols).size()
+            print(f"[joint] pair mode, W={args.joint_loss_weight}: {len(pool_keys)} pool cells "
+                  f"+ {len(sizes)} off-grid train/dev cells from the run's own rows "
+                  f"(min {int(sizes.min()) if len(sizes) else 0} rows/cell)")
+            train_dist = config.training_config.intervention_signal_distribution
+            if len(sizes) and int(sizes.min()) < 2 and train_dist != "prob_uniform":
+                # one row => the cell has no spread (`std` NaN, `std_logit` 0), so a
+                # moment-based sampler would inject NaN or a constant without raising.
+                # prob_uniform reads no per-cell statistic.
+                raise ValueError(
+                    f"intervention_signal_distribution {train_dist!r} reads per-cell "
+                    f"statistics, but {int((sizes < 2).sum())} off-grid cells have one row")
+            df = pd.concat([df, extra], ignore_index=True)
     signal_ranges = {}
     for key, vals in df.groupby(group_cols)["activation"]:
-        signal_ranges[signal_range_key(*key)] = {
+        stats = {
             "min": float(vals.min()), "max": float(vals.max()),
             "mean": float(vals.mean()), "std": float(vals.std())}
+        if prob_signal:
+            assert float(vals.min()) >= 0.0 and float(vals.max()) <= 1.0, (
+                f"attention_weight cell {key} has activations outside [0,1]: "
+                f"[{float(vals.min())}, {float(vals.max())}] -- the cache holds "
+                f"pre-softmax logits under a 'P' name (port site mismatch)")
+            stats.update(logit_moments(vals.tolist()))
+            if need_logit_hist:
+                # extra keys for the `empirical_logit` sampler, invisible to the rest
+                stats.update(logit_histogram(vals.tolist()))
+            if need_prob_values:
+                # extra key for the `empirical_prob` sampler, invisible to the rest
+                stats.update(empirical_prob_values(vals.tolist()))
+        if pair_mode:
+            layer, head, d, src = key
+            signal_ranges[signal_range_key(layer, head, pair=(d, src))] = stats
+        else:
+            signal_ranges[signal_range_key(*key)] = stats
 
     def preprocess(ex):
         out = preprocess_example(ex, tokenizer=tokenizer,
@@ -1335,6 +1629,7 @@ def main():
     # enough of them to mean something is misconfigured), then drop the flags -- these
     # datasets are collated straight into model kwargs, so they cannot stay.
     max_len = config.training_config.max_seq_length
+    test_provenance = eval_provenance(test_raw, test_dataset_pred)
     train_dataset = drop_invalid_positions(train_dataset, "train", max_len)
     dev_dataset = drop_invalid_positions(dev_dataset, "dev", max_len)
     test_dataset_pred = drop_invalid_positions(test_dataset_pred, "test", max_len)
@@ -1371,7 +1666,7 @@ def main():
     base.resize_token_embeddings(len(tokenizer))
     diag_ckpt = None
     load_from_ckpt = (args.diag_only or args.ood_only or args.length_only
-                      or args.neuron_gen_only)
+                      or args.neuron_gen_only or args.interv_eval_only)
     if load_from_ckpt:
         # load a specific (possibly mid-run) checkpoint's adapter for eval WITHOUT training
         from peft import PeftModel
@@ -1393,7 +1688,42 @@ def main():
     model = IntrospectionRegressionModel(
         model, signal_ranges=signal_ranges,
         intervention_distribution=config.training_config.intervention_signal_distribution,
-        intervention_extreme_scale=config.training_config.intervention_extreme_scale)
+        intervention_extreme_scale=config.training_config.intervention_extreme_scale,
+        attention_site=port_site(signal_type) if attention_run else None,
+        head_activation=config.training_config.regression_head_activation)
+    print(f"[joint] regression head: {type(model.regression_head).__name__} "
+          f"(regression_head_activation={config.training_config.regression_head_activation})")
+    regression_loss = config.training_config.regression_loss
+    if regression_loss not in REGRESSION_LOSSES:
+        raise ValueError(f"regression_loss {regression_loss!r} not in {REGRESSION_LOSSES}")
+    if regression_loss == "norm_deviance":
+        # deviance is defined on probabilities: the head must output one, and the target
+        # (cached weight or injected value) must be one
+        if config.training_config.regression_head_activation != "sigmoid":
+            raise ValueError("regression_loss 'norm_deviance' needs regression_head_activation "
+                             f"'sigmoid', got {config.training_config.regression_head_activation!r}")
+        if not prob_signal:
+            raise ValueError(f"regression_loss 'norm_deviance' is for attention_weight signals, "
+                             f"this run is {signal_type!r}")
+    print(f"[joint] regression loss: {regression_loss}")
+    if "empirical_logit" in interv_eval_dists and not prob_signal:
+        raise ValueError(f"empirical_logit injection is for attention_weight signals only, "
+                         f"this run is {signal_type!r}")
+    if need_prob_values and not prob_signal:
+        # Without this an MLP run would reach sample_intervention_values' generic branch
+        # and fail there with "Unknown intervention_distribution" mid-training.
+        raise ValueError(f"empirical_prob injection is for attention_weight signals only, "
+                         f"this run is {signal_type!r}")
+    if prob_signal:
+        # Attach AFTER construction: the sampler closes over the model so that it reads
+        # `intervention_distribution` and `intervention_scale` live on every draw. Freeze
+        # them into the closure instead and evaluate_interventional_test's forced
+        # "gaussian at scale 1.0" and every row of interventional_scale_sweep silently
+        # become the same distribution, with the tables filling in as if they had not.
+        model.intervention_fn = make_bounded_prob_intervention_fn(model)
+        print(f"[joint] attention_weight run: intervention values are drawn in log-odds "
+              f"space and mapped through a sigmoid, so every draw is a valid probability "
+              f"(guard band {model.intervention_fn.eps}).")
     if load_from_ckpt:
         load_regression_head(model, str(diag_ckpt))
         # no-op unless the checkpoint's frozen embeddings were stripped to save disk
@@ -1403,12 +1733,34 @@ def main():
 
     gate_input = config.training_config.disable_adapter_in_input
     collator_cls = LoRAGatingCollator if gate_input else UngatedCollator
+    # The KL anchor is a no-op under the gate, and silently so: LoRAGatingCollator leaves
+    # the mask as `lora_token_mask`, compute_loss finds no `anchor_region_mask`, and the
+    # `region_mask is not None` guard drops the term. It is also VACUOUS there -- the gate
+    # zeroes the LoRA delta over the input text, so tuned and base give the same
+    # next-token distribution and KL is 0 by construction, not by optimization. A run like
+    # that lands in a directory named _kl<budget>_ and reads, later, as a budgeted run.
+    anchor_requested = (args.kl_anchor_target is not None or args.kl_anchor_weight > 0)
+    if anchor_requested and gate_input:
+        msg = ("KL anchor requested (--kl-anchor-target/--kl-anchor-weight) but the input "
+               "gate is ON, so the anchor cannot apply: the gate already pins text "
+               "behaviour to the base model, making KL 0 by construction. The run would "
+               "train with NO KL term while its name still claims a budget.")
+        if args.require_kl_anchor:
+            raise SystemExit(f"[joint] {msg} Refusing (--require-kl-anchor).")
+        print(f"[joint] *** WARNING *** {msg} Continuing unanchored.")
     print(f"[joint] LoRA input gate: "
           f"{'ON -- adapter gated to the introspection prompt' if gate_input else 'OFF -- adapter active over the input text too'} "
           f"(training_config.disable_adapter_in_input={gate_input}); lora_dropout="
           f"{config.training_config.lora_dropout}")
     pred_collator = collator_cls(tokenizer=tokenizer, model=model, padding=True,
                                  label_pad_token_id=-100, return_tensors="pt", for_prediction=True)
+
+    if args.interv_eval_only:
+        print(f"[joint] --interv-eval-only: {diag_ckpt} -> {output_dir} | {interv_eval_dists}")
+        run_interventional_evals(model, test_dataset_pred, pred_collator, config, output_dir,
+                                 interv_eval_dists, n_pca=args.routing_probe_pca,
+                                 source_checkpoint=diag_ckpt, provenance=test_provenance)
+        return
 
     if args.neuron_gen_only:
         # No cache prep needed: both arms read this run's own test split, unlike the
@@ -1429,7 +1781,8 @@ def main():
         print(f"[joint] --length-only: {diag_ckpt} -> {output_dir} | lengths={eval_lengths}")
         evaluate_length_grid(model, config, tokenizer, pred_collator,
                              output_dir=output_dir, eval_lengths=eval_lengths,
-                             prepared=length_prepared)
+                             prepared=length_prepared,
+                             interv_dists=interv_eval_dists)
         return
 
     if args.ood_only:
@@ -1485,6 +1838,7 @@ def main():
         # afterwards, where it measures context bypass rather than training progress
         do_intervention=(args.joint_loss_weight < 1.0),
         callbacks=callbacks, joint_loss_weight=args.joint_loss_weight,
+        regression_loss=config.training_config.regression_loss,
         kl_anchor_target=args.kl_anchor_target, kl_anchor_weight=args.kl_anchor_weight,
         kl_anchor_positions=args.kl_anchor_positions,
         kl_anchor_coef_init=args.kl_anchor_coef_init,
@@ -1510,10 +1864,10 @@ def main():
         train_results = trainer.train()
         trainer.save_metrics("train", train_results.metrics)
 
-    # ---- frontier metrics: interventional@gaussian(scale=1) AND endogenous ----
-    evaluate_interventional_test(model, eval_dataset=test_dataset_pred, collator=pred_collator,
-                                 config=config, output_dir=eval_out_dir,
-                                 distribution="gaussian", suffix="_gaussian")
+    # ---- frontier metrics: interventional (gaussian@1 by default) AND endogenous ----
+    run_interventional_evals(model, test_dataset_pred, pred_collator, config, eval_out_dir,
+                             interv_eval_dists, n_pca=args.routing_probe_pca,
+                             provenance=test_provenance)
     # is the cached endogenous target still what the model computes? (auto-runs
     # whenever the adapter is active over the input text, where it can go stale)
     if not args.skip_drift_eval and (not gate_input or args.force_drift_eval):
@@ -1521,10 +1875,17 @@ def main():
         # measures up_proj/gate_proj transmission; an attention logit is not a module
         # output and has no transmission analogue, so that family gets its own
         # implementation of the same two measurements, writing the same filenames.
-        drift_fn = measure_attention_alignment if attention_run else measure_activation_drift
-        drift_fn(model, test_dataset_pred, pred_collator, config, eval_out_dir)
+        if attention_run:
+            # the site must match the cache, or this compares a cached probability
+            # against a live logit and reports it as a position error
+            measure_attention_alignment(model, test_dataset_pred, pred_collator, config,
+                                        eval_out_dir, signal_type=signal_type)
+        else:
+            measure_activation_drift(model, test_dataset_pred, pred_collator, config,
+                                     eval_out_dir)
 
-    eval_endogenous_test(model, test_dataset_pred, pred_collator, config, eval_out_dir)
+    eval_endogenous_test(model, test_dataset_pred, pred_collator, config, eval_out_dir,
+                         provenance=test_provenance)
 
     # diagnostic: is the injected value routed to the readout (ceiling) vs read by
     # the trained head, stratified by token position -> tells us whether earlier-
@@ -1534,9 +1895,14 @@ def main():
 
     # diagnostic: interventional corr vs injection scale -> reveals the numerical/
     # noise floor (corr rising with scale => natural scale is below the floor).
-    scales = [float(x) for x in args.scale_sweep.split(",")]
-    interventional_scale_sweep(model, test_dataset_pred, pred_collator, config, eval_out_dir,
-                               scales=scales, n_pca=args.routing_probe_pca)
+    # --scale-sweep "" switches it off (3-1 drops it: one scale per pair-conditional
+    # pool would mean little, and it costs a full pass over the test grid per scale).
+    scales = [float(x) for x in args.scale_sweep.split(",") if x.strip()]
+    if scales:
+        interventional_scale_sweep(model, test_dataset_pred, pred_collator, config,
+                                   eval_out_dir, scales=scales, n_pca=args.routing_probe_pca)
+    else:
+        print("[joint] --scale-sweep is empty: interventional scale sweep skipped")
 
     if args.neuron_gen_eval:
         from score_neuron_generalization import evaluate_neuron_generalization
@@ -1548,7 +1914,8 @@ def main():
         from score_length_generalization import evaluate_length_grid
         evaluate_length_grid(model, config, tokenizer, pred_collator,
                              output_dir=eval_out_dir, eval_lengths=eval_lengths,
-                             prepared=length_prepared)
+                             prepared=length_prepared,
+                             interv_dists=interv_eval_dists)
 
     if args.ood_eval:
         # lazy import: score_ood_generalization imports this module's eval helpers
@@ -1562,8 +1929,10 @@ def main():
     if args.diag_fp32:
         print("[joint] casting model to fp32 and re-running diagnostics (_fp32) ...")
         model.float()
-        interventional_scale_sweep(model, test_dataset_pred, pred_collator, config, eval_out_dir,
-                                   scales=scales, n_pca=args.routing_probe_pca, suffix="_fp32")
+        if scales:
+            interventional_scale_sweep(model, test_dataset_pred, pred_collator, config,
+                                       eval_out_dir, scales=scales,
+                                       n_pca=args.routing_probe_pca, suffix="_fp32")
         routing_probe_by_position(model, test_dataset_pred, pred_collator, config, eval_out_dir,
                                   scale=args.routing_probe_scale, n_pca=args.routing_probe_pca, suffix="_fp32")
 

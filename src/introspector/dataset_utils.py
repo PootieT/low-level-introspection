@@ -33,8 +33,11 @@ _TYPE_CODE = {"mlp": "N", "attention_score": "A", "attention_weight": "P",
 # "N10.24" / "S12.4567" / bare "10.24" (assumed mlp) / "A10.5@-3" (attention: the
 # @<src_offset> suffix is the source token's offset from the destination token)
 _FILTER_RE = re.compile(
-    r"^(?P<code>[NARSP])?(?P<layer>\d+)\.(?P<index>\d+)(?:@(?P<src>[+-]?\d+))?$"
+    r"^(?P<code>[NARSP])?(?P<layer>\d+)\.(?P<index>\d+)(?:@(?P<src>[+-]?\d+|pairs))?$"
 )
+# Filter value for a PAIR MODE signal ("P6.3@pairs"): match (type, layer, index) and take
+# every row whatever its realized src_offset. Same string as resolution.PAIRS_SUFFIX.
+PAIRS = "pairs"
 # Signal types whose identity includes a source-token offset. Keep in sync with
 # signals.resolution.ATTENTION_CODES.
 _ATTENTION_TYPES = ("attention_score", "attention_weight")
@@ -85,6 +88,8 @@ def _src_offset(spec):
 
 
 def _src_suffix(spec) -> str:
+    if spec.type in _ATTENTION_TYPES and getattr(spec, "src_offset", None) is None:
+        return f"@{PAIRS}"
     off = _src_offset(spec)
     return "" if off is None else f"@{off}"
 
@@ -95,6 +100,10 @@ def _short_selector(sel) -> str:
     if sel.type == "random_range":
         lo, hi = sorted((sel.start, sel.stop))
         return f"posR{lo}to{hi}"
+    if sel.type == "random_pair":
+        return "posPairs"
+    if sel.type == "pair_list":
+        return f"posGrid{len(sel.pairs)}"
     return f"pos{sel.type}"
 
 
@@ -202,6 +211,45 @@ def canonical_dataset_name(config) -> str:
     ])
 
 
+# ---- PAIR MODE injection pool (experiment 3-1) ----
+# Per-(head, dst, src) attention weights read from TRAIN documents at the longest eval
+# length, so a pair-conditional `empirical_prob` injection has a pool for every pair any
+# eval length asks for -- including dst >= n, which an n-token training cache never
+# contains. By the causal mask the weight at (d, s) depends only on tokens 0..d, so a
+# 512-token read is the right value for every shorter prefix too. Test documents are
+# never used, so no test label leaks into what gets injected.
+POOL_DOCS = 4000
+POOL_SEQ_LEN = 512
+
+
+def pair_pool_identity(config, n_docs: int = POOL_DOCS, seq_len: int = POOL_SEQ_LEN):
+    """What determines the pool's content. Deliberately excludes the run's own train
+    max_seq_length and max_samples, so the runs at every training length n share ONE pool."""
+    from .signals.pair_grid import pool_pairs
+    ds = config.train_dataset
+    return {
+        "model_name": config.model_name,
+        "seed": config.seed,
+        "load_in_4bit": config.load_in_4bit,
+        "load_in_8bit": config.load_in_8bit,
+        "corpus": {"name": ds.name, "split": ds.split, "text_field": ds.text_field,
+                   "min_seq_length": ds.min_seq_length, "hf_data_kwargs": ds.hf_data_kwargs},
+        "signals": [_spec_identity(s) for s in config.train_signals],
+        "n_docs": n_docs,
+        "seq_len": seq_len,
+        "pairs": [list(p) for p in pool_pairs()],
+    }
+
+
+def pair_pool_dir(config, n_docs: int = POOL_DOCS, seq_len: int = POOL_SEQ_LEN):
+    from pathlib import Path
+    ident = pair_pool_identity(config, n_docs, seq_len)
+    h = hashlib.sha1(json.dumps(ident, sort_keys=True, default=str).encode()).hexdigest()[:8]
+    name = "_".join([_short_signals(config.train_signals), f"{_short_count(n_docs)}docs",
+                     f"seq{seq_len}", h])
+    return Path(config.cache_dir) / "_pair_pool" / _short_model(config.model_name) / name
+
+
 def parse_signal_filter(spec: str) -> dict[str, Any]:
     """'N10.24' / '10.24' -> {'signal_type': 'mlp', 'signal_layer': 10, 'signal_index': 24}.
 
@@ -235,9 +283,10 @@ def parse_signal_filter(spec: str) -> dict[str, Any]:
         if src is None:
             raise ValueError(
                 f"{spec!r}: an attention filter must name the source offset, e.g. "
-                f"'A10.5@-3'. Without it the filter would match every offset in the "
-                f"cell and the run would train on several signals at once.")
-        out["src_offset"] = int(src)
+                f"'A10.5@-3' (or '@pairs' for a pair-mode cache). Without it the filter "
+                f"would match every offset in the cell and the run would train on several "
+                f"signals at once.")
+        out["src_offset"] = PAIRS if src == PAIRS else int(src)
     return out
 
 
@@ -296,8 +345,18 @@ def apply_signal_filter(dataset, spec: Optional[str], split_name: str = ""):
 
     keys = {(w["signal_type"], w["signal_layer"], w["signal_index"], w.get("src_offset"))
             for w in wants}
+    # PAIR MODE ("@pairs"): one signal spans every realized offset, so it matches on the
+    # first three fields. Kept apart from the exact keys so "P6.3@-1" and "P6.3@pairs"
+    # can never match each other's rows.
+    pair_keys = {k[:3] for k in keys if k[3] == PAIRS}
+    exact_keys = {k for k in keys if k[3] != PAIRS}
+
+    def _matches(ex):
+        k = _row_key(ex)
+        return k in exact_keys or k[:3] in pair_keys
+
     before = len(dataset)
-    filtered = dataset.filter(lambda ex: _row_key(ex) in keys)
+    filtered = dataset.filter(_matches)
     if len(filtered) == 0:
         present = _present_keys(dataset) if before else []
         raise SystemExit(f"signal_filter {spec!r} matched 0 of {before} rows in {split_name or 'dataset'}. "
@@ -305,13 +364,15 @@ def apply_signal_filter(dataset, spec: Optional[str], split_name: str = ""):
     # A partial match is worth naming: asking for 100 neurons and getting 60 means the
     # cache was built with a different set, and the run would quietly train on fewer.
     got = set(_present_keys(filtered))
-    missing = keys - got
+    missing = (exact_keys - got) | (pair_keys - {k[:3] for k in got})
     label = spec if len(wants) <= 3 else f"{len(wants)} signals"
     if missing:
         raise SystemExit(
             f"signal_filter ({label}) in {split_name or 'dataset'}: "
             f"{len(missing)} of {len(keys)} requested signals are absent from the cache, "
             f"e.g. {sorted(missing, key=str)[:5]}. The cache was built with a different signal set.")
+    # a pair-mode signal spans many realized offsets; count it once
+    n_signals = len(exact_keys & got) + len(pair_keys & {k[:3] for k in got})
     print(f"[signal_filter] {split_name or 'dataset'}: {label} -> {len(filtered)}/{before} rows "
-          f"({len(got)} signals)")
+          f"({n_signals} signals)")
     return filtered

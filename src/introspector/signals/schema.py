@@ -35,13 +35,19 @@ class _AttentionSpecBase(SpecModel):
     # Source token offset relative to the destination token: 0 == the destination
     # attending to itself, -1 == the token immediately before it.
     #
+    # None == PAIR MODE ("P6.3@pairs"): the (dst, src) pair is not part of the signal but
+    # comes from a pair token selector (RandomPairTokenSelector / PairListTokenSelector),
+    # one pair per cached row. The spec then names only (layer, head), and each row's
+    # realized offset (src - dst) is written into its `src_offset` column. An int and
+    # None never mix in one config; cache_signals.validate_attention_offsets refuses it.
+    #
     # WHY a position lives in the signal IDENTITY. One forward pass produces the whole
     # [B, Hq, L_dst, L_src] logit tensor, so every source offset is free once the
     # destination is fixed. Putting src_offset in the spec lets ONE cached dataset hold
     # many offsets, split per run by --signal-filter (which is deliberately not part of
     # the cache identity). Keeping it in the token selector instead would force one
     # caching pass per offset.
-    src_offset: int = -1
+    src_offset: int | None = -1
 
     def __hash__(self):
         # MUST override: SpecModel.__hash__ keys on (type[0], layer, index) only, and
@@ -194,4 +200,35 @@ class RandomRangeTokenSelector(BaseModel):
     stop: int
 
 
-TokenSelector = Union[FixedTokenSelector,RandomRangeTokenSelector]
+class RandomPairTokenSelector(BaseModel):
+    """PAIR MODE, training: each document gets ONE (dst, src) pair drawn uniformly from
+    all causal pairs 0 <= src <= dst < seq_len except (0, 0) (BOS -> BOS, always 1.0).
+
+    Uniform over PAIRS, not over dst: P(dst = d) is proportional to d + 1. Requires every
+    document to be exactly max_seq_length tokens (min_seq_length >= max_seq_length), so
+    the pair set is the same for every document; validate_attention_offsets enforces it.
+    """
+    type: Literal["random_pair"] = "random_pair"
+
+
+class PairListTokenSelector(BaseModel):
+    """PAIR MODE, evaluation: EVERY listed absolute (dst, src) pair on every document, one
+    cached row per (document, signal, pair), all read from a single forward pass.
+
+    Absolute positions (0 == BOS), so the same pair means the same attention cell at
+    every eval length: by the causal mask the weight at (d, s) depends only on tokens
+    0..d, and a length-m cache of right-truncated documents holds the same value there
+    for every m > d. That is what makes the length sweep a paired comparison.
+    """
+    type: Literal["pair_list"] = "pair_list"
+    pairs: list[tuple[int, int]]
+
+
+TokenSelector = Union[FixedTokenSelector, RandomRangeTokenSelector,
+                      RandomPairTokenSelector, PairListTokenSelector]
+
+PAIR_SELECTOR_TYPES = ("random_pair", "pair_list")
+
+
+def is_pair_selector(sel) -> bool:
+    return getattr(sel, "type", None) in PAIR_SELECTOR_TYPES

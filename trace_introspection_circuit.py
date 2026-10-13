@@ -53,8 +53,11 @@ from src.introspector.config import ExperimentConfig
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
 from src.introspector.prompts import PROMPT_REGISTRY
 from src.introspector.training.collator import LoRAGatingCollator
+from src.introspector.models.attention_logits import is_attention_type
 from src.introspector.training.model import (
     IntrospectionRegressionModel,
+    logit_moments,
+    signal_range_key,
     load_regression_head,
     load_added_token_embeddings,
     replace_model_with_gated_version,
@@ -101,12 +104,35 @@ def parse_args():
 # Loading (reuses the training script's building blocks)
 # ======================================================================
 def compute_signal_ranges(train_dataset_raw):
+    """Per-signal empirical range, keyed exactly as the model's sampler looks it up.
+
+    An attention signal is (layer, head, source offset), not (layer, head): a cell holds
+    ten offsets whose ranges differ by an order of magnitude between the BOS sink and a
+    mid-context token. Grouping on (layer, head) alone pools all ten into one range, so
+    every intervention would be drawn from the wrong distribution -- silently, because
+    the resulting numbers are still plausible. This mirrors
+    train_introspector_joint.py's grouping and uses signal_range_key, the same function
+    IntrospectionRegressionModel.sample_intervention_values looks up with.
+
+    For attention_weight the log-odds moments ride along too: that signal lives in (0,1)
+    and make_bounded_prob_intervention_fn samples in log-odds space.
+    """
     df = train_dataset_raw.to_pandas()
-    grouped = df.groupby(["signal_layer", "signal_index"])["activation"]
+    signal_type = df["signal_type"].iloc[0] if len(df) else None
+    attention = is_attention_type(signal_type)
+    if attention:
+        assert df["src_offset"].notna().all(), (
+            "attention rows without src_offset -- cache predates attention signals")
+        group_cols = ["signal_layer", "signal_index", "src_offset"]
+    else:
+        group_cols = ["signal_layer", "signal_index"]
     ranges = {}
-    for key, vals in grouped:
-        ranges[key] = {"min": float(vals.min()), "max": float(vals.max()),
-                       "mean": float(vals.mean()), "std": float(vals.std())}
+    for key, vals in df.groupby(group_cols)["activation"]:
+        stats = {"min": float(vals.min()), "max": float(vals.max()),
+                 "mean": float(vals.mean()), "std": float(vals.std())}
+        if signal_type == "attention_weight":
+            stats.update(logit_moments(vals.tolist()))
+        ranges[signal_range_key(*key)] = stats
     return ranges
 
 

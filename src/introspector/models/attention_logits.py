@@ -45,9 +45,18 @@ from transformers.models.llama.modeling_llama import repeat_kv
 # model load time and stored in `config._attn_implementation`.
 ATTN_IMPL_NAME = "introspection_logit"
 
-# Attribute name the port is installed under on a `LlamaAttention` module. Underscore-
-# prefixed so it cannot collide with a real transformers field.
-PORT_ATTR = "_introspection_port"
+# Attribute names the ports are installed under on a `LlamaAttention` module. Underscore-
+# prefixed so they cannot collide with a real transformers field.
+#
+# TWO ports, not one, because the two signals live at DIFFERENT points of the same
+# forward: the logit before the mask and the softmax, the weight after both. A single
+# attribute would force the A and P ports of one layer to evict each other, and
+# `installed_ports` asserts the slot is empty -- so the collision would at least be
+# loud. It is still wrong: caching A and P in one pass is the whole reason a cell costs
+# one forward.
+PORT_ATTR = "_introspection_port"                 # pre-softmax attention logit (code A)
+PORT_ATTR_WEIGHT = "_introspection_weight_port"   # post-softmax attention weight (code P)
+PORT_ATTRS = {"logit": PORT_ATTR, "weight": PORT_ATTR_WEIGHT}
 
 
 def introspection_attention_forward(
@@ -87,7 +96,24 @@ def introspection_attention_forward(
         # slice to the kv length, matching upstream's handling of cached keys
         attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
 
-    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    # THE OTHER SIGNAL. [B, Hq, L_dst, L_src], a probability over the causal row.
+    #
+    # DO NOT fold these three statements back into the one-liner they came from
+    # (`F.softmax(..., dtype=torch.float32).to(query.dtype)`). Split this way the kernel
+    # sequence is identical when `wport is None`, so every attention_score run stays
+    # bit-for-bit what it was -- that is what validate_attention_logits.py checks and
+    # what keeps the A sweep's cached numbers comparable to new ones.
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)  # [B, Hq, L, L] fp32
+    wport = getattr(module, PORT_ATTR_WEIGHT, None)
+    if wport is not None:
+        # Read in fp32, BEFORE the cast and BEFORE dropout, both deliberately.
+        #   cast: bf16's relative precision is ~2^-8 = 4e-3, and a mid-context weight is
+        #     ~1e-3 -- quantizing here would leave 2-3 significant digits, i.e. the
+        #     quantization noise would be the same size as the signal's variation.
+        #   dropout: with module.training=True it zeroes values or scales them by
+        #     1/(1-p). Llama's attention_dropout is 0 today; this does not depend on that.
+        attn_weights = wport(attn_weights)                               # [B, Hq, L, L]
+    attn_weights = attn_weights.to(query.dtype)
     attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
     attn_output = torch.matmul(attn_weights, value_states)          # [B, Hq, L, d]
     attn_output = attn_output.transpose(1, 2).contiguous()          # [B, L, Hq, d]
@@ -122,6 +148,19 @@ def attention_model_kwargs(signal_specs) -> dict:
 def is_attention_type(signal_type) -> bool:
     """True for the signal types served by this file."""
     return signal_type in ("attention_score", "attention_weight")
+
+
+def port_site(signal_type) -> str:
+    """Which of the two port sites a signal type is read/written at.
+
+    Single source of truth, so `cache_signals` and the trainer cannot disagree about
+    where a signal lives. They CAN disagree silently otherwise: both branch on
+    `is_attention_type`, which is True for either type, so a P config routed through the
+    logit port would cache the pre-softmax value under a `P` name and an "attention
+    weight" prompt without raising anything.
+    """
+    assert is_attention_type(signal_type), f"not an attention signal: {signal_type!r}"
+    return "logit" if signal_type == "attention_score" else "weight"
 
 
 def ensure_dispatched(model):
@@ -215,7 +254,13 @@ class AttentionLogitPort:
         self.values = values        # [B] float, or None for read-only
         self.read = None            # [B] float, filled on each call
 
-    def __call__(self, attn_logits):                       # [B, Hq, L_dst, L_src]
+    def _resolve(self, attn_logits):
+        """Validate the index tensors against this batch and move them to its device.
+
+        Returns (bidx, heads, dst, src), each [B]. Split out of __call__ so the
+        post-softmax subclass reuses the checks verbatim instead of copying them --
+        every one of them is as valid on a probability tensor as on a logit tensor.
+        """
         B, n_heads, seq_dst, seq_src = attn_logits.shape
         assert self.heads.shape == (B,), f"heads {tuple(self.heads.shape)} != ({B},)"
         assert self.dst.shape == (B,), f"dst {tuple(self.dst.shape)} != ({B},)"
@@ -242,9 +287,10 @@ class AttentionLogitPort:
 
         device = attn_logits.device
         bidx = torch.arange(B, device=device)                       # [B]
-        heads = self.heads.to(device)
-        dst = self.dst.to(device)
-        src = self.src.to(device)
+        return bidx, self.heads.to(device), self.dst.to(device), self.src.to(device)
+
+    def __call__(self, attn_logits):                       # [B, Hq, L_dst, L_src]
+        bidx, heads, dst, src = self._resolve(attn_logits)
 
         self.read = attn_logits[bidx, heads, dst, src].detach().float()   # [B]
 
@@ -252,8 +298,194 @@ class AttentionLogitPort:
             return attn_logits
 
         out = attn_logits.clone()
-        out[bidx, heads, dst, src] = self.values.to(device=device, dtype=out.dtype)
+        out[bidx, heads, dst, src] = self.values.to(device=attn_logits.device,
+                                                    dtype=out.dtype)
         return out
+
+
+class AttentionWeightPort(AttentionLogitPort):
+    """Read/write port on ONE layer's POST-softmax attention weights (code P).
+
+    READ is the parent's: gather p[b, head, dst, src] into `self.read`. The tensor is a
+    probability row rather than a logit row, but every bound and the causal `src <= dst`
+    check mean the same thing, so `_resolve` is reused unchanged.
+
+    WRITE is NOT the parent's. Overwriting one cell with t leaves the row summing to
+    1 - p_j + t, and no logit row softmaxes to that -- it would inject a state the model
+    cannot produce and then ask it to report it. Instead the row is RENORMALIZED:
+
+        p'_j = t,    p'_k = p_k * (1 - t) / (1 - p_j)    for k != j
+
+    which is exactly equal, in every cell, to shifting the single pre-softmax logit z_j
+    by delta = logit(t) - logit(p_j), where logit(u) = log(u/(1-u)) is the inverse of
+    sigmoid -- NOT the attention logit z, which is the other thing "logit" means here.
+    Sketch: with R = sum_{k != j} exp(z_k), p_j / (1 - p_j) = exp(z_j) / R, so
+    logit(p_j) = z_j - log R; moving z_j alone leaves R fixed, so logit(p_j) moves by
+    exactly the same delta. (Full derivation: md/attention_weight/
+    1_attention_weight_experiment_plan.md, section 3-2 (a)-(c). Checked numerically by
+    validate_attention_weights.py, block EQUIVALENCE.)
+
+    That equality is what lets the A and P experiments be read side by side: both
+    intervene by moving one attention logit and letting the row follow.
+
+    The other cells of the row moving is intended, not a leak. A probability row cannot
+    have one entry changed in isolation, and it mirrors A, where changing one logit also
+    moves every weight in its row.
+    """
+
+    # Guard band on p_j only: the renormalization divides by (1 - p_j). The target t
+    # needs no band -- see the assert in __call__.
+    EPS = 1e-6
+
+    def __call__(self, attn_probs):                        # [B, Hq, L_dst, L_src] fp32
+        bidx, heads, dst, src = self._resolve(attn_probs)
+
+        p_j = attn_probs[bidx, heads, dst, src]                      # [B]
+        self.read = p_j.detach().float()                             # [B], read BEFORE the write
+
+        if self.values is None:
+            return attn_probs
+
+        t = self.values.to(device=attn_probs.device, dtype=attn_probs.dtype)   # [B]
+        # Internal invariants -> assert, and NEVER clamp. The sampler, not the user,
+        # produces these. If t >= 1 or p_j >= 1 the scale (1-t)/(1-p_j) goes negative
+        # and builds a row with negative probabilities -- and since the softmax is
+        # already behind us, nothing downstream raises. Clamping would instead inject a
+        # silently different value than the one recorded as the regression target.
+        # t is checked against the CLOSED [0, 1]. It enters the row only through the
+        # linear (1 - t), so t = 0 (others scaled by 1/(1-p_j)) and t = 1 (others 0) are
+        # both valid probability rows; only the logit-shift reading of the write needs
+        # 0 < t < 1, and nothing computes logit(t) here. This used to be (EPS, 1-EPS),
+        # which killed `empirical_prob` runs: real train weights go down to 1e-9
+        # (0.7% of L14 h26 @-19 sit below 1e-6), and that sampler injects them as-is.
+        assert bool(((t >= 0) & (t <= 1)).all()), (
+            f"attention weight target outside [0,1]: min={float(t.min())}, "
+            f"max={float(t.max())}")
+        assert bool((p_j < 1 - self.EPS).all()), (
+            f"p_j too close to 1 to renormalize: max={float(p_j.max())}")
+
+        scale = ((1 - t) / (1 - p_j)).view(-1, 1)                    # [B, 1]
+        out = attn_probs.clone()
+        row = out[bidx, heads, dst] * scale                          # [B, L_src]
+        row[torch.arange(row.shape[0], device=row.device), src] = t  # target cell exactly t
+        out[bidx, heads, dst] = row
+        return out
+
+
+class AttentionRowTap:
+    """Read-only tap on a WHOLE destination row, at several source offsets and all heads.
+
+    A port reads one cell per example, so scanning 16 layers x 32 heads x 10 offsets
+    through the ordinary machinery would need 5120 ports. This reads the same
+    [B, Hq, L_dst, L_src] tensor the forward already computed and gathers
+    [B, Hq, n_offsets] out of it, which is what makes a full-grid spread scan cost one
+    forward per batch instead of 5120.
+
+    `dst` is per-example ([B]); `src_offsets` is a fixed list of non-positive offsets
+    shared by the batch. Out-of-range (src < 0) is asserted, not clamped, for the same
+    reason as in AttentionLogitPort.
+    """
+
+    def __init__(self, dst, src_offsets):
+        self.dst = dst                       # [B] long
+        self.src_offsets = list(src_offsets)  # e.g. [0, -1, -3, ..., -31]
+        self.read = None                     # [B, Hq, n_offsets] float32
+
+    def __call__(self, attn_probs):                        # [B, Hq, L_dst, L_src]
+        B, n_heads, seq_dst, seq_src = attn_probs.shape
+        assert self.dst.shape == (B,), f"dst {tuple(self.dst.shape)} != ({B},)"
+        device = attn_probs.device
+        dst = self.dst.to(device)
+        assert int(dst.min()) >= 0 and int(dst.max()) < seq_dst, (
+            f"dst out of range: [{int(dst.min())}, {int(dst.max())}] not within [0, {seq_dst})")
+
+        # The destination row is the same for every offset, so gather it once.
+        rows = attn_probs[torch.arange(B, device=device), :, dst]    # [B, Hq, L_src]
+        cols = []
+        for off in self.src_offsets:
+            src = dst + off                                          # [B]
+            assert bool(((src >= 0) & (src <= dst)).all()), (
+                f"offset {off} leaves the causal range for some example: "
+                f"src min={int(src.min())}, dst min={int(dst.min())}")
+            cols.append(rows.gather(2, src.view(B, 1, 1).expand(B, n_heads, 1)))  # [B,Hq,1]
+        self.read = torch.cat(cols, dim=2).detach().float()          # [B, Hq, n_offsets]
+        return attn_probs
+
+
+class AttentionCellGridTap:
+    """Read-only tap on a FIXED list of absolute (dst, src) cells, for a few heads.
+
+    PAIR MODE evaluation reads every pair of a grid (up to 599) on every document. One
+    AttentionLogitPort per (head, pair) would be ~1.8K ports per forward; this gathers
+    the same [B, H, P] block out of the tensor the forward already computed, in one go.
+
+    `heads` [H] and `dst`/`src` [P] are shared by the whole batch, because a pair-list
+    cache asks for the same cells in every document. Bounds and causality are asserted,
+    never clamped, as in AttentionLogitPort.
+    """
+
+    def __init__(self, heads, dst, src):
+        assert dst.shape == src.shape and dst.ndim == 1, (
+            f"dst {tuple(dst.shape)} / src {tuple(src.shape)} must both be [P]")
+        assert bool((src <= dst).all()), "src must not be after dst"
+        self.heads = heads                    # [H] long
+        self.dst = dst                        # [P] long
+        self.src = src                        # [P] long
+        self.read = None                      # [B, H, P] float32
+
+    def __call__(self, attn_probs):                        # [B, Hq, L_dst, L_src]
+        B, n_heads, seq_dst, seq_src = attn_probs.shape
+        device = attn_probs.device
+        heads, dst, src = (self.heads.to(device), self.dst.to(device), self.src.to(device))
+        assert int(heads.min()) >= 0 and int(heads.max()) < n_heads, (
+            f"head out of range: [{int(heads.min())}, {int(heads.max())}] not within [0, {n_heads})")
+        assert int(src.min()) >= 0 and int(dst.max()) < seq_dst, (
+            f"pair out of range: src min {int(src.min())}, dst max {int(dst.max())}, "
+            f"L={seq_dst} -- a document is shorter than the grid needs")
+        sub = attn_probs[:, heads]                                   # [B, H, L_dst, L_src]
+        self.read = sub[:, :, dst, src].detach().float()             # [B, H, P]
+        return attn_probs
+
+
+class AttentionProbGradTap:
+    """Make one layer's post-softmax weights a differentiable leaf, for attribution.
+
+    Returns `alpha * p` where p is detached and marked as requiring grad, so that after
+    one backward from the readout, `self.leaf.grad` holds d(prediction)/d(p) for EVERY
+    (head, dst, src) of that layer at once -- 512 head-matrices from a single backward
+    across the 16 layers.
+
+    `alpha` is the Integrated Gradients path coefficient against the zero-attention
+    baseline (Hao et al. 2021, "Self-Attention Attribution"): alpha = 1 gives plain
+    gradient x activation, which is IG's single-step approximation, and averaging
+    gradients over an alpha grid gives IG proper. IG is what the final figures use,
+    because a softmax row saturates and gradient x activation under-attributes exactly
+    there.
+
+    Detaching means the scaled row does not sum to 1 for alpha < 1. That is the intended
+    IG baseline (no attention at all), not a bug -- unlike AttentionWeightPort's write,
+    this is not pretending to be a reachable model state.
+
+    CONSEQUENCE OF DETACHING, and the reason token attribution needs its own pass: the
+    gradient path from p BACK to q, k and ultimately the input embeddings is severed at
+    every tapped layer. d(prediction)/d(p) stays correct for each layer, because the
+    path FORWARD from each leaf is intact, but a backward taken with these taps
+    installed reaches the embeddings only through the residual stream. Run the
+    embedding-gradient pass with no taps installed.
+    """
+
+    def __init__(self, alpha=1.0):
+        self.alpha = float(alpha)
+        self.leaf = None      # [B, Hq, L, L] fp32, requires_grad
+        self.value = None     # [B, Hq, L, L] fp32, detached copy for grad x act
+
+    def __call__(self, attn_probs):                        # [B, Hq, L_dst, L_src]
+        leaf = attn_probs.detach().clone().requires_grad_(True)
+        self.leaf = leaf
+        self.value = leaf.detach()
+        if self.alpha == 1.0:
+            return leaf
+        return leaf * self.alpha
 
 
 class PortFanOut:
@@ -286,14 +518,22 @@ def fan_out_ports(ports_by_spec: dict) -> dict:
 class installed_ports:
     """Context manager: attach ports to layers, guarantee removal.
 
-    `ports` is {layer_index: AttentionLogitPort}. Removal happens in `finally` so a raised
-    assertion inside the forward cannot leave a stale port attached to the model -- which
-    would silently intervene on the NEXT, unrelated forward pass.
+    `ports` is {layer_index: port}. Removal happens in `finally` so a raised assertion
+    inside the forward cannot leave a stale port attached to the model -- which would
+    silently intervene on the NEXT, unrelated forward pass.
+
+    `site` picks which of the two attributes to attach to: "logit" (pre-softmax, the
+    default and what every pre-existing call site means) or "weight" (post-softmax).
+    Two instances of this manager can therefore be nested to read both sites in one
+    forward, because they claim different attributes.
     """
 
-    def __init__(self, model, ports: dict):
+    def __init__(self, model, ports: dict, site: str = "logit"):
+        assert site in PORT_ATTRS, f"unknown port site {site!r}, want one of {sorted(PORT_ATTRS)}"
         self.model = model
         self.ports = ports
+        self.site = site
+        self._attr = PORT_ATTRS[site]
         self._modules = []
 
     def __enter__(self):
@@ -301,14 +541,14 @@ class installed_ports:
         assert_attention_impl(self.model)
         for layer, port in self.ports.items():
             module = resolve_attention_module(self.model, layer)
-            assert getattr(module, PORT_ATTR, None) is None, (
-                f"layer {layer} already has a port installed; nested/leaked port")
-            setattr(module, PORT_ATTR, port)
+            assert getattr(module, self._attr, None) is None, (
+                f"layer {layer} already has a {self.site!r} port installed; nested/leaked port")
+            setattr(module, self._attr, port)
             self._modules.append(module)
         return self.ports
 
     def __exit__(self, *exc):
         for module in self._modules:
-            setattr(module, PORT_ATTR, None)
+            setattr(module, self._attr, None)
         self._modules = []
         return False

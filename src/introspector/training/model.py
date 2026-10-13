@@ -1,6 +1,7 @@
 import os
 import pdb
 import math
+import bisect
 import random
 import operator
 from typing import Any, Optional
@@ -14,8 +15,8 @@ from transformers import TrainerCallback
 
 from src.introspector.models.signal_paths import resolve_mlp_signal_path
 from src.introspector.models.attention_logits import (
-    AttentionLogitPort, PORT_ATTR, assert_attention_impl, is_attention_type,
-    resolve_attention_module,
+    AttentionLogitPort, AttentionWeightPort, PORT_ATTR, PORT_ATTRS,
+    assert_attention_impl, is_attention_type, resolve_attention_module,
 )
 
 # the custom regression head is NOT part of the PEFT adapter, so PEFT's
@@ -150,13 +151,26 @@ def replace_model_with_gated_version(model: PeftModelForCausalLM):
 # ============================================================
 # Hook helpers
 # ============================================================
-def signal_range_key(layer, index, src_offset=None):
-    """Key into `signal_ranges`. 2-tuple for MLP/SAE (unchanged), 3-tuple for attention.
+# Third slot of a PAIR MODE range key; a string so it can never equal a real offset.
+PAIR_RANGE_TAG = "pair"
+
+
+def signal_range_key(layer, index, src_offset=None, pair=None):
+    """Key into `signal_ranges`. 2-tuple for MLP/SAE (unchanged), 3-tuple for attention,
+    5-tuple (layer, head, "pair", dst, src) for PAIR MODE attention.
 
     One function so the dict that trainers BUILD and the sampler that READS it cannot
     drift apart -- a mismatch there is a KeyError at best and a wrong intervention
     distribution at worst.
+
+    PAIR MODE keys on the ABSOLUTE (dst, src), not on the offset: the weight at offset -1
+    is ~0.5 at dst=1 and ~0.01 at dst=500, so an offset-keyed range would inject values
+    from the wrong distribution at nearly every position.
     """
+    if pair is not None:
+        assert src_offset is None, "a pair-mode key takes the pair, not an offset"
+        d, s = pair
+        return (int(layer), int(index), PAIR_RANGE_TAG, int(d), int(s))
     if src_offset is None:
         return (int(layer), int(index))
     return (int(layer), int(index), int(src_offset))
@@ -170,11 +184,12 @@ class _PortHandle:
     would end up secretly interventional.
     """
 
-    def __init__(self, module):
+    def __init__(self, module, attr=PORT_ATTR):
         self.module = module
+        self.attr = attr          # which port site to clear; defaults to the logit port
 
     def remove(self):
-        setattr(self.module, PORT_ATTR, None)
+        setattr(self.module, self.attr, None)
 
 
 class InterventionHook:
@@ -242,6 +257,256 @@ class SAEInterventionHook:
         return hidden
 
 
+# Guard band for signals that live in (0, 1), i.e. post-softmax attention weights.
+# It was chosen LOOSER than the port's old target band (EPS, 1-EPS), which a draw on
+# the edge would have hit at a random step; the port now accepts all of [0, 1] (see
+# AttentionWeightPort.__call__), but the value stays so every log-odds run keeps drawing
+# the same distribution it always did. `logit_moments` and the sampler share it
+# so the empirical range a `uniform` draw spans is a range the sampler can actually
+# reach -- with two different epsilons, uniform would clamp a third of its draws while
+# reporting itself as uniform.
+PROB_SIGNAL_EPS = 1e-4
+
+
+def logit_moments(values, eps=PROB_SIGNAL_EPS):
+    """Log-odds summary of a probability sample, for the bounded sampler below.
+
+    `values` is an iterable of probabilities. Returns the extra `signal_ranges` keys
+    (`mean_logit`, `std_logit`, `min_logit`, `max_logit`) that
+    `make_bounded_prob_intervention_fn` reads. Kept next to its consumer so the two
+    cannot drift apart about names.
+
+    Clipping to [eps, 1-eps] before the log is what keeps a cell whose weight underflows
+    to exactly 0 (or saturates to 1) from producing an infinite moment that would then
+    poison every draw for that cell.
+    """
+    vals = [min(max(float(v), eps), 1.0 - eps) for v in values]
+    assert vals, "logit_moments got an empty sample"
+    ls = [math.log(v / (1.0 - v)) for v in vals]
+    mean = sum(ls) / len(ls)
+    var = sum((x - mean) ** 2 for x in ls) / max(len(ls) - 1, 1)
+    return {"mean_logit": mean, "std_logit": math.sqrt(var),
+            "min_logit": min(ls), "max_logit": max(ls)}
+
+
+# Guard band for the `empirical_logit` EVAL sampler only. Looser than PROB_SIGNAL_EPS
+# because its draws come from the cell's own histogram, not from a widened range, so a
+# clamp there would only cut real mass (on L2 h26 @-27, 34% of the natural weights sit
+# below 1e-4). Kept at 1e-5 when the port's target band was dropped, for the same
+# reason PROB_SIGNAL_EPS was: existing empirical_logit numbers stay reproducible.
+EMPIRICAL_EPS = 1e-5
+
+
+def logit_histogram(values, n_bins=100, eps=EMPIRICAL_EPS):
+    """Equal-width log-odds histogram of a probability sample, for `empirical_logit`.
+
+    Returns the extra `signal_ranges` keys `logit_hist_edges` ([n_bins+1]) and
+    `logit_hist_cdf` ([n_bins], last entry 1). Kept next to `logit_moments` and the
+    sampler for the same reason: the key names live in one place.
+    """
+    # Bounds go through the SAME expression as the data. They used to be written as
+    # log((1-eps)/eps), but a value clamped to 1-eps maps to log((1-eps)/(1-(1-eps))), and
+    # 1-(1-eps) != eps in floating point: the clamped top value came out 4.5e-12 ABOVE the
+    # bound and the assert below killed every run whose cell has a weight >= 1-eps (BOS at
+    # an early destination, 7-1 tasks 45/52/54) -- before training, on a value only the
+    # empirical_logit eval reads.
+    def _logit(v):
+        return math.log(v / (1.0 - v))
+    lo_l, hi_l = _logit(eps), _logit(1.0 - eps)
+    ls = [_logit(v) for v in (min(max(float(v), eps), 1.0 - eps) for v in values)]
+    assert ls, "logit_histogram got an empty sample"
+    lo, hi = min(ls), max(ls)
+    assert lo_l <= lo <= hi <= hi_l, f"logits [{lo}, {hi}] outside the clip [{lo_l}, {hi_l}]"
+    if hi - lo < 1e-9:           # a constant cell: one bin of width ~0 around the value
+        lo, hi = lo - 1e-6, hi + 1e-6
+    width = (hi - lo) / n_bins
+    counts = [0] * n_bins
+    for x in ls:
+        counts[min(int((x - lo) / width), n_bins - 1)] += 1
+    edges = [lo + i * width for i in range(n_bins)] + [hi]
+    cdf, run = [], 0
+    for c in counts:
+        run += c
+        cdf.append(run / len(ls))
+    assert len(edges) == n_bins + 1 and len(cdf) == n_bins, (
+        f"edges {len(edges)} != {n_bins + 1} or cdf {len(cdf)} != {n_bins}")
+    assert cdf[-1] == 1.0, f"cdf ends at {cdf[-1]}, not 1"
+    return {"logit_hist_edges": edges, "logit_hist_cdf": cdf}
+
+
+def empirical_prob_values(values):
+    """The train split's own probabilities, for the `empirical_prob` sampler.
+
+    Returns the extra `signal_ranges` key `train_values` (a list of floats). Kept next
+    to `logit_histogram` and the sampler for the same reason: the key name lives in one
+    place. The sampler draws from this list as-is, so the [0, 1] check here is the ONLY
+    range guarantee its draws get -- there is no clamp behind it.
+    """
+    vals = [float(v) for v in values]
+    assert vals, "empirical_prob_values got an empty sample"
+    lo, hi = min(vals), max(vals)
+    assert 0.0 <= lo and hi <= 1.0, (
+        f"empirical_prob needs probabilities, got range [{lo}, {hi}] -- the cache holds "
+        f"something other than post-softmax weights")
+    return {"train_values": vals}
+
+
+def make_bounded_prob_intervention_fn(model, eps=PROB_SIGNAL_EPS):
+    """Intervention sampler for a signal that lives in (0, 1): a post-softmax weight.
+
+    All three built-in distributions leave the domain. `gaussian` on a cell with mean
+    ~1e-3 and std ~1e-4 draws negatives about half the time; `extreme` draws uniformly
+    over `scale x` the empirical RANGE, which is not a probability at any scale. A
+    negative target makes AttentionWeightPort's renormalization build a row with negative
+    probabilities, and the softmax is already behind us, so nothing downstream raises.
+
+    This samples in LOG-ODDS space and maps back with a sigmoid, so every draw is a valid
+    probability at every scale by construction rather than by rejection. Rejection
+    sampling degenerates here: at a large scale on a mean-1e-3 cell nearly every draw is
+    rejected, so `extreme` would quietly collapse to ~U(eps, 1-eps) and the scale sweep
+    would stop meaning anything.
+
+    Log-odds is also the RIGHT space, not merely a safe one. Renormalizing the row to put
+    t at the target cell is exactly a shift of that cell's attention logit z_j by
+    logit(t) - logit(p_j) (see AttentionWeightPort), so a gaussian on logit(t) is the
+    same FAMILY of intervention as the attention-logit experiment's gaussian on z_j.
+    That is what makes the A and P interventional numbers comparable.
+
+    **The closure MUST read `intervention_distribution` and `intervention_scale` off the
+    model on every call, never capture them.** `sample_intervention_values` consults
+    `intervention_fn` BEFORE its own distribution branches, so a closure that froze them
+    would silently ignore `evaluate_interventional_test`'s "gaussian at scale 1.0" and
+    every step of `interventional_scale_sweep` -- each scale row would be the same
+    distribution, the tables would fill in normally, and nothing would raise.
+
+    The log-odds branches clamp to PROB_SIGNAL_EPS (EMPIRICAL_EPS for empirical_logit);
+    `empirical_prob` draws real probabilities and does not clamp. See the comment on
+    PROB_SIGNAL_EPS for how these relate to the port, which accepts all of [0, 1].
+
+    A probability is bounded, so at a large enough scale draws DO pile up on the guard
+    band -- the same point mass that makes clamping in probability space wrong, only
+    pushed out to where it takes an extreme scale to reach. It is not hidden: `sample`
+    carries `n_drawn` / `n_clamped`, so `interventional_scale_sweep` can report the
+    saturated fraction and a scale whose corr is really "the model learned the clamp"
+    is visible rather than inferred.
+    """
+    lo, hi = math.log(eps / (1 - eps)), math.log((1 - eps) / eps)
+    emp_lo, emp_hi = (math.log(EMPIRICAL_EPS / (1 - EMPIRICAL_EPS)),
+                      math.log((1 - EMPIRICAL_EPS) / EMPIRICAL_EPS))
+
+    def sample(layer, idx, **stats):
+        missing = [k for k in ("mean_logit", "std_logit", "min_logit", "max_logit")
+                   if k not in stats]
+        assert not missing, (
+            f"signal_ranges for layer {layer} index {idx} lacks {missing}; an "
+            f"attention_weight run must add them with logit_moments()")
+        rng = model.intervention_rng          # read live: seed_intervention_rng rebinds it
+        dist = model.intervention_distribution
+        scale = model.intervention_scale
+        if dist == "prob_uniform":
+            # Uniform in PROBABILITY space, the one branch that does not draw in log-odds.
+            # The log-odds branches at a wide scale pile most draws on the guard band
+            # (both ends of the clamp), so the regression targets collapse onto ~0 and ~1;
+            # this spreads them over (0, 1) instead and clamps only a 2*eps sliver.
+            # It has no spread to widen, so a scale other than 1 means a caller expected
+            # a scale sweep to change something here -- it would not.
+            assert scale == 1.0, f"prob_uniform has no scale, got intervention_scale={scale}"
+            t = rng.uniform(0.0, 1.0)
+            sample.n_drawn += 1
+            if t < eps or t > 1 - eps:
+                sample.n_clamped += 1
+                t = min(max(t, eps), 1 - eps)
+            return t
+        if dist == "empirical_logit":
+            # The cell's OWN log-odds distribution (train-split histogram, see
+            # logit_histogram), for evaluation. The gaussian branch assumes the log-odds
+            # are normal; on a cell like L2 h26 @-27 a third of them sit below the 1e-4
+            # guard band and get clamped. Pick a bin by frequency, then uniform within it.
+            assert scale == 1.0, f"empirical_logit has no scale, got intervention_scale={scale}"
+            edges, cdf = stats.get("logit_hist_edges"), stats.get("logit_hist_cdf")
+            assert edges is not None and cdf is not None, (
+                f"signal_ranges for layer {layer} index {idx} lacks the logit histogram; "
+                f"add it with logit_histogram()")
+            b = min(bisect.bisect_left(cdf, rng.random()), len(cdf) - 1)
+            u = rng.uniform(edges[b], edges[b + 1])
+            sample.n_drawn += 1
+            if u < emp_lo or u > emp_hi:
+                sample.n_clamped += 1
+                u = min(max(u, emp_lo), emp_hi)
+            return 1.0 / (1.0 + math.exp(-u))
+        if dist == "empirical_prob":
+            # The cell's OWN probabilities: one train-split value, drawn uniformly
+            # (bootstrap). Unlike every branch above, nothing here goes through log-odds
+            # moments or a histogram, so the injected distribution IS the endogenous one.
+            # No clamp: the values come from the cache, which empirical_prob_values
+            # checked to lie in [0, 1], and AttentionWeightPort accepts all of [0, 1].
+            # A guard band here would move real mass -- 0.7% of L14 h26 @-19's train
+            # weights sit below 1e-6.
+            assert scale == 1.0, f"empirical_prob has no scale, got intervention_scale={scale}"
+            vals = stats.get("train_values")
+            assert vals is not None, (
+                f"signal_ranges for layer {layer} index {idx} lacks train_values; "
+                f"add them with empirical_prob_values()")
+            sample.n_drawn += 1
+            return vals[rng.randrange(len(vals))]
+        if dist == "gaussian":
+            u = rng.gauss(stats["mean_logit"], scale * stats["std_logit"])
+        elif dist == "uniform":
+            u = rng.uniform(stats["min_logit"], stats["max_logit"])
+        elif dist == "extreme":
+            center = (stats["min_logit"] + stats["max_logit"]) / 2
+            half = scale * (stats["max_logit"] - stats["min_logit"]) / 2
+            u = rng.uniform(center - half, center + half)
+        else:
+            raise ValueError(f"Unknown intervention_distribution: {dist!r}")
+        sample.n_drawn += 1
+        if u < lo or u > hi:
+            sample.n_clamped += 1
+            u = min(max(u, lo), hi)
+        return 1.0 / (1.0 + math.exp(-u))
+
+    def reset_counts():
+        sample.n_drawn = 0
+        sample.n_clamped = 0
+
+    sample.reset_counts = reset_counts
+    sample.eps = eps
+    reset_counts()
+    return sample
+
+
+class SigmoidRegressionHead(nn.Linear):
+    """Logistic probe: sigmoid(W h + b), for targets that are probabilities.
+
+    A subclass of nn.Linear so every caller that does `head(h)` or reads
+    `head.weight.device/dtype` (the evals, the scale sweep, the attribution scripts)
+    gets the sigmoid without being edited.
+
+    The `_sigmoid_marker` buffer is what keeps a checkpoint honest about its head: it
+    goes into state_dict, so load_regression_head's STRICT load fails when a sigmoid
+    head is loaded into a plain nn.Linear or the other way round. Without it the weights
+    have identical keys and shapes, and a loader that does not know the config (e.g.
+    attribute_attention_weight_readout.load_everything) would silently drop the sigmoid
+    and report logits as probabilities.
+    """
+
+    def __init__(self, in_features, out_features=1, bias=True):
+        super().__init__(in_features, out_features, bias=bias)
+        self.register_buffer("_sigmoid_marker", torch.ones(1))
+
+    def pre_activation(self, x):
+        """z = W h + b, the log-odds before the sigmoid. A loss on probabilities takes this
+        rather than torch.logit(forward(x)): fp32 sigmoid rounds to exactly 1.0 above
+        z ~ 17, and the logit of that is inf (attention weights at offset -1 reach ~1)."""
+        return super().forward(x)
+
+    def forward(self, x):
+        return torch.sigmoid(self.pre_activation(x))
+
+
+HEAD_ACTIVATIONS = ("identity", "sigmoid")
+
+
 class IntrospectionRegressionModel(PeftModelForCausalLM):
 
     def __init__(
@@ -251,14 +516,19 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
         intervention_distribution="uniform",
         intervention_extreme_scale=EXTREME_SCALE,
         intervention_fn=None,
+        attention_site=None,
+        head_activation="identity",
     ):
         # IMPORTANT: do NOT call super().__init__
         self.__dict__ = model.__dict__
+        if head_activation not in HEAD_ACTIVATIONS:
+            raise ValueError(f"head_activation {head_activation!r} not in {HEAD_ACTIVATIONS}")
         # Keep the head in fp32 for stable MSE regression, but move it onto the
         # base model's device so it does not silently sit on CPU when the base
         # model is dispatched with device_map / loaded in bf16 (which would
         # otherwise throw a device/dtype mismatch at the head matmul).
-        self.regression_head = nn.Linear(self.config.hidden_size, 1, bias=True)
+        head_cls = SigmoidRegressionHead if head_activation == "sigmoid" else nn.Linear
+        self.regression_head = head_cls(self.config.hidden_size, 1, bias=True)
         _base_param = next(model.parameters())
         self.regression_head = self.regression_head.to(device=_base_param.device)
         print(
@@ -277,7 +547,17 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
         # whether src_token_position was passed, and a caller that forgot it would
         # otherwise write into `mlp.act_fn` at index `head` -- a real neuron, a plausible
         # number, and a completely wrong experiment.
-        self._attention_signals = key_lens == {3}
+        self._attention_signals = key_lens in ({3}, {5})
+        # PAIR MODE: ranges are keyed per absolute (dst, src), see signal_range_key
+        self._pair_ranges = key_lens == {5}
+        # WHICH attention site, for runs that have one. The bool above cannot tell A from
+        # P -- both key signal_ranges by 3-tuples -- and writing a probability into the
+        # pre-softmax tensor (or a logit into the post-softmax one) raises nothing and
+        # produces a plausible number. Defaults to "logit" on an attention run so every
+        # caller written before P existed keeps its exact behaviour.
+        assert attention_site in (None, "logit", "weight"), (
+            f"attention_site must be None/'logit'/'weight', got {attention_site!r}")
+        self._attention_site = attention_site or ("logit" if self._attention_signals else None)
         self.intervention_distribution = intervention_distribution
         self.intervention_extreme_scale = intervention_extreme_scale
         self.intervention_fn = intervention_fn  # optional custom intervention sampler
@@ -301,16 +581,37 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
         self.intervention_scale = float(scale)
 
     def sample_intervention_values(self, signal_layers, signal_indices, device,
-                                   signal_src_offsets=None):
+                                   signal_src_offsets=None, dst_positions=None,
+                                   src_positions=None):
+        """`dst_positions`/`src_positions` (PAIR MODE only) are positions in the UNPADDED
+        text, i.e. before forward's left-pad shift -- the coordinates the ranges are
+        keyed in. Passing shifted ones would look up a different pair, or none."""
         vals = []
         # An attention signal is only identified once the source offset is included:
         # (layer, head) alone names ten different signals in a cell, whose ranges differ
         # by an order of magnitude (the BOS sink against a mid-context token). Keying
         # without it would sample every offset's intervention from one pooled range.
-        offsets = (signal_src_offsets.tolist() if signal_src_offsets is not None
-                   else [None] * len(signal_layers))
-        for layer, idx, off in zip(signal_layers.tolist(), signal_indices.tolist(), offsets):
-            stats = self.signal_ranges[signal_range_key(layer, idx, off)]
+        n = len(signal_layers)
+        if self._pair_ranges:
+            assert dst_positions is not None and src_positions is not None, (
+                "pair-mode signal_ranges need per-row dst/src positions")
+            assert len(dst_positions) == n and len(src_positions) == n, (
+                f"{len(dst_positions)} dst / {len(src_positions)} src for {n} rows")
+            keys = [signal_range_key(l, i, pair=(d, s_)) for l, i, d, s_ in zip(
+                signal_layers.tolist(), signal_indices.tolist(),
+                dst_positions.tolist(), src_positions.tolist())]
+        else:
+            offsets = (signal_src_offsets.tolist() if signal_src_offsets is not None
+                       else [None] * n)
+            keys = [signal_range_key(l, i, off) for l, i, off in zip(
+                signal_layers.tolist(), signal_indices.tolist(), offsets)]
+        for key in keys:
+            layer, idx = key[0], key[1]
+            if key not in self.signal_ranges:
+                raise KeyError(
+                    f"no intervention range for {key}; signal_ranges holds "
+                    f"{len(self.signal_ranges)} keys, e.g. {list(self.signal_ranges)[:3]}")
+            stats = self.signal_ranges[key]
             if self.intervention_fn is not None:
                 val = self.intervention_fn(layer=layer, idx=idx, **stats)
             elif self.intervention_distribution == "gaussian":
@@ -369,6 +670,9 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
                 # leading pad count so the hook injects into the intended token
                 # rather than a padding/wrong token. (Assumes left padding: with no
                 # right padding, (attention_mask == 0).sum == leading pad count.)
+                # PAIR MODE ranges are keyed in UNPADDED coordinates; keep those
+                # before the shift below moves them.
+                dst_unpadded, src_unpadded = token_position, src_token_position
                 attention_mask = kwargs.get("attention_mask")
                 if attention_mask is not None:
                     # The comment above only holds under LEFT padding. Assert it instead
@@ -386,7 +690,8 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
 
                 # sample interventions INSIDE forward
                 intervention_values = self.sample_intervention_values(
-                    signal_layer, signal_index, device, signal_src_offset)
+                    signal_layer, signal_index, device, signal_src_offset,
+                    dst_positions=dst_unpadded, src_positions=src_unpadded)
                 attention_batch = src_token_position is not None
                 assert attention_batch == self._attention_signals, (
                     f"intervention site mismatch: signal_ranges says "
@@ -398,21 +703,28 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
                 for layer in unique_layers.tolist():
                     mask = signal_layer == layer
                     if attention_batch:
-                        # An attention logit is not any module's output, so it cannot be
-                        # written by a forward hook. The port is read/written inside the
-                        # custom attention function; see models/attention_logits.py.
-                        port = AttentionLogitPort(
+                        # An attention logit/weight is not any module's output, so it
+                        # cannot be written by a forward hook. The port is read/written
+                        # inside the custom attention function; see
+                        # models/attention_logits.py. WHICH port and which attribute is
+                        # decided by the run's signal type, not guessed: the weight port
+                        # renormalizes the row, the logit port overwrites one cell, and
+                        # using the wrong one is silent.
+                        site = self._attention_site
+                        port_cls = AttentionWeightPort if site == "weight" else AttentionLogitPort
+                        attr = PORT_ATTRS[site or "logit"]
+                        port = port_cls(
                             heads=signal_index[mask],
                             dst=token_position[mask],
                             src=src_token_position[mask],
                             values=intervention_values[mask],
                         )
                         module = resolve_attention_module(self, layer)
-                        assert getattr(module, PORT_ATTR, None) is None, (
-                            f"layer {layer} already carries a port; a previous forward "
-                            f"leaked one and this batch would be intervened twice")
-                        setattr(module, PORT_ATTR, port)
-                        hooks.append(_PortHandle(module))
+                        assert getattr(module, attr, None) is None, (
+                            f"layer {layer} already carries a {site!r} port; a previous "
+                            f"forward leaked one and this batch would be intervened twice")
+                        setattr(module, attr, port)
+                        hooks.append(_PortHandle(module, attr))
                         continue
 
                     hook = InterventionHook(
@@ -463,12 +775,20 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
                 # cast hidden to the head's device/dtype so a bf16/device-mapped
                 # base model does not mismatch the fp32 head
                 selected_hidden = selected_hidden.to(device=head_device, dtype=head_dtype)
-                pred = self.regression_head(selected_hidden).squeeze(-1)
+                if isinstance(self.regression_head, SigmoidRegressionHead):
+                    z = self.regression_head.pre_activation(selected_hidden).squeeze(-1)  # [B]
+                    pred = torch.sigmoid(z)                                               # [B]
+                else:
+                    z = None
+                    pred = self.regression_head(selected_hidden).squeeze(-1)              # [B]
+                assert pred.shape == (bs,), f"pred {tuple(pred.shape)} != ({bs},)"
                 regression_labels = labels.to(pred.dtype)
                 loss = nn.functional.mse_loss(pred,regression_labels,)
                 # Trainer expects logits
                 outputs.logits = pred
                 outputs.loss = loss
+                # the head's log-odds, for losses on probabilities (None for a linear head)
+                outputs["regression_pre_activation"] = z
 
             return outputs
 

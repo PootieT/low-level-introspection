@@ -34,8 +34,10 @@ from src.introspector.utils import int_or_str
 from src.introspector.dataset_utils import canonical_dataset_name, parse_signal_filters
 from src.introspector.config import DatasetConfig, ExperimentConfig, TrainingConfig, EvalConfig
 from src.introspector.signals.schema import ExplicitSignalSpec, FixedTokenSelector, RandomRangeTokenSelector, \
+    RandomPairTokenSelector, PairListTokenSelector, \
     ExplicitSignalSpec, UniformLayerSampler, AttentionLayerSampler, SignalSource
 from src.introspector.signals.resolution import resolve_signal_source
+from src.introspector.signals.pair_grid import pair_grid
 
 
 def parse_args() -> argparse.Namespace:
@@ -136,13 +138,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--detection-balance-pos-frac", type=float, default=0.5,
                         help="Oversample feature-active rows in TRAIN up to this fraction (detection only).")
     parser.add_argument("--intervention-signal-distribution", type=str, default="uniform",
-                        choices=["uniform", "gaussian", "extreme", "empirical"],
+                        choices=["uniform", "gaussian", "extreme", "empirical", "prob_uniform",
+                                 "empirical_prob"],
                         help="Distribution to sample the injected value from at intervention time. "
                              "'uniform' draws U(min, max); 'gaussian' fits N(mean, std) to the neuron's "
                              "empirical activations (better matches the real, skewed activation distribution); "
                              "'extreme' draws uniformly from a range intervention-extreme-scale x wider than "
                              "the empirical range (sanity check: does an exaggerated signal force the model "
-                             "to learn to read it).")
+                             "to learn to read it). 'empirical_prob' (attention_weight, joint trainer "
+                             "only) draws one of the cell's own train-split weights as-is.")
+    parser.add_argument("--regression-head-activation", type=str, default="identity",
+                        choices=["identity", "sigmoid"],
+                        help="'sigmoid' => logistic probe sigmoid(Wh+b) for probability targets "
+                             "(attention_weight). 'identity' is the linear head every earlier run used.")
+    parser.add_argument("--regression-loss", type=str, default="var_norm_mse",
+                        choices=["var_norm_mse", "norm_deviance"],
+                        help="Joint trainer only. 'var_norm_mse' = MSE / var(target) (every earlier "
+                             "run). 'norm_deviance' = KL(p||q) / KL(p||p_bar), the Bernoulli deviance "
+                             "normalized by the null model's; needs --regression-head-activation sigmoid.")
     parser.add_argument("--intervention-extreme-scale", type=float, default=1000.0,
                         help="Multiplier on the empirical range width used when "
                              "--intervention-signal-distribution=extreme. Sweep this to find where the "
@@ -233,9 +246,14 @@ def load_spec(value: str):
 def load_token_selector(value: Union[int,str]):
     if isinstance(value, int):
         return FixedTokenSelector(type="fixed", position=value)
-    else:
-        start, stop = value.split(":")
-        return RandomRangeTokenSelector(type="random_range", start=start, stop=stop)
+    # PAIR MODE (experiment 3-1): "random_pair" draws one (dst, src) pair per document;
+    # "pair_grid:<m>" evaluates the fixed grid of eval length m (signals/pair_grid.py).
+    if value == "random_pair":
+        return RandomPairTokenSelector()
+    if value.startswith("pair_grid:"):
+        return PairListTokenSelector(pairs=list(pair_grid(int(value.split(":", 1)[1]))))
+    start, stop = value.split(":")
+    return RandomRangeTokenSelector(type="random_range", start=start, stop=stop)
 
 def main() -> None:
     args = parse_args()
@@ -313,6 +331,8 @@ def main() -> None:
             intervention_anneal_schedule=args.intervention_anneal_schedule,
             intervention_anneal_start_frac=args.intervention_anneal_start_frac,
             intervention_anneal_end_frac=args.intervention_anneal_end_frac,
+            regression_head_activation=args.regression_head_activation,
+            regression_loss=args.regression_loss,
             learning_rate=args.learning_rate,
             warmup_ratio=args.warmup_ratio,
             lr_scheduler_type=args.lr_scheduler_type,

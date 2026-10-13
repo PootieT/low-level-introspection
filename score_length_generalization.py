@@ -51,7 +51,10 @@ import pandas as pd
 from datasets import load_from_disk
 
 from src.introspector.config import ExperimentConfig
-from src.introspector.signals.schema import RandomRangeTokenSelector
+from src.introspector.signals.schema import (
+    RandomRangeTokenSelector, PairListTokenSelector, is_pair_selector,
+)
+from src.introspector.signals.pair_grid import pair_grid
 from src.introspector.dataset_utils import apply_signal_filter, canonical_dataset_name
 
 # Eval lengths. Every one of these must be <= the min_seq_length the caches were built
@@ -105,15 +108,25 @@ def derive_config(base_config: ExperimentConfig, eval_len: int, config_dir: Path
     silently truncate a 128-token eval document down to nothing.
     """
     cfg = base_config.model_copy(deep=True)
+    pair_mode = is_pair_selector(base_config.train_token_selector)
+    if pair_mode:
+        # PAIR MODE (3-1): the fixed grid of THIS length, on the SAME documents as the
+        # run's own test split -- same corpus, same floor, same count, so the streamed
+        # documents are identical and only their truncation length differs. That is what
+        # makes (document, dst, src) comparable across lengths; the eval checks it.
+        n_test = base_config.test_dataset.max_samples
     cfg.test_dataset = cfg.test_dataset.model_copy(update={
         "max_samples": n_test,
         "max_seq_length": eval_len,
     })
-    # Sample positions across the entire document, expressed from the end so it is the
-    # same quantity the training selector is written in. Always a range, whatever the
-    # run trained on -- a fixed-position run is exactly the case whose generalization
-    # to other positions is in question.
-    cfg.test_token_selector = RandomRangeTokenSelector(start=-eval_len, stop=-1)
+    if pair_mode:
+        cfg.test_token_selector = PairListTokenSelector(pairs=list(pair_grid(eval_len)))
+    else:
+        # Sample positions across the entire document, expressed from the end so it is
+        # the same quantity the training selector is written in. Always a range, whatever
+        # the run trained on -- a fixed-position run is exactly the case whose
+        # generalization to other positions is in question.
+        cfg.test_token_selector = RandomRangeTokenSelector(start=-eval_len, stop=-1)
 
     # Nothing trains here, but cache_signals builds all three splits. Shrink them, and
     # keep dev's offset small: on a streaming dataset the run's usual .skip(1_000_000)
@@ -239,9 +252,40 @@ def _bin_by_distance(df: pd.DataFrame, value_col: str, target_col: str,
     return pd.DataFrame(rows)
 
 
+def _doc_ids(raw, n_rows_per_doc):
+    """{doc_index: text_input_ids} from a single-signal split ordered doc -> pair."""
+    first = raw.select(range(0, len(raw), n_rows_per_doc))
+    docs = first["doc_index"]
+    assert docs == list(range(len(docs))), (
+        f"rows are not grouped doc-major ({n_rows_per_doc} per doc): doc_index starts "
+        f"{docs[:5]}")
+    return dict(zip(docs, first["text_input_ids"]))
+
+
+def _check_same_documents(raw, reference, eval_len):
+    """PAIR MODE: assert this length's documents are the reference ones, longer.
+
+    The length sweep is a paired comparison -- the weight at (d, s) of document i is the
+    same number at every length -- only if every length streamed the same documents and
+    truncated them differently. Nothing else enforces that; a changed filter or sample
+    count would silently swap the documents and turn the comparison into a content shift.
+    """
+    ref_ids, ref_len = reference
+    n_pairs = len(pair_grid(eval_len))
+    ids = _doc_ids(raw, n_pairs)
+    assert set(ids) == set(ref_ids), (
+        f"len {eval_len}: {len(ids)} documents vs {len(ref_ids)} in the reference split")
+    bad = [i for i in ids if ids[i][:ref_len] != ref_ids[i]]
+    assert not bad, (f"len {eval_len}: {len(bad)} documents do not start with the reference "
+                     f"split's tokens (e.g. doc {bad[0]}) -- the splits hold different documents")
+    print(f"[lengen] len {eval_len}: same {len(ids)} documents as the reference "
+          f"(len {ref_len}), prefix-checked")
+
+
 def evaluate_length_grid(model, base_config: ExperimentConfig, tokenizer, collator,
                          output_dir, eval_lengths=DEFAULT_EVAL_LENGTHS,
-                         n_test: int = DEFAULT_N_TEST, prepared=None):
+                         n_test: int = DEFAULT_N_TEST, prepared=None,
+                         interv_dists=("gaussian",)):
     """
     Evaluate an already-built model across eval lengths, binned by distance-to-readout.
 
@@ -254,9 +298,10 @@ def evaluate_length_grid(model, base_config: ExperimentConfig, tokenizer, collat
     the TRAINING length, which would truncate every longer eval document.
     """
     from train_introspector import preprocess_example, drop_invalid_positions
-    from train_introspector_joint import eval_endogenous_test
+    from train_introspector_joint import eval_endogenous_test, eval_provenance
     from train_introspector_with_intervention import evaluate_interventional_test
     from src.introspector.prompts import PROMPT_REGISTRY
+    from src.introspector.models.attention_logits import is_attention_type
 
     output_dir = Path(output_dir)
     if prepared is None:
@@ -268,6 +313,15 @@ def evaluate_length_grid(model, base_config: ExperimentConfig, tokenizer, collat
     train_window = training_window(base_config)
     print(f"[lengen] training window = {train_window} tokens from the end "
           f"(bins beyond this are out-of-distribution)")
+
+    pair_mode = is_pair_selector(base_config.train_token_selector)
+    reference = None
+    if pair_mode:
+        # the run's own test split (length n) is the reference every longer one must extend
+        ref_raw = apply_signal_filter(load_from_disk(str(base_config.dataset_cache_dir / "test")),
+                                      base_config.signal_filter, "lengen/reference")
+        ref_len = base_config.test_dataset.max_seq_length
+        reference = (_doc_ids(ref_raw, len(base_config.test_token_selector.pairs)), ref_len)
 
     summary_rows, bin_frames = [], []
     for eval_len in eval_lengths:
@@ -293,18 +347,34 @@ def evaluate_length_grid(model, base_config: ExperimentConfig, tokenizer, collat
                 out["signal_layer"] = ex["signal_layer"]
                 out["signal_index"] = ex["signal_index"]
                 out["activation"] = ex["activation"]
+                # Attention rows need the source as well, exactly as the trainer's own
+                # preprocess emits it. Without these the interventional eval tripped the
+                # "intervention site mismatch" assert on every attention run.
+                if is_attention_type(ex["signal_type"]):
+                    out["src_token_position"] = ex["src_token_position"]
+                    out["signal_src_offset"] = ex["src_offset"]
                 return out
 
+            if pair_mode:
+                _check_same_documents(raw, reference, eval_len)
             ds = raw.map(preprocess, remove_columns=raw.column_names)
+            provenance = eval_provenance(raw, ds)
             ds = drop_invalid_positions(ds, f"lengen/len{eval_len}",
                                         cfg.training_config.max_seq_length)
 
             suffix = f"_len{eval_len}"
-            interv = evaluate_interventional_test(
-                model, eval_dataset=ds, collator=collator, config=base_config,
-                output_dir=str(output_dir), distribution="gaussian", suffix=suffix)
+            interv = None
+            for dist in interv_dists:
+                # gaussian keeps the historical file names; any other distribution
+                # gets its own suffix so the two never overwrite each other
+                r = evaluate_interventional_test(
+                    model, eval_dataset=ds, collator=collator, config=base_config,
+                    output_dir=str(output_dir), distribution=dist,
+                    suffix=suffix if dist == "gaussian" else f"{suffix}_{dist}",
+                    provenance=provenance)
+                interv = r if interv is None else interv
             endo = eval_endogenous_test(model, ds, collator, base_config, output_dir,
-                                        suffix=suffix)
+                                        suffix=suffix, provenance=provenance)
 
             # Read the per-example frames back rather than threading them through the
             # eval functions' return values: those return metric dicts and are called
@@ -330,6 +400,10 @@ def evaluate_length_grid(model, base_config: ExperimentConfig, tokenizer, collat
                 "interventional_corr": interv.get("corr"),
                 "endogenous_corr": endo.get("corr"),
                 "endogenous_l2": endo.get("l2_dist"),
+                # PAIR MODE: the headline is within-pair, not pooled (pair_metrics)
+                **{f"endogenous_{k}": v for k, v in endo.get("pairs", {}).items()
+                   if k in ("corr_within_pair_mean", "corr_demeaned",
+                            "pair_mean_baseline_corr", "n_pairs")},
             })
         except Exception as e:
             print(f"[lengen] len={eval_len} eval FAILED ({type(e).__name__}: {e}); continuing")

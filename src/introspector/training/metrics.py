@@ -4,7 +4,7 @@ from typing import Tuple, List
 import regex as re
 
 import numpy as np
-from scipy.stats import pearsonr, entropy
+from scipy.stats import pearsonr, spearmanr, entropy
 import torch
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizerBase
@@ -95,10 +95,30 @@ def compute_metrics_from_numericals(pred_nums: List[float], label_nums:List[floa
         print("Value error:", e)
         corr = float("nan")
         p_value = float("nan")
+
+    # Rank correlation ALONGSIDE Pearson, never instead of it -- an added column, so
+    # every number any existing run reported is unchanged.
+    #
+    # Why it is needed: a post-softmax attention weight is heavily right-skewed (the BOS
+    # sink sits at 0.3-0.9 while mid-context cells sit at 1e-4-1e-1). Pearson and the
+    # training loss _var_norm_mse are both squared-scale, so a handful of large rows
+    # decide the reported value, and a model that has learned only "is this the sink"
+    # scores nearly as well as one that reads the whole range. Spearman is insensitive to
+    # that, so the gap between the two IS the measurement of how much the tail is
+    # carrying. Attention logits were roughly symmetric, so this never came up before.
+    try:
+        spearman, spearman_p = spearmanr(pred_nums, label_nums)
+        spearman, spearman_p = float(spearman), float(spearman_p)
+    except ValueError as e:
+        print("Value error (spearman):", e)
+        spearman = float("nan")
+        spearman_p = float("nan")
     return {
         "l2_dist": l2_dist.item(),
         "avg_diff": avg_diff.item(),
         "std_diff": std_diff.item(),
         "corr": corr,
         "corr_p_value": p_value,
+        "spearman": spearman,
+        "spearman_p_value": spearman_p,
     }
