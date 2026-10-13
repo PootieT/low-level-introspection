@@ -34,10 +34,16 @@ SCORE_KEYS = ["logprobs", "unconditioned_logprobs", "logits"]
 
 
 def _detail_files(run_dir: Path, condition: str) -> dict[str, Path]:
-    """{task_name: parquet} for one condition."""
+    """{task_name: parquet} for one condition, from the LATEST evaluation pass.
+
+    A run evaluated twice has two timestamped detail dirs per condition. Unsorted glob
+    order picked one arbitrarily (and differently per machine), and the early pass of the
+    prev-token hyper sweep is broken: its "base" details are the ADAPTER's (identical
+    scores), so pairing it gave 0% changed answers. Paths sort by their timestamp
+    directory, so iterating sorted lets the latest pass overwrite earlier ones."""
     out = {}
-    for f in glob.glob(str(run_dir / "lighteval" / condition / "details" / "**" / "*.parquet"),
-                       recursive=True):
+    for f in sorted(glob.glob(str(run_dir / "lighteval" / condition / "details" / "**" / "*.parquet"),
+                              recursive=True)):
         name = Path(f).name
         task = name.split("details_")[-1].rsplit("_", 1)[0]
         out[task] = Path(f)
@@ -130,18 +136,23 @@ def compare_task(base_path: Path, adapter_path: Path, task: str) -> dict:
 def summarize_run(run_dir: Path, cache=True) -> dict:
     """Per-example comparison for one run, aggregated over tasks. Cached to
     benchmarks_per_example.json so repeated plotting does not re-read every parquet."""
+    import json
     out_path = Path(run_dir) / "lighteval" / "benchmarks_per_example.json"
-    if cache and out_path.exists():
-        import json
-        return json.loads(out_path.read_text())
     base, adapter = _detail_files(Path(run_dir), "base"), _detail_files(Path(run_dir), "adapter")
     shared = sorted(set(base) & set(adapter))
+    # the cache records which detail files it was computed from; a cache written before
+    # the latest-pass fix (or from different files) does not match and is recomputed
+    sources = {t: [str(base[t].parent.name), str(adapter[t].parent.name)] for t in shared}
+    if cache and out_path.exists():
+        cached = json.loads(out_path.read_text())
+        if cached.get("sources") == sources:
+            return cached
     if not shared:
         return {}
     rows = [compare_task(base[t], adapter[t], t) for t in shared]
     df = pd.DataFrame(rows)
     changed = [c for c in df.columns if c.endswith("_changed_frac")]
-    out = {"tasks": len(df)}
+    out = {"tasks": len(df), "sources": sources}
     if changed:
         # mean over tasks of "fraction of examples whose score changed"
         out["example_changed_frac"] = float(np.nanmean(df[changed].to_numpy(dtype=float)))
@@ -150,7 +161,6 @@ def summarize_run(run_dir: Path, cache=True) -> dict:
     if "same_argmax_frac" in df:
         out["same_argmax_frac"] = float(np.nanmean(df["same_argmax_frac"]))
     if cache and out:
-        import json
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(out, indent=2))
     return out

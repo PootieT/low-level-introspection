@@ -205,21 +205,28 @@ def plot_benchmarks(df, out_dir, length=TRAIN_LEN):
     if not (have_agg or have_ex):
         print("[kl] no lighteval results found; skipping benchmark panel")
         return
-    panels = [("bench_acc_delta", "accuracy delta (adapter - base)", True),
-              ("bench_example_changed_frac", "fraction of questions answered differently", False)]
+    panels = [("bench_acc_delta", "Benchmark Accuracy", "Accuracy \u0394 (Adapter \u2212 Base)", True),
+              ("bench_example_changed_frac", "Per-Question Agreement",
+               "Fraction of Answers Changed", False)]
     panels = [p for p in panels if p[0] in df and df[p[0]].notna().any()]
-    fig, axes = plt.subplots(1, len(panels), figsize=(6.8 * len(panels), 5), squeeze=False)
-    for ax, (col, ylabel, zero_line) in zip(axes.flat, panels):
+    fig, axes = plt.subplots(1, len(panels), figsize=(7.2 * len(panels), 6), squeeze=False)
+    cells = sorted(df.dropna(subset=[x])["cell"].unique())
+    colors = dict(zip(cells, plt.get_cmap("tab10").colors))      # same colour in both panels
+    for ax, (col, title, ylabel, zero_line) in zip(axes.flat, panels):
         for cell, sub in df.dropna(subset=[x, col]).groupby("cell"):
             sub = sub.sort_values(x)
-            ax.plot(sub[x], sub[col], marker="o", label=cell)
+            ax.plot(sub[x], sub[col], marker="o", ms=9, lw=1.8, color=colors[cell],
+                    label=_cell_title(cell))
         if zero_line:
             ax.axhline(0, color="grey", ls="--", lw=1)
         ax.set_xscale("log")
-        ax.set_xlabel(f"measured KL @L={length} (nats/token)")
-        ax.set_ylabel(ylabel)
-        ax.grid(alpha=0.25, which="both"); ax.legend(fontsize=10)
-    fig.suptitle("downstream benchmarks vs LM degradation", y=1.02)
+        ax.set_title(title, fontsize=28)
+        ax.set_xlabel(f"Measured KL @ L={length} (nats/token)", fontsize=24)
+        ax.set_ylabel(ylabel, fontsize=24)
+        ax.tick_params(which="both", labelsize=20)
+        ax.grid(alpha=0.25, which="both")
+    # one legend, lower-left of the first panel: empty there (low KL = ~0 accuracy change)
+    axes.flat[0].legend(fontsize=16, loc="lower left", framealpha=0.9)
     fig.tight_layout()
     path = Path(out_dir) / "kl_benchmarks.png"
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)

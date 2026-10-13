@@ -55,6 +55,22 @@ ARMS = {                      # label -> (group, w, kl_tag)
 NEEDED = ["coupling_gap", "drift_vs_cached_corr", "interventional_corr", "endogenous_corr"]
 # figure names for the arm labels (the labels stay the keys in every CSV)
 ARM_TITLE = {"sft": "SFT", "joint_kl0.1": "Joint Loss (KL=0.1)", "joint_free": "Joint Loss (KL=None)"}
+BASELINE = "sft"      # paired deltas are every other arm minus this one
+
+# --preset: which arms to compare. Each preset = (arms, titles, baseline arm, out subdir).
+# weight_sweep: the 3 cells x 5 neurons of mlp_joint_weight_sweep at the extreme weights,
+# so the drift caused by the INTERVENTIONAL loss alone (w=0) can be read against the
+# endogenous-only model (w=1) on the same neurons. kl_tag is not filtered: the anchor
+# budget is per cell (0.1 or 3.0) and identical across weights within a cell.
+PRESETS = {
+    "sft_vs_joint": (dict(ARMS), dict(ARM_TITLE), "sft", "introspection_coupling"),
+    "weight_sweep": ({"w1":    ("mlp_joint_weight_sweep", 1.0,  None),
+                      "w0.01": ("mlp_joint_weight_sweep", 0.01, None),
+                      "w0":    ("mlp_joint_weight_sweep", 0.0,  None)},
+                     {"w1": "Endogenous Only (w=1)", "w0.01": "Joint Loss (w=0.01)",
+                      "w0": "Interventional Only (w=0)"},
+                     "w1", "mlp_joint_weight_sweep/introspection_coupling"),
+}
 SEQ_LEN = 32      # heatmap columns are drawn as 0-indexed absolute positions (-1 -> 31)
 FS = dict(title=22, label=20, ticks=16, legend=15, annot=12)
 
@@ -192,14 +208,15 @@ def plot_cell_heatmaps(cells: pd.DataFrame, out_dir: Path, metric: str, vmin=Non
 
 
 def plot_arm_deltas(df: pd.DataFrame, out_dir: Path):
-    """Joint minus SFT on the SAME cell and neuron, for gap and for interventional corr.
-    A paired delta near zero on the gap is the 'joint does not change coupling' result."""
-    if "sft" not in set(df["arm"]):
+    """Each arm minus the BASELINE arm on the SAME cell and neuron, for gap, drift and
+    both correlations. A paired delta near zero on the gap is the 'this objective does
+    not change coupling' result."""
+    if BASELINE not in set(df["arm"]):
         return
     key = ["layer", "position", "neuron"]
-    base = df[df["arm"] == "sft"].set_index(key)
+    base = df[df["arm"] == BASELINE].set_index(key)
     rows = []
-    for arm in [a for a in df["arm"].unique() if a != "sft"]:
+    for arm in [a for a in df["arm"].unique() if a != BASELINE]:
         o = df[df["arm"] == arm].set_index(key)
         j = o.join(base, lsuffix="_j", rsuffix="_s", how="inner")
         for metric in ("coupling_gap", "interventional_corr", "endogenous_corr", "drift_vs_cached_corr"):
@@ -216,14 +233,16 @@ def plot_arm_deltas(df: pd.DataFrame, out_dir: Path):
     if not rows:
         return
     t = pd.DataFrame(rows)
-    t.to_csv(out_dir / "arm_deltas_vs_sft.csv", index=False)
-    print("\n[ic] joint − SFT, paired on (layer, position, neuron):")
+    t.to_csv(out_dir / f"arm_deltas_vs_{BASELINE}.csv", index=False)
+    print(f"\n[ic] each arm − {BASELINE}, paired on (layer, position, neuron):")
     print(t.round(3).to_string(index=False))
     return t
 
 
-def main(out_dir=None):
-    out_dir = Path(out_dir or ROOT / "outputs" / "plots" / "introspection_coupling")
+def main(out_dir=None, preset="sft_vs_joint"):
+    global ARMS, ARM_TITLE, BASELINE
+    ARMS, ARM_TITLE, BASELINE, subdir = PRESETS[preset]
+    out_dir = Path(out_dir or ROOT / "outputs" / "plots" / subdir)
     out_dir.mkdir(parents=True, exist_ok=True)
     df = load_arms()
     source = "run directories"
@@ -256,4 +275,12 @@ def main(out_dir=None):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else None)
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("out_dir", nargs="?", default=None,
+                    help="Default: outputs/plots/<preset's subdir>.")
+    ap.add_argument("--preset", choices=sorted(PRESETS), default="sft_vs_joint",
+                    help="sft_vs_joint (default): SFT vs the two joint arms on the layer x "
+                         "position grid. weight_sweep: w=1 / 0.01 / 0 on the weight sweep.")
+    a = ap.parse_args()
+    main(a.out_dir, a.preset)

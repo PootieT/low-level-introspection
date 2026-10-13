@@ -141,19 +141,19 @@ def _agreement_panels(k: int, q: float) -> list:
     qs = f"{q:g}"
     rnd = "Random Layer-Matched Heads"
     return [
-        (f"Top-Head Overlap Coefficient\n({100 * q:g}% Mass)",
+        ("Overlap", f"Top-Head Overlap Coeff.\n({100 * q:g}% Mass)",
          [(f"mass{qs}_overlap", "Observed", "#c0392b"),
           (f"mass{qs}_null", rnd, "#bdc3c7")], (-0.05, 1.05)),
-        (f"Top-{k} Jaccard", [(f"jaccard_top{k}", "Observed", "#2471a3"),
+        ("Overlap", f"Top-{k} Jaccard", [(f"jaccard_top{k}", "Observed", "#2471a3"),
                               (f"null_top{k}", rnd, "#bdc3c7")], (-0.05, 1.05)),
-        ("Transfer Ratio", [(f"transfer_{A}_to_{B}", f"{LABEL[A]}-Ranked, on {LABEL[B]}", "#c0392b"),
+        ("Functional Similarity", "Transfer Ratio", [(f"transfer_{A}_to_{B}", f"{LABEL[A]}-Ranked, on {LABEL[B]}", "#c0392b"),
                             (f"transfer_{B}_to_{A}", f"{LABEL[B]}-Ranked, on {LABEL[A]}", "#2471a3"),
                             (f"transfer_random_to_{B}", f"Random, on {LABEL[B]}", "#bdc3c7")],
          (-0.05, 1.05)),
-        ("Effective Heads\n(Positive Drops)",
+        ("Sparsity", "Effective Heads\n(Positive Drops)",
          [(f"effective_heads_pos_{A}", LABEL[A], "#c0392b"),
           (f"effective_heads_pos_{B}", LABEL[B], "#2471a3")], None),
-        ("Effective Heads\n(|Drop|)",
+        ("Sparsity", "Effective Heads\n(|Drop|)",
          [(f"effective_heads_abs_{A}", LABEL[A], "#c0392b"),
           (f"effective_heads_abs_{B}", LABEL[B], "#2471a3")], None),
     ]
@@ -170,7 +170,7 @@ def _draw_row(axes, runs, xcol, xlabel, panels, fonts, titles=True, legends=True
     rng = np.random.default_rng(seed)
     levels = sorted(runs[xcol].unique())
     pos = {v: i for i, v in enumerate(levels)}
-    for ax, (title, series, ylim) in zip(axes, panels):
+    for ax, (title, ylabel, series, ylim) in zip(axes, panels):
         width = 0.8 / len(series)
         for si, (col, label, color) in enumerate(series):
             if col not in runs:
@@ -184,6 +184,7 @@ def _draw_row(axes, runs, xcol, xlabel, panels, fonts, titles=True, legends=True
                        s=fonts["median"], color=color, linewidths=2.5)
         ax.set_xticks(range(len(levels)), levels)
         ax.set_xlabel(xlabel, fontsize=fonts["label"])
+        ax.set_ylabel(ylabel, fontsize=fonts["label"])
         ax.tick_params(labelsize=fonts["tick"])
         if titles:
             ax.set_title(title.replace("\n", " ") if one_line_titles else title,
@@ -221,7 +222,7 @@ def agreement_by_locale(runs: pd.DataFrame, k: int, q: float, out: Path):
         # titles once (top row); legends once per column, below the bottom row
         _draw_row(axes[r], runs, xcol, xlabel, panels, FONTS_PAPER,
                   titles=r == 0, legends=last, legend_below=last)
-    fig.subplots_adjust(left=0.04, right=0.99, top=0.92, bottom=0.2, wspace=0.32, hspace=0.42)
+    fig.subplots_adjust(left=0.04, right=0.99, top=0.92, bottom=0.2, wspace=0.48, hspace=0.42)
     fig.savefig(out / "knockout_agreement_by_locale.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -231,7 +232,7 @@ def agreement_by_locale(runs: pd.DataFrame, k: int, q: float, out: Path):
         _draw_row(axes[0], runs, xcol, xlabel, panels, FONTS_PAPER, legend_below=True)
         # explicit margins: tight_layout shrinks the axes to make room for the legends
         # below them, which squashes the plots; bbox_inches="tight" trims the rest
-        fig.subplots_adjust(left=0.04, right=0.99, top=0.86, bottom=0.36, wspace=0.32)
+        fig.subplots_adjust(left=0.04, right=0.99, top=0.86, bottom=0.36, wspace=0.48)
         fig.savefig(out / fname, dpi=200, bbox_inches="tight")
         plt.close(fig)
 
@@ -278,7 +279,13 @@ def prevalence(heads: pd.DataFrame, k: int, out: Path) -> pd.DataFrame:
         d["prevalence"] = d["n_top"] / d["n_eligible"]
         rows.append(d)
     prev = pd.concat(rows, ignore_index=True)
+    plot_prevalence(prev, k, out)
+    return prev
 
+
+def plot_prevalence(prev: pd.DataFrame, k: int, out: Path):
+    """Heatmap per arm of how often each head is in a run's top-k. Separate from
+    prevalence() so the figure can be redrawn from knockout_head_prevalence.csv."""
     arms = [a for a in (A, B) if a in set(prev["arm"])]
     n_layers = int(prev["layer"].max()) + 1
     n_heads = int(prev["head"].max()) + 1
@@ -288,14 +295,18 @@ def prevalence(heads: pd.DataFrame, k: int, out: Path) -> pd.DataFrame:
     for ax, arm in zip(axes[:, 0], arms):
         m = (prev[prev["arm"] == arm].pivot(index="layer", columns="head", values="prevalence")
              .reindex(index=range(lo, n_layers), columns=range(n_heads)))
-        sns.heatmap(m, ax=ax, cmap="magma_r", vmin=0, vmax=1, cbar_kws={"label": f"Fraction of Runs in Top-{k}"})
-        ax.set_title(f"{LABEL.get(arm, arm)}: How Often Each Head Is in a Run's Top-{k} "
-                     f"(of Runs Where It Is Above the Signal)", fontsize=9)
-        ax.set_ylabel("Layer"); ax.set_xlabel("Head"); ax.tick_params(labelsize=6)
+        hm = sns.heatmap(m, ax=ax, cmap="magma_r", vmin=0, vmax=1,
+                         cbar_kws={"label": f"Fraction of Runs in Top-{k}"})
+        hm.figure.axes[-1].yaxis.label.set_size(16)          # colorbar label
+        hm.figure.axes[-1].tick_params(labelsize=13)
+        # short title names the arm; "of runs where the head is above the signal layer"
+        # (the denominator) belongs in the caption
+        ax.set_title(f"{LABEL.get(arm, arm)} Head Prevalence", fontsize=20)
+        ax.set_ylabel("Layer", fontsize=17); ax.set_xlabel("Head", fontsize=17)
+        ax.tick_params(labelsize=11)
     fig.tight_layout()
     fig.savefig(out / "knockout_head_prevalence.png", dpi=150)
     plt.close(fig)
-    return prev
 
 
 def main():
