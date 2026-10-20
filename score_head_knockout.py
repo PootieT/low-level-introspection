@@ -326,9 +326,12 @@ def arm_label(arm: str) -> str:
     return f"Interventional ({arm})" if arm.startswith("x") else arm.capitalize()
 
 
+SEQ_LEN = 32      # training window length (positions in titles are absolute)
+
+
 def run_title(name: str, signal: str | None = None) -> str:
     """'joint_N12.1235_POS-12_..._kl0.1_...' -> 'Joint Loss (KL=0.1), Neuron Activation,
-    L=12, i=1235, t=-12'. `signal` (e.g. 'N12.1235') overrides the name's neuron, which
+    L=12, i=1235, t=20'. `signal` (e.g. 'N12.1235') overrides the name's neuron, which
     a multi-locale run's name does not carry. Unparseable pieces are left out."""
     parts = []
     kl = KL_RE.search(name)
@@ -342,7 +345,10 @@ def run_title(name: str, signal: str | None = None) -> str:
         parts.append(f"Neuron Activation, L={n['layer']}, i={n['index']}")
     pz = POS_RE.search(name)
     if pz:
-        parts.append(f"t={pz['pos']}")
+        # 0-indexed absolute position in the 32-token window (POS-1 -> t=31), as in
+        # every other figure
+        pos = int(pz["pos"])
+        parts.append(f"t={pos + SEQ_LEN if pos < 0 else pos}")
     return ", ".join(parts) or name
 
 

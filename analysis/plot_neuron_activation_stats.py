@@ -44,6 +44,7 @@ STAT_COLS = ["count", "mean", "std", "min", "25%", "50%", "75%", "max"]
 # a neuron whose mean moves by more than this many of its own stds across positions
 # is flagged as position-dependent in the printed check
 POSITION_FLAG = 0.25
+SEQ_LEN = 32          # every cell dataset uses 32-token windows (seq32)
 
 
 def parse_args():
@@ -145,7 +146,9 @@ def plot(df: pd.DataFrame, out_dir: Path):
                         fmt="o", ms=4, capsize=2, lw=1.2, color=color, label=f"{neuron}")
         ax.axhline(0, color="grey", lw=0.8, ls="--", alpha=0.6)
         ax.set_xticks(range(len(positions)))
-        ax.set_xticklabels(positions, fontsize=10)
+        # 0-indexed absolute positions in the window (-1 -> 31), as in every other figure;
+        # the CSV keeps the end-relative values the datasets are named by
+        ax.set_xticklabels([p + SEQ_LEN if p < 0 else p for p in positions], fontsize=10)
         ax.tick_params(axis="y", labelsize=10)
         ax.set_title(f"Layer {layer}", fontsize=14)
         ax.set_xlabel("Token Position", fontsize=12)

@@ -348,8 +348,7 @@ def ood_ladder_table(frames: dict, readout="endogenous", common_only=True):
 
 def plot_ood_ladders(frames: dict, out_dir, arm_colors=None, common_only=True):
     """Both readouts across the corpus ladder in ONE figure: endogenous left,
-    interventional right, shared y; one box per arm per corpus over the per-run
-    correlations (the CSVs keep the mean ± SE).
+    interventional right, shared y; grouped bars, mean ± SE over runs (as in the CSVs).
 
     The x-order is set by the endogenous panel -- in-domain pinned leftmost, then OOD
     corpora by decreasing endogenous performance (averaged over arms) -- and reused for
@@ -371,54 +370,40 @@ def plot_ood_ladders(frames: dict, out_dir, arm_colors=None, common_only=True):
                  .sort_values(ascending=False).index.tolist())
         order += extra
 
-    # same runs in every arm (as ood_ladder_table does), so boxes compare like with like
-    if common_only and len(frames) > 1:
-        keys = set.intersection(*[set(map(tuple, f[KEY].values)) for f in frames.values()])
-        frames = {a: f[[tuple(r) in keys for r in f[KEY].values]] for a, f in frames.items()}
     arms = list(frames)
-
-    # Box plot of the per-run correlations: median, quartiles, whiskers (no outlier dots).
-    # Boxes rather than mean +- SE lines because the spread is the finding in places --
-    # e.g. SFT gate-off's interventional median is ~0 while its upper quartile is not.
-    # Sized for a half-width paper column: titles / y-label above the generalization
-    # figures' sizes, unrotated two-line tick labels, y fixed to [0, 1].
+    # Grouped bars, mean ± SE over runs (the same numbers ood_ladder_*.csv holds). Sized
+    # for a half-width paper column: titles / y-label larger than the generalization
+    # figures, unrotated two-line tick labels.
     fig, axes = plt.subplots(1, 2, figsize=(19, 6.5), sharey=True)
     xticklabels = [pretty_corpus(c).replace(" (", "\n(") for c in order]
     width = 0.8 / len(arms)
     for ax, readout in zip(axes, ("endogenous", "interventional")):
+        t = tables.get(readout)
         for i, arm in enumerate(arms):
-            f = frames[arm]
-            vals = [f[col].dropna().to_numpy() if col in f else np.array([])
-                    for col in (f"{readout}_corr" if c == "in-domain" else f"ood_{c}_{readout}"
-                                for c in order)]
-            xs = np.arange(len(order)) + (i - (len(arms) - 1) / 2) * width
-            keep = [k for k, v in enumerate(vals) if len(v)]
-            if not keep:
+            if t is None:
                 continue
+            sub = t[t["arm"] == arm].set_index("corpus").reindex(order)
+            xs = np.arange(len(order)) + (i - (len(arms) - 1) / 2) * width
             color = arm_colors.get(arm) if arm_colors else None
-            bp = ax.boxplot([vals[k] for k in keep], positions=xs[keep], widths=width * 0.85,
-                            patch_artist=True, showfliers=False,
-                            medianprops=dict(color="k", lw=1.5),
-                            whiskerprops=dict(lw=1.1), capprops=dict(lw=1.1))
-            for box in bp["boxes"]:
-                box.set(facecolor=color, alpha=0.85, edgecolor="k", lw=0.8)
-            ax.plot([], [], "s", ms=14, color=color, label=pretty_arm(arm))   # legend proxy
-            print(f"[cmp] ladder ({readout}) {pretty_arm(arm)}: n={max(map(len, vals))} runs")
+            ax.bar(xs, sub["mean"], width * 0.92, yerr=sub["se"], capsize=3, color=color,
+                   label=pretty_arm(arm), error_kw=dict(lw=1.2))
+            print(f"[cmp] ladder ({readout}) {pretty_arm(arm)}: n={int(sub['n'].max())} runs")
         ax.set_title(f"OOD {readout.capitalize()}", fontsize=36)
         ax.set_xticks(np.arange(len(order)))
         ax.set_xticklabels(xticklabels, fontsize=24)
         ax.tick_params(axis="y", labelsize=26)
         ax.grid(axis="y", alpha=0.25)
-    axes[0].set_ylabel("Correlation", fontsize=34)
-    axes[0].set_ylim(0, 1)
-    # one legend, 2 x 2, bottom-left of the endogenous panel: kept inside the axes so
-    # the figure does not grow taller (it touches the lowest whisker tips of a few boxes)
+    axes[0].set_ylabel("Correlation\n(Mean \u00b1 SE)", fontsize=34)   # one line overruns the axis
+    # bars fill the panel from 0, so the legend needs headroom: the axis runs to 1.25
+    # but is labelled 0-1 only, and the 2 x 2 legend sits above the tallest bars
+    axes[0].set_ylim(0, 1.25)
+    axes[0].set_yticks(np.arange(0, 1.01, 0.2))
     handles, labels = next((ax.get_legend_handles_labels() for ax in axes
                             if ax.get_legend_handles_labels()[0]), ([], []))
     if handles:
-        axes[0].legend(handles, labels, loc="lower left", ncol=2, fontsize=20,
-                       framealpha=0.9, handlelength=1.0, columnspacing=0.8,
-                       borderaxespad=0.3)
+        axes[0].legend(handles, labels, loc="upper center", ncol=2, fontsize=20,
+                       frameon=False, handlelength=1.0, columnspacing=0.8,
+                       borderaxespad=0.2)
     fig.tight_layout()
     path = Path(out_dir) / "ood_ladder.png"
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)

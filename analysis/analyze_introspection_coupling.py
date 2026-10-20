@@ -62,6 +62,9 @@ BASELINE = "sft"      # paired deltas are every other arm minus this one
 # so the drift caused by the INTERVENTIONAL loss alone (w=0) can be read against the
 # endogenous-only model (w=1) on the same neurons. kl_tag is not filtered: the anchor
 # budget is per cell (0.1 or 3.0) and identical across weights within a cell.
+LABEL_ARM = {"weight_sweep": "w0"}   # readout scatter: label this arm's points by neuron
+ANNOTATE = None
+MAX_SHAPED_CELLS = 6                  # marker shape per (layer, position) cell up to this many
 PRESETS = {
     "sft_vs_joint": (dict(ARMS), dict(ARM_TITLE), "sft", "introspection_coupling"),
     "weight_sweep": ({"w1":    ("mlp_joint_weight_sweep", 1.0,  None),
@@ -165,15 +168,35 @@ def plot_readout_scatter(df: pd.DataFrame, out_dir: Path):
         return
     arms = [a for a in ARMS if a in set(df["arm"])] or sorted(df["arm"].unique())
     fig, axes = plt.subplots(1, len(arms), figsize=(6 * len(arms), 5.6), sharey=True, squeeze=False)
+    # few cells (the weight sweep has 3): one marker shape per (layer, position) cell in
+    # every panel, so a locale can be followed across arms; the grid's 64 cells stay circles
+    cells = sorted({(int(l), int(p)) for l, p in zip(df["layer"], df["position"])})
+    shaped = len(cells) <= MAX_SHAPED_CELLS
+    markers = dict(zip(cells, ["o", "s", "^", "D", "v", "P"])) if shaped else {}
     for ax, arm in zip(axes[0], arms):
         q = df[df["arm"] == arm]
-        sc = ax.scatter(q["corr_pred_cached"], q["corr_pred_tuned_live"],
-                        c=q["drift_vs_cached_corr"], cmap="viridis", vmin=0.5, vmax=1.0,
-                        s=30, edgecolors="k", linewidths=0.4)
+        groups = q.groupby(["layer", "position"]) if shaped else [(None, q)]
+        for cell, g in groups:
+            sc = ax.scatter(g["corr_pred_cached"], g["corr_pred_tuned_live"],
+                            c=g["drift_vs_cached_corr"], cmap="viridis", vmin=0.5, vmax=1.0,
+                            s=90 if shaped else 30, marker=markers.get(cell, "o"),
+                            edgecolors="k", linewidths=0.6 if shaped else 0.4)
+        if arm == ANNOTATE:
+            # neuron index next to each point, to see whether a locale is consistently in a
+            # corner (the marker shape says which cell it is); labels that would collide
+            # are pushed down and get a leader line back to their point
+            _label_points(ax, q["corr_pred_cached"], q["corr_pred_tuned_live"],
+                          [str(n).split(".")[-1] for n in q["neuron"]])
         ax.plot([-0.2, 1], [-0.2, 1], "k--", lw=0.9, alpha=0.6)
         ax.set_xlim(-0.2, 1.02); ax.set_ylim(-0.2, 1.02)
         ax.set_title(_arm(arm), fontsize=FS["title"])
         ax.tick_params(labelsize=FS["ticks"])
+    if shaped:
+        handles = [plt.Line2D([], [], ls="", marker=markers[c], ms=11, mfc="white", mec="k",
+                              label=f"L{c[0]}, t={c[1] + SEQ_LEN if c[1] < 0 else c[1]}")
+                   for c in cells]
+        axes[0][0].legend(handles=handles, title="Locale", fontsize=FS["legend"],
+                          title_fontsize=FS["legend"], loc="lower right")
     axes[0][0].set_ylabel("Corr(Prediction, Live Activation)", fontsize=FS["label"])
     # one shared x-label: per-panel copies are wider than a panel and collide
     fig.supxlabel("Corr(Prediction, Cached Target)", fontsize=FS["label"], y=-0.02)
@@ -182,6 +205,22 @@ def plot_readout_scatter(df: pd.DataFrame, out_dir: Path):
     cb.ax.tick_params(labelsize=FS["ticks"])
     fig.savefig(out_dir / "readout_cached_vs_live.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+def _label_points(ax, xs, ys, labels, w=0.12, h=0.05, dx=0.03, dy=0.015):
+    """Greedy non-overlapping labels in data units (w, h ~ a 4-digit label at size 11 on
+    these [-0.2, 1] axes): place each label up-right of its point, moving it down by one
+    label height until it clears every label already placed."""
+    placed = []
+    for x, y, t in sorted(zip(xs, ys, labels), key=lambda r: -r[1]):
+        lx, ly = x + dx, y + dy
+        while any(abs(lx - px) < w and abs(ly - py) < h for px, py in placed):
+            ly -= h
+        placed.append((lx, ly))
+        moved = abs(ly - (y + dy)) > 1e-9
+        ax.annotate(t, (x, y), xytext=(lx, ly), textcoords="data", fontsize=11,
+                    va="bottom", arrowprops=dict(arrowstyle="-", lw=0.6, color="0.4")
+                    if moved else None)
 
 
 def plot_cell_heatmaps(cells: pd.DataFrame, out_dir: Path, metric: str, vmin=None, vmax=None,
@@ -240,8 +279,9 @@ def plot_arm_deltas(df: pd.DataFrame, out_dir: Path):
 
 
 def main(out_dir=None, preset="sft_vs_joint"):
-    global ARMS, ARM_TITLE, BASELINE
+    global ARMS, ARM_TITLE, BASELINE, ANNOTATE
     ARMS, ARM_TITLE, BASELINE, subdir = PRESETS[preset]
+    ANNOTATE = LABEL_ARM.get(preset)
     out_dir = Path(out_dir or ROOT / "outputs" / "plots" / subdir)
     out_dir.mkdir(parents=True, exist_ok=True)
     df = load_arms()
