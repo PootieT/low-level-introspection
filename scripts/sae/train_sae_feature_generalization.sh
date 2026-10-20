@@ -5,10 +5,10 @@
 #$ -l gpus=1
 #$ -l gpu_c=8.5
 #$ -l gpu_memory=47G
-#$ -l h_rt=10:00:00
+#$ -l h_rt=48:00:00
 #$ -o log
 #$ -j y
-#$ -t 1-5
+#$ -t 13
 
 # ============================================================================
 # SAE FEATURE GENERALIZATION: does an introspector trained on N SAE features read

@@ -68,7 +68,6 @@ set -e
 # DIFFERENT cell. (For a hard guarantee, run a cache-only pass first and submit the
 # training array with -hold_jid.)
 index=$(($SGE_TASK_ID-1))
-index=0
 LAYERS=(4 12 20 28)
 # N2.2566,N2.1886,N2.5949,N2.6998,N2.1447,N2.868,N2.1134,N2.1027,N2.8085,N2.1583
 POSS=(-1 -8 -20 -28)

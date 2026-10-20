@@ -88,7 +88,7 @@ def parse_args():
     p.add_argument("--checkpoint", type=Path, default=None)
     p.add_argument("--n-test", type=int, default=None,
                    help="Test rows to use (default: the whole split).")
-    p.add_argument("--batch-size", type=int, default=8,
+    p.add_argument("--batch-size", type=int, default=128,
                    help="Smaller than the eval default on purpose: this pass keeps the "
                         "act_fn output AND its gradient for every layer "
                         "([B, seq, 8192] x 16 x 2), which is the memory constraint.")

@@ -52,6 +52,7 @@ export HF_HOME=/projectnb/ivc-ml/SharedHuggingFaceCache
 set -e
 
 MODE=${MODE:-grid}
+#MODE=lc
 GROUP=mlp_joint_grid_layer_token
 
 if [ "$MODE" = "lc" ]; then

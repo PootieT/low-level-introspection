@@ -3,8 +3,8 @@
 #$ -N head_knockout_joint_grid
 #$ -pe omp 4
 #$ -l gpus=1
-#$ -l gpu_c=8.0
-#$ -l gpu_memory=24G
+#$ -l gpu_c=8.5
+#$ -l gpu_memory=47G
 #$ -l h_rt=6:00:00
 #$ -o log
 #$ -j y

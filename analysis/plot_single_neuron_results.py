@@ -741,10 +741,11 @@ if __name__ == "__main__":
 
 
     # ---- endogenous (W=1.0) layer x token sweep -------------------------
-    EXP_GROUP = "mlp_endo_sweep_layer_token_llama323b" # "mlp_endo_sweep_layer_token"
-    OUT_DIR = f"{ROOT}/outputs/plots/{EXP_GROUP}"
+    for suffix in ["", "_llama323b", "_llama318b"]:
+        EXP_GROUP = f"mlp_endo_sweep_layer_token{suffix}" # "mlp_endo_sweep_layer_token"
+        OUT_DIR = f"{ROOT}/outputs/plots/{EXP_GROUP}"
 
-    os.makedirs(OUT_DIR, exist_ok=True)
-    # both arms: each into its own subdir, plus the gate on/off comparison at the root
-    run_endogenous_sweep_plots(EXP_GROUP, OUT_DIR, gates=("on", "off"))
+        os.makedirs(OUT_DIR, exist_ok=True)
+        # both arms: each into its own subdir, plus the gate on/off comparison at the root
+        run_endogenous_sweep_plots(EXP_GROUP, OUT_DIR, gates=("on", "off"))
 
