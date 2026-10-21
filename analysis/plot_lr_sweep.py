@@ -19,7 +19,7 @@ it redraws from that CSV (outputs/runs is partial on a laptop).
 
   python analysis/plot_lr_sweep.py                          # llama318b
   python analysis/plot_lr_sweep.py --model llama323b
-  python analysis/plot_lr_sweep.py --model qwen25_05b,llama323b,qwen25_7b,llama318b
+  python analysis/plot_lr_sweep.py --model qwen3_06b,qwen3_17b,llama323b,qwen3_4b,llama318b,qwen3_8b
 With several models it also overlays their LR curves per cell role and writes the best
 LR per (model, role, regime) to outputs/plots/lr_sweep_compare/.
 """
@@ -40,13 +40,13 @@ import matplotlib.pyplot as plt
 ROOT = Path(__file__).resolve().parents[1]
 # sweep key -> (display name, n_layers, params in B). The key is SWEEP_MODEL in the script
 MODELS = {
-    "qwen25_05b": ("Qwen2.5-0.5B", 24, 0.49),
-    "qwen25_15b": ("Qwen2.5-1.5B", 28, 1.54),
-    "qwen25_3b": ("Qwen2.5-3B", 36, 3.09),
+    "qwen3_06b": ("Qwen3-0.6B-Base", 28, 0.60),
+    "qwen3_17b": ("Qwen3-1.7B-Base", 28, 1.72),
     "llama323b": ("Llama-3.2-3B", 28, 3.21),
-    "qwen25_7b": ("Qwen2.5-7B", 28, 7.62),
+    "qwen3_4b": ("Qwen3-4B-Base", 36, 4.02),
     "llama318b": ("Llama-3.1-8B", 32, 8.03),
-    "qwen25_14b": ("Qwen2.5-14B", 48, 14.7),
+    "qwen3_8b": ("Qwen3-8B-Base", 36, 8.19),
+    "qwen3_14b": ("Qwen3-14B-Base", 40, 14.8),
 }
 # every model's three cells play the same role, keyed by position (see the sweep script)
 ROLE = {-8: "mid (~3/8)", -1: "shallow (~1/8)", -28: "deep (~7/8)"}

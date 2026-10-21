@@ -14,6 +14,35 @@
 # ============================================================================
 # LR SWEEP, ANY MODEL: does the Llama-3.2-1B learning rate transfer?
 #
+# >>> SUBMIT -- paste on SCC. To print these lines without the leading '# ':
+#   SHOW_COMMANDS=1 bash scripts/neuron/train_single_mlp_introspector_joint_lr_sweep.sh
+# cd /projectnb/llamagrp/peter/low-level-introspection
+# S=scripts/neuron/train_single_mlp_introspector_joint_lr_sweep.sh
+# C=scripts/neuron/train_single_mlp_introspector_joint_lr_sweep_cache.sh
+#
+# # 1. Llama-3.1-8B: add only the new top LR (5e-4) to its sweep. That is 12 tasks, so
+# #    submit a copy whose header says -t 1-12 (qsub here does not take -t)
+# sed 's/^#\$ -t 1-72$/#$ -t 1-12/' $S > log/lr_sweep_t12.sh
+# qsub -N lrsweep_llama318b_lr5e4 -v SWEEP_MODEL=llama318b,LR_LIST=5e-4 log/lr_sweep_t12.sh
+#
+# # 2. Llama-3.2-3B: new cells, so build the 3 caches first and hold the sweep on them
+# qsub -N lrcache_llama323b -v SWEEP_MODEL=llama323b $C
+# qsub -N lrsweep_llama323b -hold_jid lrcache_llama323b -v SWEEP_MODEL=llama323b $S
+#
+# # 3. Qwen3, same two steps per model
+# for M in qwen3_06b qwen3_17b qwen3_4b qwen3_8b; do
+#   qsub -N lrcache_$M -v SWEEP_MODEL=$M $C
+#   qsub -N lrsweep_$M -hold_jid lrcache_$M -v SWEEP_MODEL=$M $S
+# done
+# # 14B needs an 80G GPU and more wall time
+# qsub -N lrcache_qwen3_14b -l gpu_memory=80G -l h_rt=24:00:00 -v SWEEP_MODEL=qwen3_14b $C
+# qsub -N lrsweep_qwen3_14b -hold_jid lrcache_qwen3_14b -l gpu_memory=80G -l h_rt=24:00:00 -v SWEEP_MODEL=qwen3_14b $S
+#
+# # 4. Once runs finish: the 1B reference table, then per-model and cross-model plots
+# python analysis/compare_model_scaling.py
+# python analysis/plot_lr_sweep.py --model qwen3_06b,qwen3_17b,llama323b,qwen3_4b,llama318b,qwen3_8b,qwen3_14b
+# <<< SUBMIT
+#
 # The model-generic version of train_single_mlp_introspector_joint_lr_sweep_llama318b.sh
 # (same design, same decision rule, same run names and groups -- llama318b here reproduces
 # that script's runs exactly, so finished 8B tasks are skipped on resubmission). Pick the
@@ -22,11 +51,21 @@
 #   key          model                 layers  cells (layer:pos)        batch    cache
 #   llama323b    meta-llama/Llama-3.2-3B   28  11:-8   4:-1  25:-28     32 x 1   NEW
 #   llama318b    meta-llama/Llama-3.1-8B   32  12:-8   4:-1  28:-28     16 x 2   grid's
-#   qwen25_05b   Qwen/Qwen2.5-0.5B         24   9:-8   3:-1  21:-28     32 x 1   NEW
-#   qwen25_15b   Qwen/Qwen2.5-1.5B         28  11:-8   4:-1  25:-28     32 x 1   NEW
-#   qwen25_3b    Qwen/Qwen2.5-3B           36  14:-8   5:-1  32:-28     32 x 1   NEW
-#   qwen25_7b    Qwen/Qwen2.5-7B           28  11:-8   4:-1  25:-28     16 x 2   NEW
-#   qwen25_14b   Qwen/Qwen2.5-14B          48  18:-8   6:-1  42:-28      8 x 4   NEW (80G)
+#   qwen3_06b    Qwen/Qwen3-0.6B-Base      28  11:-8   4:-1  25:-28     32 x 1   NEW
+#   qwen3_17b    Qwen/Qwen3-1.7B-Base      28  11:-8   4:-1  25:-28     32 x 1   NEW
+#   qwen3_4b     Qwen/Qwen3-4B-Base        36  14:-8   5:-1  32:-28     16 x 2   NEW
+#   qwen3_8b     Qwen/Qwen3-8B-Base        36  14:-8   5:-1  32:-28     16 x 2   NEW
+#   qwen3_14b    Qwen/Qwen3-14B-Base       40  15:-8   5:-1  35:-28      8 x 4   NEW (80G)
+#
+# QWEN3 BASE, not Qwen3.5: Qwen3 is a plain decoder with the same gated-SiLU MLP as Llama
+# (Qwen3ForCausalLM; its only attention change is QK-norm) and a smoke test passes end to
+# end. Qwen3.5 is a vision-language wrapper whose text model mixes Gated-DeltaNet linear
+# attention into 3 of every 4 layers -- an architecture confound in a scaling study, and
+# not yet verified here (loading the real checkpoint, padding through the linear layers,
+# no fused kernels on SCC). BASE checkpoints throughout, matching the Llama grids
+# (meta-llama/Llama-3.2-1B, -3.2-3B, -3.1-8B are the pretrained models, not -Instruct).
+# Qwen names its base models with a -Base suffix; the un-suffixed Qwen3 ids are the
+# post-trained (instruct/thinking) models, so dropping -Base would break the match.
 #
 # CELLS play the same three roles in every model, in the same order:
 #   pos -8  at depth ~3/8   the cell where 8B fell furthest behind 1B (the main question)
@@ -45,40 +84,39 @@
 # No neuron that picks the LR is ever used to evaluate it.
 #
 # LRs: 1e-5 .. 5e-4. 5e-4 is new relative to the 8B sweep: there the unanchored optimum
-# sat at the old upper edge (2e-4). To add only it to the finished 8B sweep:
-#   qsub -t 1-12 -v SWEEP_MODEL=llama318b,LR_LIST=5e-4 <script>
-# (LR_LIST is colon-separated, because qsub -v splits on commas.)
+# sat at the old upper edge (2e-4); step 1 above adds just that LR. LR_LIST is
+# colon-separated because qsub -v splits on commas. Tasks beyond a short LR_LIST sweep
+# exit at once, but still wait for a GPU first -- hence the -t 1-12 copy.
 #
-# ---- SUBMITTING -------------------------------------------------------------
-# Llama 8B (caches exist):
-#   qsub -N lrsweep_llama318b -v SWEEP_MODEL=llama318b <script>
-# Llama 3B and Qwen (NEW caches): all 24 tasks of a cell would otherwise race to build
-# one cache directory, so build the caches first -- one task per cell -- and hold the
-# sweep on it:
-#   qsub -N lrcache_qwen25_7b -t 1-3 -v SWEEP_MODEL=qwen25_7b,CACHE_ONLY=1 <script>
-#   qsub -N lrsweep_qwen25_7b -hold_jid lrcache_qwen25_7b -v SWEEP_MODEL=qwen25_7b <script>
-# Training tasks refuse to start without a complete cache rather than build one.
-# qwen25_14b: add -l gpu_memory=80G (and probably -l h_rt=24:00:00) to both.
+# CACHES: 3B and Qwen cells are new, and all 24 tasks of a cell would race to build one
+# cache directory, so the 3-task wrapper ..._lr_sweep_cache.sh builds them first (one
+# task per cell) and the sweep is held on it. Training tasks refuse to start without a
+# complete cache rather than build one. 8B's caches exist.
 #
 # TASK LAYOUT  72 = 3 cells x 2 regimes x 2 neurons x 6 LRs, LR innermost (any block
 # of 6 contiguous tasks is one LR curve); the main cell is first, so -t 1-24 alone
 # answers the main question.
-#   SWEEP_MODEL=qwen25_7b DRY_RUN=1 bash <script>      prints the task table
-#   SWEEP_MODEL=qwen25_7b SGE_TASK_ID=7 bash <script>  runs one task interactively
+#   SWEEP_MODEL=qwen3_8b DRY_RUN=1 bash <script>      prints the task table
+#   SWEEP_MODEL=qwen3_8b SGE_TASK_ID=7 bash <script>  runs one task interactively
 # Read with: python analysis/plot_lr_sweep.py --model <key>   (--model a,b,... compares)
 # ============================================================================
+
+if [ -n "$SHOW_COMMANDS" ]; then
+  sed -n '/^# >>> SUBMIT/,/^# <<< SUBMIT/p' "$0" | sed '1,2d;$d' | sed 's/^# \{0,1\}//'
+  exit 0
+fi
 
 # ---- the model --------------------------------------------------------------------
 case "$SWEEP_MODEL" in
   llama323b)  MODEL=meta-llama/Llama-3.2-3B; CELLS=("11:-8" "4:-1" "25:-28"); BS=32; ACCUM=1 ;;
   llama318b)  MODEL=meta-llama/Llama-3.1-8B; CELLS=("12:-8" "4:-1" "28:-28"); BS=16; ACCUM=2 ;;
-  qwen25_05b) MODEL=Qwen/Qwen2.5-0.5B;       CELLS=("9:-8"  "3:-1" "21:-28"); BS=32; ACCUM=1 ;;
-  qwen25_15b) MODEL=Qwen/Qwen2.5-1.5B;       CELLS=("11:-8" "4:-1" "25:-28"); BS=32; ACCUM=1 ;;
-  qwen25_3b)  MODEL=Qwen/Qwen2.5-3B;         CELLS=("14:-8" "5:-1" "32:-28"); BS=32; ACCUM=1 ;;
-  qwen25_7b)  MODEL=Qwen/Qwen2.5-7B;         CELLS=("11:-8" "4:-1" "25:-28"); BS=16; ACCUM=2 ;;
-  qwen25_14b) MODEL=Qwen/Qwen2.5-14B;        CELLS=("18:-8" "6:-1" "42:-28"); BS=8;  ACCUM=4 ;;
-  *) echo "ERROR: set SWEEP_MODEL to one of llama323b llama318b qwen25_05b qwen25_15b" \
-          "qwen25_3b qwen25_7b qwen25_14b (got '$SWEEP_MODEL')" >&2; exit 1 ;;
+  qwen3_06b)  MODEL=Qwen/Qwen3-0.6B-Base;    CELLS=("11:-8" "4:-1" "25:-28"); BS=32; ACCUM=1 ;;
+  qwen3_17b)  MODEL=Qwen/Qwen3-1.7B-Base;    CELLS=("11:-8" "4:-1" "25:-28"); BS=32; ACCUM=1 ;;
+  qwen3_4b)   MODEL=Qwen/Qwen3-4B-Base;      CELLS=("14:-8" "5:-1" "32:-28"); BS=16; ACCUM=2 ;;
+  qwen3_8b)   MODEL=Qwen/Qwen3-8B-Base;      CELLS=("14:-8" "5:-1" "32:-28"); BS=16; ACCUM=2 ;;
+  qwen3_14b)  MODEL=Qwen/Qwen3-14B-Base;     CELLS=("15:-8" "5:-1" "35:-28"); BS=8;  ACCUM=4 ;;
+  *) echo "ERROR: set SWEEP_MODEL to one of llama323b llama318b qwen3_06b qwen3_17b" \
+          "qwen3_4b qwen3_8b qwen3_14b (got '$SWEEP_MODEL')" >&2; exit 1 ;;
 esac
 if [ $((BS * ACCUM)) -ne 32 ]; then
   echo "ERROR: effective batch $BS x $ACCUM != 32" >&2; exit 1
@@ -157,7 +195,8 @@ if [ -n "$CACHE_ONLY" ]; then
   fi
   index=$((index * N_PER_CELL))
 elif [ "$index" -ge "$N_TASKS" ]; then
-  echo "ERROR: task $SGE_TASK_ID > $N_TASKS tasks in this sweep" >&2; exit 1
+  # not an error: the header's -t is fixed at 72, and an LR_LIST sweep is smaller
+  echo "task $SGE_TASK_ID > $N_TASKS tasks in this sweep; nothing to do"; exit 0
 fi
 decode "$index"
 
@@ -278,7 +317,7 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
 ")
 if [ ! -f "$CACHE_DIR/metadata.json" ]; then
   echo "ERROR: no complete cache at $CACHE_DIR -- run the CACHE_ONLY pass first:" >&2
-  echo "  qsub -t 1-$N_CELL -v SWEEP_MODEL=$SWEEP_MODEL,CACHE_ONLY=1 $0" >&2
+  echo "  qsub -v SWEEP_MODEL=$SWEEP_MODEL scripts/neuron/train_single_mlp_introspector_joint_lr_sweep_cache.sh" >&2
   exit 1
 fi
 
