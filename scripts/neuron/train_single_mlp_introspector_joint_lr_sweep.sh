@@ -19,24 +19,30 @@
 # cd /projectnb/llamagrp/peter/low-level-introspection
 # S=scripts/neuron/train_single_mlp_introspector_joint_lr_sweep.sh
 # C=scripts/neuron/train_single_mlp_introspector_joint_lr_sweep_cache.sh
+# # a copy of $S whose header says -t 1-<n>, for sweeps that are not 72 tasks
+# # (qsub here does not take -t; DRY_RUN=1 prints the task count of any sweep)
+# tcopy() { sed "s/^#\$ -t 1-72\$/#\$ -t 1-$1/" $S > log/lr_sweep_t$1.sh; echo log/lr_sweep_t$1.sh; }
 #
-# # 1. Llama-3.1-8B: add only the new top LR (5e-4) to its sweep. That is 12 tasks, so
-# #    submit a copy whose header says -t 1-12 (qsub here does not take -t)
-# sed 's/^#\$ -t 1-72$/#$ -t 1-12/' $S > log/lr_sweep_t12.sh
-# qsub -N lrsweep_llama318b_lr5e4 -v SWEEP_MODEL=llama318b,LR_LIST=5e-4 log/lr_sweep_t12.sh
-#
-# # 2. Llama-3.2-3B: new cells, so build the 3 caches first and hold the sweep on them
-# qsub -N lrcache_llama323b -v SWEEP_MODEL=llama323b $C
-# qsub -N lrsweep_llama323b -hold_jid lrcache_llama323b -v SWEEP_MODEL=llama323b $S
-#
-# # 3. Qwen3, same two steps per model
-# for M in qwen3_06b qwen3_17b qwen3_4b qwen3_8b; do
+# # 1. caches (3 tasks per model; 8B's exist). Skip a model whose cache job already ran
+# for M in llama323b qwen3_06b qwen3_17b qwen3_4b qwen3_8b; do
 #   qsub -N lrcache_$M -v SWEEP_MODEL=$M $C
-#   qsub -N lrsweep_$M -hold_jid lrcache_$M -v SWEEP_MODEL=$M $S
 # done
-# # 14B needs an 80G GPU and more wall time
 # qsub -N lrcache_qwen3_14b -l gpu_memory=80G -l h_rt=24:00:00 -v SWEEP_MODEL=qwen3_14b $C
-# qsub -N lrsweep_qwen3_14b -hold_jid lrcache_qwen3_14b -l gpu_memory=80G -l h_rt=24:00:00 -v SWEEP_MODEL=qwen3_14b $S
+#
+# # 2. joint, KL 0.1 only (36 tasks per model). Skip models already submitted; 8B only
+# #    lacks 5e-4 (6 tasks)
+# qsub -N lrsweep_llama318b_lr5e4 -v SWEEP_MODEL=llama318b,REGIME_LIST=kl0.1,LR_LIST=5e-4 $(tcopy 6)
+# for M in llama323b qwen3_06b qwen3_17b qwen3_4b qwen3_8b; do
+#   qsub -N lrsweep_$M -hold_jid lrcache_$M -v SWEEP_MODEL=$M,REGIME_LIST=kl0.1 $(tcopy 36)
+# done
+# qsub -N lrsweep_qwen3_14b -hold_jid lrcache_qwen3_14b -l gpu_memory=80G -l h_rt=24:00:00 -v SWEEP_MODEL=qwen3_14b,REGIME_LIST=kl0.1 $(tcopy 36)
+#
+# # 3. SFT baseline (w=1, no KL), gate off only: 36 tasks per model
+# qsub -N lrsft_llama318b -v SWEEP_MODEL=llama318b,REGIME_LIST=sft_gateoff $(tcopy 36)
+# for M in llama323b qwen3_06b qwen3_17b qwen3_4b qwen3_8b; do
+#   qsub -N lrsft_$M -hold_jid lrcache_$M -v SWEEP_MODEL=$M,REGIME_LIST=sft_gateoff $(tcopy 36)
+# done
+# qsub -N lrsft_qwen3_14b -hold_jid lrcache_qwen3_14b -l gpu_memory=80G -l h_rt=24:00:00 -v SWEEP_MODEL=qwen3_14b,REGIME_LIST=sft_gateoff $(tcopy 36)
 #
 # # 4. Once runs finish: the 1B reference table, then per-model and cross-model plots
 # python analysis/compare_model_scaling.py
@@ -46,7 +52,8 @@
 # The model-generic version of train_single_mlp_introspector_joint_lr_sweep_llama318b.sh
 # (same design, same decision rule, same run names and groups -- llama318b here reproduces
 # that script's runs exactly, so finished 8B tasks are skipped on resubmission). Pick the
-# model with SWEEP_MODEL:
+# model with SWEEP_MODEL and the training regimes with REGIME_LIST (colon-separated,
+# required -- see REGIMES below):
 #
 #   key          model                 layers  cells (layer:pos)        batch    cache
 #   llama323b    meta-llama/Llama-3.2-3B   28  11:-8   4:-1  25:-28     32 x 1   NEW
@@ -93,11 +100,25 @@
 # task per cell) and the sweep is held on it. Training tasks refuse to start without a
 # complete cache rather than build one. 8B's caches exist.
 #
-# TASK LAYOUT  72 = 3 cells x 2 regimes x 2 neurons x 6 LRs, LR innermost (any block
-# of 6 contiguous tasks is one LR curve); the main cell is first, so -t 1-24 alone
-# answers the main question.
-#   SWEEP_MODEL=qwen3_8b DRY_RUN=1 bash <script>      prints the task table
-#   SWEEP_MODEL=qwen3_8b SGE_TASK_ID=7 bash <script>  runs one task interactively
+# REGIMES (REGIME_LIST picks any of them; each is its grid arm with only the LR changed):
+#   kl0.1        joint, w=0.01, gate off, adaptive KL anchor at 0.1 nats/token
+#   unanchored   joint, w=0.01, gate off, no anchor          (dropped 2026-10-21: the
+#                kl0.1 optimum answers the transfer question; kept so old runs decode)
+#   sft_gateoff  SFT baseline: w=1 (endogenous loss only), no anchor, adapter reaches
+#                the introspected token -- the arm the joint loss is compared against
+#   sft_gateon   SFT baseline, gated: no trainable weight touches the token, so its
+#                endogenous score is context bypass and interventional corr is ~0 (not
+#                swept: only sft_gateoff is, 2026-10-21; kept so it can be)
+# The SFT arm is swept so the baseline gets the same tuning budget as the method. It is
+# judged by ENDOGENOUS corr (what it is trained on); analysis/plot_lr_sweep.py also
+# reports the best interventional corr any LR gives it.
+#
+# TASK LAYOUT  cells x regimes x 2 neurons x LRs, LR innermost (any block of 6
+# contiguous tasks is one LR curve), main cell first. Two regimes x 6 LRs = 72 tasks,
+# the header's -t; one regime is 36, and any size but 72 needs a copy with its own -t
+# (tcopy above).
+#   SWEEP_MODEL=qwen3_8b REGIME_LIST=kl0.1 DRY_RUN=1 bash <script>      task table
+#   SWEEP_MODEL=qwen3_8b REGIME_LIST=kl0.1 SGE_TASK_ID=7 bash <script>  one task here
 # Read with: python analysis/plot_lr_sweep.py --model <key>   (--model a,b,... compares)
 # ============================================================================
 
@@ -128,7 +149,18 @@ if [ -n "$LR_LIST" ]; then
 else
   LRS=(1e-5 2e-5 5e-5 1e-4 2e-4 5e-4)
 fi
-REGIMES=("kl0.1" "unanchored")
+if [ -n "$REGIME_LIST" ]; then
+  IFS=: read -r -a REGIMES <<< "$REGIME_LIST"
+elif [ -n "$CACHE_ONLY" ]; then
+  REGIMES=("kl0.1")                 # the cache does not depend on the regime
+else
+  echo "ERROR: set REGIME_LIST (colon-separated): kl0.1 unanchored sft_gateoff sft_gateon" >&2
+  exit 1
+fi
+for r in "${REGIMES[@]}"; do
+  case "$r" in kl0.1|unanchored|sft_gateoff|sft_gateon) ;;
+    *) echo "ERROR: unknown regime '$r' in REGIME_LIST" >&2; exit 1 ;; esac
+done
 TUNE_SAMPLES=(5 6)                  # indices into the cell's 10 cached neurons; grids use 0-4
 
 N_LR=${#LRS[@]}; N_REG=${#REGIMES[@]}; N_TUNE=${#TUNE_SAMPLES[@]}; N_CELL=${#CELLS[@]}
@@ -201,8 +233,6 @@ fi
 decode "$index"
 
 # ---- fixed: the 1B-tuned settings every grid used -----------------------------------
-GATE=off
-W=0.01
 SEED=21
 N_NEURONS_CACHE=10
 SCALE=10
@@ -210,11 +240,13 @@ LORA_R=16
 LORA_ALPHA=$((LORA_R * 2))
 LORA_DO=0.0
 
-if [ "$REGIME" = "unanchored" ]; then
-  KL_FLAG=""; KL_TAG="klnone"
-else
-  KL_FLAG="--kl-anchor-target ${REGIME#kl}"; KL_TAG="$REGIME"
-fi
+# ---- the regime: each is its grid arm (joint grid / endogenous grid) with LR swept ----
+case "$REGIME" in
+  kl0.1)       W=0.01; GATE=off; KL_FLAG="--kl-anchor-target 0.1"; KL_TAG="kl0.1" ;;
+  unanchored)  W=0.01; GATE=off; KL_FLAG="";                         KL_TAG="klnone" ;;
+  sft_gateoff) W=1.0;  GATE=off; KL_FLAG="";                         KL_TAG="klnone" ;;
+  sft_gateon)  W=1.0;  GATE=on;  KL_FLAG="";                         KL_TAG="klnone" ;;
+esac
 if [ "$GATE" = "on" ]; then GATE_FLAG="--disable-adapter-in-input"; else GATE_FLAG=""; fi
 
 # Leave empty. --overwrite-cache would retrain any finished task on resubmission, and
@@ -329,7 +361,7 @@ python train_introspector_joint.py \
     $KL_FLAG \
     $OVERWRITE
 
-# LM cost on one neuron per (cell, regime, LR): in the unanchored regime KL is free to
+# LM cost on one neuron per (cell, regime, LR): without the anchor KL is free to
 # move with LR, and how far it moves is part of the answer. Skips if already scored.
 if [ "$SAMPLE" -eq "${TUNE_SAMPLES[0]}" ]; then
   python score_lm_degradation.py --config "$CONFIG"

@@ -3,8 +3,11 @@
 Read an LR sweep and apply its decision rule: did the 1B learning rate transfer?
 
 Runs come from scripts/neuron/train_single_mlp_introspector_joint_lr_sweep.sh (group
-mlp_joint_lr_sweep_<model>): LR x {kl0.1, unanchored} x 3 cells x 2 tuning neurons that
-no grid trains. The 8B runs of the older ..._lr_sweep_llama318b.sh share its group/names.
+mlp_joint_lr_sweep_<model>): LR x regime x 3 cells x 2 tuning neurons that no grid
+trains. Regimes: the joint loss (kl0.1, unanchored) and the SFT baselines (sft_gateoff,
+sft_gateon; w=1). Joint arms are judged by interventional corr, SFT by endogenous corr,
+with the best interventional corr any LR gives SFT reported beside it. The 8B runs of the
+older ..._lr_sweep_llama318b.sh share its group/names.
 
 For each (cell, regime) it reports the corr at the grid's LR (5e-5), the best LR and its
 gain, and -- as the target -- Llama-3.2-1B at the nearest relative depth and the same
@@ -55,11 +58,30 @@ GRID_LR = 5e-5
 REF_MODEL = "Llama-3.2-1B"
 REF_DEPTH_TOL = 0.1            # nearest 1B depth must be this close to count as a reference
 REGIME_OF_TAG = {"kl0.1": "kl0.1", "klnone": "unanchored"}
-REF_ARM = {"kl0.1": "joint_kl0.1", "unanchored": "joint_free"}
+REGIMES = ("kl0.1", "unanchored", "sft_gateoff", "sft_gateon")   # plotting / table order
+REF_ARM = {"kl0.1": "joint_kl0.1", "unanchored": "joint_free",
+           "sft_gateoff": "sft_gateoff", "sft_gateon": "sft_gateon"}
+# what each regime's LR is chosen by: the joint arms by interventional corr (the criterion
+# that chose 5e-5 at 1B), the SFT baselines by what they are trained on
+CRITERION = {"kl0.1": "interventional", "unanchored": "interventional",
+             "sft_gateoff": "endogenous", "sft_gateon": "endogenous"}
 READOUTS = ("endogenous", "interventional")
-COLORS = {"kl0.1": "#1f77b4", "unanchored": "#d62728"}
-NAME_RE = re.compile(r"lrsweep_N(?P<layer>\d+)\.(?P<index>\d+)_POS(?P<pos>-?\d+)_.*?_"
-                     r"(?P<kl>kl[0-9.]+|klnone)_w[0-9.]+_lr(?P<lr>[0-9.eE+-]+)$")
+COLORS = {"kl0.1": "#1f77b4", "unanchored": "#d62728",
+          "sft_gateoff": "#2ca02c", "sft_gateon": "#9467bd"}
+NAME_RE = re.compile(r"lrsweep_N(?P<layer>\d+)\.(?P<index>\d+)_POS(?P<pos>-?\d+)_"
+                     r"gate(?P<gate>on|off)_.*?_(?P<kl>kl[0-9.]+|klnone)_w(?P<w>[0-9.]+)"
+                     r"_lr(?P<lr>[0-9.eE+-]+)$")
+
+
+def regime_of(m: re.Match) -> str:
+    """w=1 is the SFT baseline (endogenous loss only); anything else is a joint arm."""
+    if float(m["w"]) == 1.0:
+        return f"sft_gate{m['gate']}"
+    return REGIME_OF_TAG.get(m["kl"], m["kl"])
+
+
+def _regimes(df: pd.DataFrame):
+    return [r for r in REGIMES if r in set(df["regime"])]
 
 
 def group_of(key: str) -> str:
@@ -94,7 +116,7 @@ def load_runs(group: str) -> pd.DataFrame | None:
             continue
         it = interv.get("test", interv)
         row = {"run": d.name, "layer": int(m["layer"]), "index": int(m["index"]),
-               "position": int(m["pos"]), "regime": REGIME_OF_TAG.get(m["kl"], m["kl"]),
+               "position": int(m["pos"]), "regime": regime_of(m),
                "lr": float(m["lr"])}
         for metric in ("corr", "spearman"):
             row[f"interventional_{metric}"] = it.get(metric)
@@ -143,17 +165,29 @@ def ref_1b(df: pd.DataFrame, n_layers: int) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
-def decision_table(df: pd.DataFrame, ref: pd.DataFrame, readout="interventional") -> pd.DataFrame:
+def decision_table(df: pd.DataFrame, ref: pd.DataFrame) -> pd.DataFrame:
+    """One row per (cell, regime), the LR chosen by that regime's CRITERION readout."""
+    return pd.concat([_decision_table(df[df["regime"] == r], ref, CRITERION[r])
+                      for r in _regimes(df)], ignore_index=True)
+
+
+def _decision_table(df: pd.DataFrame, ref: pd.DataFrame, readout: str) -> pd.DataFrame:
     col = f"{readout}_corr"
     g = (df.groupby(["layer", "position", "regime", "lr"])[col]
            .agg(mean="mean", spread=lambda v: float(v.max() - v.min()), n="count")
            .reset_index())
+    interv = df.groupby(["layer", "position", "regime", "lr"])["interventional_corr"].mean()
+    # per tuning neuron x LR: the same neurons are trained at every LR, so the comparison
+    # with 5e-5 is PAIRED
+    per_neuron = df.pivot_table(index=["layer", "position", "regime", "index"], columns="lr",
+                                values=col)
     rows = []
     for (layer, pos, regime), q in g.groupby(["layer", "position", "regime"]):
         at_grid = q[np.isclose(q["lr"], GRID_LR)]
         best = q.loc[q["mean"].idxmax()]
         swept = sorted(q["lr"])
         r = {"cell": f"L{layer} pos{pos}", "position": pos, "regime": regime,
+             "criterion": readout,
              "corr_at_5e-5": float(at_grid["mean"].iloc[0]) if len(at_grid) else np.nan,
              "best_lr": best["lr"], "corr_at_best": best["mean"],
              "neuron_spread_at_best": best["spread"], "n_lrs": len(q),
@@ -166,6 +200,21 @@ def decision_table(df: pd.DataFrame, ref: pd.DataFrame, readout="interventional"
              "at_edge": bool(len(swept) > 1 and best["lr"] in (swept[0], swept[-1])
                              and not np.isclose(best["lr"], GRID_LR))}
         r["gain"] = r["corr_at_best"] - r["corr_at_5e-5"]
+        pn = per_neuron.loc[(layer, pos, regime)]
+        grid_col = [c for c in pn.columns if np.isclose(c, GRID_LR)]
+        paired = (pn[best["lr"]] - pn[grid_col[0]]).dropna() if grid_col else pd.Series(dtype=float)
+        # every tuning neuron must do better at the best LR than at 5e-5. Training is close
+        # to all-or-nothing here, so one neuron collapsing at 5e-5 can carry the mean gain
+        # alone -- that is the case this rejects
+        r["n_paired"] = len(paired)
+        r["min_neuron_gain"] = float(paired.min()) if len(paired) else np.nan
+        if readout != "interventional":
+            # what the comparison with the joint loss is about: the baseline's
+            # interventional corr at the LR its own criterion picks, and the most ANY
+            # swept LR gives it -- an upper bound, i.e. tuned for the joint loss's metric
+            iv = interv.loc[(layer, pos, regime)]
+            r["interv_at_best"] = float(iv.get(best["lr"], np.nan))
+            r["interv_max_over_lrs"] = float(iv.max())
         if not ref.empty:
             rr = ref[(ref["layer"] == layer) & (ref["position"] == pos)
                      & (ref["regime"] == regime) & (ref["readout"] == readout)]
@@ -198,7 +247,7 @@ def plot(df: pd.DataFrame, ref: pd.DataFrame, out_dir: Path, n_layers: int, name
             continue
         for c, (layer, pos) in enumerate(cells):
             ax = axes[r][c]
-            for regime in ("kl0.1", "unanchored"):
+            for regime in _regimes(df):
                 q = df[(df["layer"] == layer) & (df["position"] == pos) & (df["regime"] == regime)]
                 if q.empty:
                     continue
@@ -231,7 +280,7 @@ def plot(df: pd.DataFrame, ref: pd.DataFrame, out_dir: Path, n_layers: int, name
                                  squeeze=False, sharey=True)
         for c, (layer, pos) in enumerate(cells):
             ax = axes[0][c]
-            for regime in ("kl0.1", "unanchored"):
+            for regime in _regimes(df):
                 q = (df[(df["layer"] == layer) & (df["position"] == pos) & (df["regime"] == regime)]
                      .dropna(subset=["kl@32"]).sort_values("lr"))
                 if len(q):
@@ -248,28 +297,25 @@ def plot(df: pd.DataFrame, ref: pd.DataFrame, out_dir: Path, n_layers: int, name
         plt.close(fig)
 
 
-def plot_compare(runs: dict[str, pd.DataFrame], out_dir: Path, metric="corr",
-                 readout="interventional"):
+def plot_compare(runs: dict[str, pd.DataFrame], out_dir: Path, metric="corr"):
     """One panel per (regime, cell role), one LR curve per model, models ordered by size:
     does the optimal LR drift with scale, and does it drift the same way in both
-    families?"""
-    col = f"{readout}_{metric}"
+    families? Each regime is drawn on its own criterion readout."""
     keys = sorted(runs, key=lambda k: MODELS[k][2])
     cmap = plt.get_cmap("viridis")
-    regimes = ("kl0.1", "unanchored")
+    regimes = [r for r in REGIMES if any(r in set(d["regime"]) for d in runs.values())]
     fig, axes = plt.subplots(len(regimes), len(ROLE_ORDER), figsize=(5 * len(ROLE_ORDER), 8.2),
                              squeeze=False, sharex=True, sharey="row")
     for i, key in enumerate(keys):
         df = runs[key]
-        if col not in df.columns:
-            continue
         name, _, _ = MODELS[key]
         color = cmap(i / max(len(keys) - 1, 1))
         ls = "-" if name.startswith("Llama") else "--"
         for r, regime in enumerate(regimes):
+            col = f"{CRITERION[regime]}_{metric}"
             for c, pos in enumerate(ROLE_ORDER):
                 q = df[(df["position"] == pos) & (df["regime"] == regime)]
-                if q.empty:
+                if q.empty or col not in q.columns:
                     continue
                 m = q.groupby("lr")[col].mean().reset_index().sort_values("lr")
                 axes[r][c].plot(m["lr"], m[col], marker="o", ms=5, lw=1.8, ls=ls,
@@ -287,14 +333,14 @@ def plot_compare(runs: dict[str, pd.DataFrame], out_dir: Path, metric="corr",
             if r == len(regimes) - 1:
                 ax.set_xlabel("learning rate")
             if c == 0:
-                ax.set_ylabel(f"{regime}\n{readout} {metric}")
+                ax.set_ylabel(f"{regime}\n{CRITERION[regime]} {metric}")
     handles, labels = axes[0][0].get_legend_handles_labels()
     if handles:
         fig.legend(handles, labels, loc="lower center", ncol=len(labels), fontsize=9,
                    frameon=False)
     fig.suptitle("LR curves by model (circle = best LR; solid Llama, dashed Qwen)", fontsize=11)
     fig.tight_layout(rect=(0, 0.05, 1, 1))
-    fig.savefig(out_dir / f"lr_curves_by_model_{readout}_{metric}.png", dpi=150)
+    fig.savefig(out_dir / f"lr_curves_by_model_{metric}.png", dpi=150)
     plt.close(fig)
 
 
@@ -311,22 +357,30 @@ def _fmt(t: pd.DataFrame) -> pd.DataFrame:
 
 def report(t: pd.DataFrame):
     """Apply the decision rule fixed before the results and print the verdict."""
-    print("\n[lr] interventional corr -- decision table (fixed before the results):")
+    print("\n[lr] decision table (fixed before the results): joint arms by interventional "
+          "corr, SFT baselines by endogenous corr (column 'criterion'):")
     # LRs must not go through round(3): 5e-5 would print as 0.0
     print(_fmt(t.drop(columns="position")).to_string(index=False))
     # The noise guard needs BOTH tuning neurons on both sides of the comparison; with one,
     # neuron_spread is 0 by definition and any gain "exceeds" it. Rows short of that are
     # reported as provisional rather than counted either way.
-    judgeable = t[(t["n_at_best"] >= 2) & (t["n_at_5e-5"] >= 2)]
+    judgeable = t[t["n_paired"] >= 2]
     provisional = t.drop(judgeable.index)
     moved = judgeable[(~np.isclose(judgeable["best_lr"], GRID_LR))
-                      & (judgeable["gain"] > judgeable["neuron_spread_at_best"])]
+                      & (judgeable["min_neuron_gain"] > 0)]
     print(f"\n[lr] judgeable (both tuning neurons finished at the best LR and at "
           f"{GRID_LR:g}): {len(judgeable)} of {len(t)} (cell, regime) pairs")
+    mixed = judgeable[(~np.isclose(judgeable["best_lr"], GRID_LR))
+                      & (judgeable["min_neuron_gain"] <= 0)]
+    if len(mixed):
+        print(f"[lr] MIXED -- the mean prefers another LR but some tuning neuron does worse "
+              f"there than at {GRID_LR:g} (a collapse on one side, not a moved optimum):")
+        print(_fmt(mixed[["cell", "regime", "best_lr", "gain", "min_neuron_gain"]])
+              .to_string(index=False))
     if len(provisional):
         print(f"[lr] PROVISIONAL -- only one neuron behind the comparison, so the noise guard "
               f"cannot apply:")
-        print(_fmt(provisional[["cell", "regime", "best_lr", "gain", "n_at_best", "n_at_5e-5"]])
+        print(_fmt(provisional[["cell", "regime", "best_lr", "gain", "n_paired"]])
               .to_string(index=False))
     edge = t[t["at_edge"]]
     if len(edge):
@@ -335,9 +389,9 @@ def report(t: pd.DataFrame):
         print(_fmt(edge[["cell", "regime", "best_lr", "gain"]]).to_string(index=False))
     if len(judgeable):
         print(f"\n[lr] of the judgeable pairs, {len(moved)} have a best LR other than "
-              f"{GRID_LR:g} with a gain above the spread between the two tuning neurons")
+              f"{GRID_LR:g} that EVERY tuning neuron prefers (paired)")
         if len(moved):
-            print(_fmt(moved[["cell", "regime", "best_lr", "gain", "neuron_spread_at_best"]])
+            print(_fmt(moved[["cell", "regime", "best_lr", "gain", "min_neuron_gain"]])
                   .to_string(index=False))
             print("[lr] -> the 1B LR did not transfer cleanly here; re-run the grid at the "
                   "better LR before reading the scale trend")
@@ -345,6 +399,20 @@ def report(t: pd.DataFrame):
             print(f"[lr] -> no evidence the optimum moved; the grid at {GRID_LR:g} stands")
     else:
         print("[lr] -> nothing judgeable yet; wait for the second tuning neuron")
+    if t["regime"].nunique() > 1:
+        # the baseline question: does each arm want the same LR? If the SFT optimum sits
+        # where the joint loss's does, one re-run LR serves both arms of the comparison
+        print("\n[lr] best LR by regime, side by side (each on its own criterion):")
+        side = t.assign(best_lr=t["best_lr"].map(lambda v: f"{v:g}"))
+        print(side.pivot(index="cell", columns="regime", values="best_lr")
+              [[r for r in REGIMES if r in set(t["regime"])]].reset_index()
+              .to_string(index=False))
+    sft = t[t["criterion"] != "interventional"]
+    if len(sft) and "interv_max_over_lrs" in sft.columns:
+        print("\n[lr] SFT baselines -- interventional corr at their chosen LR, and the most "
+              "any swept LR gives them:")
+        print(_fmt(sft[["cell", "regime", "best_lr", "interv_at_best", "interv_max_over_lrs"]])
+              .to_string(index=False))
 
 
 def analyze(key: str, group: str | None = None):
@@ -400,14 +468,15 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     for metric in ("corr", "spearman"):
         plot_compare(runs, out_dir, metric)
+    order = {"position": {p: i for i, p in enumerate(ROLE_ORDER)},
+             "regime": {r: i for i, r in enumerate(REGIMES)}}
     s = (pd.concat(tables, ignore_index=True)
            .sort_values(["regime", "position", "params_b"],
-                        key=lambda c: c.map({p: i for i, p in enumerate(ROLE_ORDER)})
-                        if c.name == "position" else c))
+                        key=lambda c: c.map(order[c.name]) if c.name in order else c))
     s.to_csv(out_dir / "best_lr_by_model.csv", index=False)
-    cols = ["regime", "role", "model", "best_lr", "corr_at_5e-5", "corr_at_best", "gain",
-            "n_at_best", "at_edge"]
-    print(f"\n{'=' * 78}\n[lr] best LR by model (interventional corr), smallest model first\n"
+    cols = ["regime", "role", "model", "criterion", "best_lr", "corr_at_5e-5",
+            "corr_at_best", "gain", "n_at_best", "at_edge"]
+    print(f"\n{'=' * 78}\n[lr] best LR by model, smallest model first\n"
           f"{'=' * 78}")
     print(_fmt(s[cols]).to_string(index=False))
     print(f"\n[lr] wrote {out_dir}")
