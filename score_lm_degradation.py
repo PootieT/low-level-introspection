@@ -50,6 +50,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.introspector.config import ExperimentConfig
 from train_introspector import INTROSPECTION_SEPARATOR
 from src.introspector.training.model import load_added_token_embeddings
+from src.introspector.training.model import resize_embeddings_for_tokenizer
 
 # KL below this (nats/token) and top-1 agreement above the second value => the
 # adapter left ordinary language modelling essentially untouched. Calibration, not law.
@@ -77,21 +78,23 @@ def load_adapter_model(config: ExperimentConfig, ckpt, trim_vocab: bool = True):
     Returns (model, tokenizer) with the tokenizer matching the model's final vocab.
     """
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    orig_vocab = len(tokenizer)
-    added = tokenizer.add_special_tokens({"additional_special_tokens": [INTROSPECTION_SEPARATOR]})
+    tokenizer.add_special_tokens({"additional_special_tokens": [INTROSPECTION_SEPARATOR]})
     base = AutoModelForCausalLM.from_pretrained(
         config.model_name, device_map="auto",
         torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32)
-    if added:
-        base.resize_token_embeddings(len(tokenizer))
+    # The base model's OWN row count, not len(tokenizer): they are equal for Llama but
+    # Qwen pads its embedding past the tokenizer, so "trim back to len(tokenizer)" would
+    # cut real rows out of the base vocabulary. Trimming back to this is exact for both.
+    orig_rows = base.get_input_embeddings().weight.shape[0]
+    grown = resize_embeddings_for_tokenizer(base, tokenizer)   # 0 for Qwen, 1 for Llama
     model = PeftModel.from_pretrained(base, str(ckpt), autocast_adapter_dtype=False)
     # restores the separator row if the checkpoint's frozen embeddings were
     # stripped. Irrelevant once trim_vocab drops that row, but keeps this loader
     # correct for callers that do not trim.
     load_added_token_embeddings(model, str(ckpt))
-    if added and trim_vocab:
-        model.get_base_model().resize_token_embeddings(orig_vocab)
-        print(f"[load] trimmed vocab {len(tokenizer)} -> {orig_vocab} "
+    if grown and trim_vocab:
+        model.get_base_model().resize_token_embeddings(orig_rows)
+        print(f"[load] trimmed vocab {orig_rows + grown} -> {orig_rows} "
               f"(dropped the untrained separator row)")
         tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     model.eval()

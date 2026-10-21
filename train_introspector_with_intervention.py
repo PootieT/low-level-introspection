@@ -80,6 +80,7 @@ from train_introspector import (
     INTROSPECTION_SEPARATOR,
     evaluate_test_split
 )
+from src.introspector.training.model import resize_embeddings_for_tokenizer
 
 # ============================================================
 # Utilities
@@ -611,7 +612,7 @@ def main():
         torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32,
         device_map="auto",
     )
-    model.resize_token_embeddings(len(tokenizer))
+    resize_embeddings_for_tokenizer(model, tokenizer)
 
     peft_config = LoraConfig(
         r=config.training_config.lora_r,
@@ -622,7 +623,7 @@ def main():
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, peft_config)
-    model.resize_token_embeddings(len(tokenizer))
+    resize_embeddings_for_tokenizer(model, tokenizer)
 
     if config.use_regressor:
         model = IntrospectionRegressionModel(

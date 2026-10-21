@@ -89,6 +89,7 @@ from train_introspector_with_intervention import (
     evaluate_interventional_test,
     get_argmax_from_logits,
 )
+from src.introspector.training.model import resize_embeddings_for_tokenizer
 
 
 def parse_args():
@@ -1751,7 +1752,7 @@ def main():
         config.model_name, device_map="auto",
         torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32,
         **attention_model_kwargs(config.train_signals))
-    base.resize_token_embeddings(len(tokenizer))
+    resize_embeddings_for_tokenizer(base, tokenizer)
     diag_ckpt = None
     eval_only_flags = (args.diag_only or args.ood_only or args.length_only
                        or args.neuron_gen_only or args.interv_eval_only)
@@ -1783,7 +1784,7 @@ def main():
             target_modules=config.training_config.lora_target_modules,
             lora_dropout=config.training_config.lora_dropout, bias="none", task_type="CAUSAL_LM")
         model = get_peft_model(base, peft_config)
-    model.resize_token_embeddings(len(tokenizer))
+    resize_embeddings_for_tokenizer(model, tokenizer)
     model = IntrospectionRegressionModel(
         model, signal_ranges=signal_ranges,
         intervention_distribution=config.training_config.intervention_signal_distribution,

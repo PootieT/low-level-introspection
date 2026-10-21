@@ -4,6 +4,11 @@ from nnsight.modeling.language import LanguageModel
 from ..signals.schema import SignalSpec, MLPNeuronSpec, ResidualStreamSpec
 
 
+# Architectures whose decoder MLP is down_proj(act_fn(gate_proj(x)) * up_proj(x)) at
+# model.layers.<i>.mlp -- so the act_fn output is the same "neuron" in each.
+GATED_SILU_MLP_ARCHS = {"LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM"}
+
+
 def resolve_mlp_signal_path(
     model: LanguageModel,
     layer: int,
@@ -23,12 +28,18 @@ def resolve_mlp_signal_path(
     elif model.config is not None and hasattr(model.model, "model"): # peft model, running without nnsight (pytorch hook)
         prefix_path = "model."
 
-    if "LlamaForCausalLM" in model.config.architectures[0]:
-        # Llama MLP: output = down_proj (Swish(gate_proj(x)) * up_proj(x))
-        # we return the output of Swish(gate_proj(x)) as this is the "neuron activation"
-        path =  f"model.layers.{layer}.mlp.act_fn.output"
+    arch = model.config.architectures[0]
+    if arch in GATED_SILU_MLP_ARCHS:
+        # MLP: output = down_proj(act_fn(gate_proj(x)) * up_proj(x)). We return the output
+        # of act_fn(gate_proj(x)) as the "neuron activation". Verified identical in
+        # transformers 5.8.1 for LlamaMLP, Qwen2MLP and Qwen3MLP: same module names,
+        # same forward, so the same hook site means the same quantity.
+        path = f"model.layers.{layer}.mlp.act_fn.output"
     else:
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"No MLP signal path for architecture {arch!r}. If its MLP computes "
+            f"down_proj(act_fn(gate_proj(x)) * up_proj(x)) under model.layers.<i>.mlp, add "
+            f"it to GATED_SILU_MLP_ARCHS -- after checking, not by assumption.")
     if not path_to_output:
         path = path.removesuffix(".output")
     return f"{prefix_path}{path}"

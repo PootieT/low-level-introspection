@@ -56,6 +56,7 @@ from .training.model import (
     replace_model_with_gated_version,
     signal_range_key,
 )
+from .training.model import resize_embeddings_for_tokenizer
 
 
 @dataclass
@@ -285,7 +286,7 @@ def load_run_for_analysis(
     base = AutoModelForCausalLM.from_pretrained(
         config.model_name, device_map=device_map, local_files_only=local_files_only,
         torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32)
-    base.resize_token_embeddings(len(tokenizer))
+    resize_embeddings_for_tokenizer(base, tokenizer)
     peft_model = PeftModel.from_pretrained(base, str(checkpoint), autocast_adapter_dtype=False)
     model = IntrospectionRegressionModel(
         peft_model, signal_ranges=signal_ranges,

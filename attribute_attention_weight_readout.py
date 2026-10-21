@@ -98,6 +98,7 @@ from train_introspector import (
     INTROSPECTION_SEPARATOR, drop_invalid_positions, preprocess_example,
 )
 from train_introspector_joint import UngatedCollator
+from src.introspector.training.model import resize_embeddings_for_tokenizer
 
 
 def parse_args():
@@ -196,7 +197,7 @@ def load_everything(config: ExperimentConfig, checkpoint: Path, pin_template: in
         config.model_name, device_map="auto",
         dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32,
         **attention_model_kwargs(config.train_signals))
-    base.resize_token_embeddings(len(tokenizer))
+    resize_embeddings_for_tokenizer(base, tokenizer)
     peft_model = PeftModel.from_pretrained(base, str(checkpoint),
                                            autocast_adapter_dtype=False)
     model = IntrospectionRegressionModel(

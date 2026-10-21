@@ -192,6 +192,31 @@ class _PortHandle:
         setattr(self.module, self.attr, None)
 
 
+
+def resize_embeddings_for_tokenizer(model, tokenizer) -> int:
+    """Make the embeddings cover every tokenizer id -- by GROWING only. Returns rows added.
+
+    `model.resize_token_embeddings(len(tokenizer))` is only right when the embedding has
+    exactly one row per token, which is Llama's and Gemma's layout: there it grows by one
+    for the introspection separator. Qwen pads its embedding PAST its tokenizer
+    (Qwen2.5-0.5B: 151,936 rows for 151,665 tokens; 7B: 152,064), so the same call
+    SHRINKS it by hundreds of rows. Nothing would error: the separator lands on id
+    151,665, which survives the cut, and training proceeds. But the vocab-size change
+    makes PEFT save the full embedding matrices, the strip/restore chain assumes the new
+    rows are the last n, and score_lm_degradation's "trim back" would cut real rows.
+
+    Growing only, Qwen is not resized at all: the separator uses an existing padding
+    row, which is part of the base checkpoint and therefore identical on every load, and
+    PEFT sees an unchanged vocab and saves no embeddings. Llama/Gemma are unaffected --
+    they still grow by exactly the number of added tokens.
+    """
+    rows = model.get_input_embeddings().weight.shape[0]
+    need = len(tokenizer)
+    if need > rows:
+        model.resize_token_embeddings(need)
+        return need - rows
+    return 0
+
 class InterventionHook:
     # TODO extend to other types of signals
     def __init__(self, token_positions, signal_indices, intervention_values, row_indices=None):

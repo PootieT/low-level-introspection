@@ -53,6 +53,7 @@ from src.introspector.config import ExperimentConfig
 from src.introspector.prompts import PROMPT_REGISTRY
 from src.introspector.training.collator import LoRAGatingCollator
 from train_introspector import preprocess_example, INTROSPECTION_SEPARATOR
+from src.introspector.training.model import resize_embeddings_for_tokenizer
 
 
 def parse_args():
@@ -120,7 +121,7 @@ def main():
         config.model_name, device_map="auto", local_files_only=True,
         torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32,
     )
-    model.resize_token_embeddings(len(tokenizer))
+    resize_embeddings_for_tokenizer(model, tokenizer)
     model.eval()
 
     collator = LoRAGatingCollator(

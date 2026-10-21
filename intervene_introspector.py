@@ -36,6 +36,7 @@ from src.introspector.training.model import (
 )
 from src.introspector.utils import rsetattr
 from train_introspector import preprocess_example, INTROSPECTION_SEPARATOR
+from src.introspector.training.model import resize_embeddings_for_tokenizer
 
 
 def parse_args():
@@ -78,7 +79,7 @@ def main():
     num_added = tokenizer.add_special_tokens(special_tokens)
 
     model = AutoModelForCausalLM.from_pretrained(config.model_name,device_map="auto", local_files_only=True, torch_dtype=torch.bfloat16,) #
-    model.resize_token_embeddings(len(tokenizer))
+    resize_embeddings_for_tokenizer(model, tokenizer)
     device = model.device
     checkpoint_paths = glob.glob(str(Path(config.output_dir) / config.experiment_name / "checkpoint-*"))
     latest_checkpoint_path = max(checkpoint_paths, key=os.path.getctime)

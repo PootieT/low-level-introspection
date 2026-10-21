@@ -815,6 +815,14 @@ def _signal_site(specs) -> str:
     return " + ".join(_SIGNAL_SITES.get(k, k) for k in kinds) if kinds else "none"
 
 
+def _leading_bos(model) -> bool:
+    tok = getattr(model, "tokenizer", None)
+    if tok is None or tok.bos_token_id is None:
+        return False
+    ids = tok("x", add_special_tokens=True)["input_ids"]
+    return bool(ids) and ids[0] == tok.bos_token_id
+
+
 def write_dataset_metadata(config: ExperimentConfig, output_dir: Path, model,
                            row_counts: dict, realized: dict | None = None):
     """
@@ -841,7 +849,10 @@ def write_dataset_metadata(config: ExperimentConfig, output_dir: Path, model,
         "identity": dataset_identity(config),
         "tokenization": {
             "add_special_tokens": True,
-            "leading_bos": True,
+            # MEASURED, not assumed: Llama prepends a BOS, Qwen prepends nothing. The
+            # cache and training stay aligned either way (both tokenize the same way),
+            # but anything that treats position 0 as a sink token must not assume one.
+            "leading_bos": _leading_bos(model),
             "padding_side": "right",
             "truncation": True,
             "max_length_per_split": {

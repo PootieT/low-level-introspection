@@ -54,6 +54,7 @@ from src.introspector.training.model import (
 )
 from src.introspector.training.metrics import compute_metrics, get_numericals, compute_metrics_from_numericals
 from src.introspector.prompts import PROMPT_REGISTRY, build_prompt_kwargs
+from src.introspector.training.model import resize_embeddings_for_tokenizer
 
 INTROSPECTION_SEPARATOR = "<|introspection|>"
 
@@ -353,7 +354,7 @@ def main():
         torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32,
         device_map="auto",
     )
-    model.resize_token_embeddings(len(tokenizer))
+    resize_embeddings_for_tokenizer(model, tokenizer)
 
     # wrap model in lora config
     peft_config = LoraConfig(
@@ -365,7 +366,7 @@ def main():
         task_type="CAUSAL_LM"
     )
     model = get_peft_model(model, peft_config)
-    model.resize_token_embeddings(len(tokenizer)) # https://discuss.huggingface.co/t/resize-embeddings-on-peft-model/136761/3
+    resize_embeddings_for_tokenizer(model, tokenizer) # https://discuss.huggingface.co/t/resize-embeddings-on-peft-model/136761/3
 
     if config.training_config.disable_adapter_in_input:
         # monkey patch forward to take in mask

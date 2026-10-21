@@ -537,6 +537,15 @@ class installed_ports:
         self._modules = []
 
     def __enter__(self):
+        # NO PORTS -> TOUCH NOTHING. cache_signals enters this manager for every batch of
+        # every signal type, with an empty dict whenever no attention signal is being
+        # cached -- and attention_model_kwargs deliberately loads such models with plain
+        # sdpa. Asserting the attention implementation regardless therefore failed every
+        # MLP and SAE cache build on the first batch. It went unnoticed because the sweeps
+        # since this manager landed all reused caches built before it. Attention runs
+        # always pass ports, so they still get the assert below.
+        if not self.ports:
+            return self.ports
         ensure_dispatched(self.model)
         assert_attention_impl(self.model)
         for layer, port in self.ports.items():
