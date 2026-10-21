@@ -112,6 +112,14 @@ MODELS = {
     "llama318b": dict(layers=[4, 12, 20, 28],
                       positions=[-1, -8, -20, -28],
                       pool=14336, n_layers=32),
+    # re-runs at the LR the per-model sweep chose (1e-4). 3B moves to the depths the 1B
+    # and 8B grids share (round(depth x 28) at 1/8, 3/8, 5/8, 7/8); 8B keeps its layers
+    "llama323b_hyper_tuned": dict(layers=[4, 11, 18, 25],
+                                  positions=[-1, -8, -20, -28],
+                                  pool=8192, n_layers=28),
+    "llama318b_hyper_tuned": dict(layers=[4, 12, 20, 28],
+                                  positions=[-1, -8, -20, -28],
+                                  pool=14336, n_layers=32),
 }
 DEFAULT_MODEL = "llama321b"
 N_TRAINED = 5
@@ -127,9 +135,10 @@ def model_for_group(group: str) -> str:
     """Which model a run group belongs to, from its name suffix.
 
     Group names carry the model (mlp_endo_sweep_layer_token_llama318b); anything with no
-    suffix is the original 1B sweep.
+    suffix is the original 1B sweep. Longest key first, so ..._llama323b_hyper_tuned is
+    not read as llama323b (whose grid has different layers).
     """
-    for key in MODELS:
+    for key in sorted(MODELS, key=len, reverse=True):
         if group.endswith(key):
             return key
     return DEFAULT_MODEL
@@ -633,7 +642,8 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-suffix", default="",
-                    help="e.g. _llama318b or _llama323b; appended to every group name")
+                    help="e.g. _llama318b, _llama323b or _llama323b_hyper_tuned; appended "
+                         "to every group name")
     ap.add_argument("--out-dir", default=None)
     a = ap.parse_args()
     if a.model_suffix:
