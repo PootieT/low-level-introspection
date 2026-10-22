@@ -4,7 +4,7 @@
   <a href="">
     <img src="https://img.shields.io/badge/arXiv-b31b1b.svg?style=flat&logo=arxiv&logoColor=white" alt="arXiv"/>
   </a>
-  <a href="https://github.com/PootieT/low-level-introspection/blob/main/LICENSE">
+  <a href="https://github.com/PootieT/low-level-introspection/blob/main/LICENCE">
     <img src="https://img.shields.io/github/license/PootieT/low-level-introspection" alt="License"/>
   </a>
 </p>
@@ -42,8 +42,8 @@ Currently we have the following types of signals written for training:
 - MLP neuron (after non-linearity, post gate projection, before multiplication with up projection)
 - Attention logit (pre-softmax `q.k/sqrt(d_head)`, after RoPE) at one
   `(layer, head, destination token, source token)` cell -- named `A<layer>.<head>@<src_offset>`
-- Attention weight (post-softmax, code `P`): spec/parse/identity plumbing is in place,
-  extraction reads the same port one step later (not wired yet)
+- Attention weight (post-softmax `p = softmax(z + mask)`) at the same kind of cell -- named
+  `P<layer>.<head>@<src_offset>`
 - SAE feature
 
 Other interesting signals one could think about extending:
@@ -64,7 +64,7 @@ Run everything from the repo root, as `python <folder>/<script>.py`.
 | `src/introspector/`     | shared library: configs, signal extraction, models, training utilities                                                                      |
 | `scripts/`              | shell drivers for every experiment (index in `scripts/README.md`)                                                                           |
 | `tests/`                | unit and smoke tests (`python -m pytest tests/`), plus model-backed sanity checks (`tests/validate_*.py`, `tests/probe_cache_alignment.py`) |
-| `utils/`                | housekeeping: checkpoint cleanup, relocating runs                                                                                           |
+| `utils/`                | housekeeping: checkpoint cleanup, `migrate_old_paths.py` for branches from before the reorganization (see `MIGRATION.md`)                 |
 | `outputs/plots/`        | default plotting outputs / aggregated analysis across runs                                                                                  |
 | `outputs/runs/`         | individual training run caching directories                                                                                                 |
 
@@ -77,6 +77,29 @@ Run everything from the repo root, as `python <folder>/<script>.py`.
 
 ## Example Experiments
 Checkout `.sh` files in `scripts/`; `scripts/README.md` lists what each one runs.
+
+Here are the list of scripts corresponding to each paper section:
+
+| Section | Training | Plotting |
+|---|---|---|
+| Section 3 (Main Grid SFT; Neuron) | `scripts/neuron/train_single_mlp_introspector_endogenous_sweep_layer_token.sh` | `plotters/compare_sft_vs_joint.py` (`heatmap_sft_*`) |
+| Section 3 (Main Grid SFT; Attention) | `scripts/attention_weight/paper/1-1_grid_endogenous_logistic_norm_dev.sh`, then `2-1-0_reeval_1-1_empirical_prob.sh` for the interventional score | `plotters/plot_paper_sft_panel_c.py` |
+| Section 3 (Main Grid SFT; SAE) | `scripts/sae/submit_sae_sweep.sh` (the `W=1.0` arm) | `plotters/plot_sae_sweep.py` |
+| Section 4 (Main Grid Joint Loss; Neuron) | `scripts/neuron/train_single_mlp_introspector_joint_sweep_layer_token.sh` | `plotters/compare_sft_vs_joint.py` (`delta_*_vs_sft`) |
+| Section 4 (Main Grid Joint Loss; Attention) | `scripts/attention_weight/paper/2-2_grid_endogenous_logistic_norm_dev_prob_uniform.sh` (`W=0.3`) | `plotters/plot_paper_joint_loss_panel_c.py` |
+| Section 4 (Main Grid Joint Loss; SAE) | `scripts/sae/submit_sae_sweep.sh` (the `W=0.9` arm) | `plotters/plot_sae_sweep.py` (`delta_*_w0.9_vs_w1`) |
+| Choosing the joint-loss weight `W` | `scripts/neuron/train_single_mlp_introspector_joint_weight_sweep.sh` | `plotters/plot_weight_sweep.py` |
+| Section 5.1 (Neuron length generalization) | `scripts/neuron/train_single_mlp_introspector_length_generalization.sh` (joint) + `..._length_generalization_sft.sh` (SFT) | `plotters/plot_length_generalization.py --compare mlp_lengen:Joint mlp_lengen_sft:SFT` |
+| Section 5.2 (Neuron layer generalization) | `scripts/neuron/train_single_mlp_introspector_layer_generalization.sh` | `plotters/plot_layer_generalization.py` |
+| Section 5.3 (Neuron index generalization) | `scripts/neuron/train_single_mlp_introspector_neuron_generalization.sh` | `plotters/plot_neuron_generalization.py` |
+| Mechanism: do the two evals use the same heads? | `scripts/neuron/score_head_knockout_joint_grid.sh` (on the Section 4 checkpoints; no training) | `plotters/plot_head_knockout.py`, `plotters/plot_knockout_head_gating.py` |
+| Untrained prompted baseline | `scripts/neuron/score_prompt_baseline_layer_token.sh`, `scripts/sae/score_sae_prompt_baseline.sh` (no training) | `plotters/plot_prompt_baseline.py`, `plotters/plot_sae_prompt_baseline.py` |
+| Model scale (Llama-3.2-3B / 3.1-8B, Qwen3) | `scripts/neuron/train_single_mlp_introspector_joint_lr_sweep.sh`, then `..._joint_sweep_layer_token_<model>_hyper_tuned.sh` | `plotters/plot_lr_sweep.py`, `plotters/compare_model_scaling.py` |
+| Appendix L (SAE feature generalization) | `scripts/sae/build_featgen_pool_layer9.sh` -> `cache_sae_feature_generalization.sh` -> `train_sae_feature_generalization.sh` | `plotters/plot_sae_feature_generalization.py` |
+
+Run plotters from the repo root once the runs are synced. Most read `outputs/runs/` and
+write to `outputs/plots/`; the two `plot_paper_*` panels write to `paper_plots/`.
+
 
 ## Future Directions
 - Change off-line training to online, refresh signal caches throughout training.

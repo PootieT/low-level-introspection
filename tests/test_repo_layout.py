@@ -244,8 +244,12 @@ SELF_CONTAINED = ("media",)
 
 
 def test_documented_commands_point_at_real_files():
+    from utils.migrate_old_paths import KEEPS_OLD_PATHS   # they quote the old layout
+
     bad = []
     for f, i, target, is_module in documented_commands():
+        if f.relative_to(REPO_ROOT).as_posix() in KEEPS_OLD_PATHS:
+            continue
         base = (f.parent if f.relative_to(REPO_ROOT).parts[0] in SELF_CONTAINED
                 else REPO_ROOT)
         ok = (_resolve(base, target) is not None if is_module
@@ -254,3 +258,24 @@ def test_documented_commands_point_at_real_files():
             bad.append(f"{f.relative_to(REPO_ROOT)}:{i}: python {'-m ' if is_module else ''}"
                        f"{target}")
     assert not bad, f"{len(bad)} command(s) name a missing file:\n" + "\n".join(bad)
+
+
+# `folder/path.sh` or `folder/path.py` in backticks, as the README tables cite scripts.
+# Placeholders (`<model>`, `*`, `...`, `{a,b}`) are patterns, not paths, and are skipped.
+MD_PATH_RE = re.compile(r"`((?:scripts|plotters|trainers|data_prep|evals|mechanistic_analysis"
+                        r"|tests|utils|src)/[^`\s]+?\.(?:py|sh))")
+
+
+def test_markdown_paths_exist():
+    from utils.migrate_old_paths import KEEPS_OLD_PATHS
+
+    bad = []
+    for f in _listed("*.md"):
+        if f.relative_to(REPO_ROOT).as_posix() in KEEPS_OLD_PATHS:
+            continue
+        for i, line in enumerate(f.read_text().splitlines(), 1):
+            for m in MD_PATH_RE.finditer(line):
+                path = m.group(1)
+                if not re.search(r"[<>*{}]|\.\.\.", path) and not (REPO_ROOT / path).is_file():
+                    bad.append(f"{f.relative_to(REPO_ROOT)}:{i}: {path}")
+    assert not bad, f"{len(bad)} path(s) in Markdown name a missing file:\n" + "\n".join(bad)

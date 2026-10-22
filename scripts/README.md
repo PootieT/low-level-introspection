@@ -1,6 +1,13 @@
 # scripts/
 
-This directory contains shell scripts that kick of experiments (mostly in the BU SLURM-based cluster).
+This directory contains the shell scripts that launch every experiment. Most run on BU's SCC,
+an SGE cluster: `#$` headers, submit with `qsub`, array size in the `#$ -t` line. The SAE
+scripts with `#SBATCH` headers run on a SLURM cluster: submit with `sbatch`, array size in
+`--array`. All of them `cd` to (or are submitted from) the repo root and call
+`python <folder>/<script>.py`.
+
+Several scripts note their full array in a `# full run -t ...` comment, while the live
+`#$ -t` line covers only the tasks being re-run. Check that line before submitting.
 
 ## Conventions for scripts in this directory
 
@@ -27,32 +34,84 @@ This directory contains shell scripts that kick of experiments (mostly in the BU
 
 ## Contents
 
-| script | what it sweeps                                                                                                                                                                                                                  |
-|---|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `neuron/train_single_mlp_introspector_regressor_joint_loss_prev_token_hyper.sh` | learning rate (6 arms) for joint training on one neuron at random positions in [-31,-1]; `GATE` switches the gated control arm; this is mostly a playground script to test out new features, and manual hyper-parameter tunning |
-| `neuron/train_single_mlp_introspector_endogenous_sweep_layer_token.sh` | endogenous only (`W=1.0`): 8 layers x 8 positions x 5 neurons x {gate on, gate off}; the SFT baseline the joint grid is compared against |
-| `neuron/train_single_mlp_introspector_joint_weight_sweep.sh` | joint-loss weight `W` at 3 (layer, position, KL-budget) cells x 5 neurons = 90 runs; fixes `W` for the main grid and gives the endogenous-vs-interventional pareto with error bars |
-| `neuron/train_single_mlp_introspector_joint_sweep_layer_token.sh` | MAIN GRID: 8 layers x 8 positions x 5 neurons in two cost regimes (KL budget 0.1, and unanchored for the ceiling + measured cost) = 640 runs |
-| `neuron/score_prompt_baseline_layer_token.sh` | PROMPTED BASELINE over the main grid (320 runs, 64 tasks, no training): the untrained model asked with the grid's prompts, ridge probes on its final hidden state pooled over k=0..16 greedily generated tokens; endo + joint probes, verbal readout, no-prompt control, OOD. `MODE=lc` is the probe learning-curve pilot. Aggregate with `plotters/plot_prompt_baseline.py` |
-| `sae/precompute_sae_feature_stats.sh` | per-layer SAE feature density stats (one task per layer, skips existing); the sweep's feature picker needs these to avoid dead/punctuation features |
-| `sae/train_single_sae_introspector_sweep_layer_position.sh` | SAE DETECTION grid: 8 layers x 8 positions x 5 features x {gate on, gate off} = 128 cells; the SAE analogue of the endogenous neuron sweep |
-| `sae/train_sae_intervention_pilot.sh` | interventional SAE detection training on 3 features x 3 positions: does steering on/off during training break the bypass before the full grid is worth running |
-| `sae/build_featgen_pool_layer9.sh` | the 200-feature layer-9 POOL for feature generalization: density band + >=50 positives at the 32-token readout, Neuronpedia labels, near-duplicate labels removed, judged features first |
-| `sae/cache_sae_feature_generalization.sh` + `sae/train_sae_feature_generalization.sh` (table in `sae/featgen_common.sh`) | SAE FEATURE GENERALIZATION: N in {1,3,10,30,100} layer-9 features at 300k total rows, label-prompt arm (tasks 1-5) then index-prompt control (6-10), plus the label arm at 100k rows per feature for N=10/30/100 (11-13); scored on all 200 pool features (seen / held out) + a steer x ask distractor matrix. Aggregate with `plotters/plot_sae_feature_generalization.py`; see `sae/README.md` section 8 |
-| `sae/score_sae_prompt_baseline.sh` | SAE PROMPTED BASELINE: the untrained gemma-2-2b over the grid's 48 (feature, position) runs + the 5 layer-9 runs, index and label prompts (`PROMPT=`); verbal@k (paraphrase-matched words), logit, probe@k with val-chosen thresholds, no-prompt control, learning curve, steering-scale sweep. `STAGE=cache` builds the 17 caches first. Aggregate with `plotters/plot_sae_prompt_baseline.py`; see `sae/README.md` section 9 |
-| `attention/train_single_attn_logit_introspector_endogenous_sweep_layer_srctoken.sh` | ATTENTION LOGIT grid: 8 layers x 10 source offsets x 8 heads x {gate on, off} = 1280 runs, destination pinned to the last token. `HEAD_SELECT=random` (default) samples 8 heads per layer; `HEAD_SELECT=fixed` pins (0 4 8 12 16 20 24 28) -- the same file is both experiments |
-| `attention/pilot/pilot_attn_logit_one_cell.sh` | **run this first.** One cell of the above at 3K samples / 2 heads, with a printed PASS/FAIL verdict on cache alignment, the injection-scale saturation table, and a wall-time extrapolation for sizing `h_rt` |
-| `attention_weight/1_scan.sh` | **run this first for `P`.** Measures the post-softmax weight over the WHOLE 16 layer x 32 head x 10 offset grid (one forward per batch) and recommends three cells -- low / mid / upper layer -- to train on. Writes nothing to `data/` |
-| `attention_weight/pilot/pilot_attn_weight_one_cell.sh` | the `P` pilot: one picked cell end to end, with verdicts on alignment, cached-target range, row-sum preservation, injection domain and saturation, plus `tests/validate_attention_weights.py` |
-| `attention_weight/2_train_attn_weight_endogenous_picked_cells.sh` | ATTENTION WEIGHT, endogenous: 3 picked cells x 3 arms (gate off + KL 0.1, gate off unanchored, gate on) x 5 heads. `-t 1-3` |
-| `attention_weight/3_train_attn_weight_joint_weight_sweep.sh` | joint-loss weight `W` at the 3 picked cells x 6 weights x 5 heads = 90 runs; the `P` analogue of the neuron weight sweep, and what fixes `W` for stage 4. `-t 1-18` |
-| `attention_weight/4_train_attn_weight_interventional_picked_cells.sh` | interventional training at the chosen `W`, 3 cells x {KL 0.1, unanchored}. `-t 1-6` |
-| `attention_weight/L7H4M1/{1,2,4}_*.sh` | L7 h4 @-1 only, W in {0, .01, .03, .1, .3}, one head, Stage 3 settings otherwise. 1 = sigmoid head, 2 = training injection U(0,1) in probability space (`prob_uniform`), 4 = 1 + 2 + empirical eval. Shared body in `_common.sh`. `-t 1-5`; `SMOKE=1` for a 2000-row check |
-| `attention_weight/L7H4M1/3_empirical_logit_eval.sh` | no training: re-evaluates Stage 3's L7 h4 checkpoints with injection drawn from the cell's own log-odds histogram (`empirical_logit`). One job |
-| `attention_weight/7-0_cache_dst_src_grid_300K.sh` | builds the nine per-DESTINATION 300K/30K caches for 7-1 (3 pinned heads x every reachable source offset each) by running 7-1 with `CACHE_ONLY=1`. `-t 1-9` |
-| `attention_weight/7-1_train_dst_src_grid_endogenous_300K.sh` | (destination, source) PAIR GRID, endogenous, gate off unanchored: every `src <= dst` pair over absolute offsets {0 -1 -3 -7 -11 -15 -19 -23 -27 -31} (0 = last token, -31 = BOS) minus the constant (-31,-31) = 54 pairs x 3 pinned heads (L2 h20, L7 h9, L11 h25). Absolute dst `D` is token selector `D-1`, src `S` is `@(S-D)`. Holds on 7-0. `-t 1-54`; plot with `plotters/plot_attention_dst_src_grid.py` |
+Which of these produce which paper figure: see "Example Experiments" in the top-level
+`README.md`.
 
-Others are migrated as the experiment list for the paper firms up.
+### `neuron/` -- MLP neurons, Llama-3.2-1B unless named
+
+| script | what it runs |
+|---|---|
+| `train_single_mlp_introspector_endogenous_sweep_layer_token.sh` | endogenous only (`W=1.0`): 8 layers x 8 positions x 5 neurons x {gate on, gate off}; the SFT baseline the joint grid is compared against. `-t 1-128` |
+| `train_single_mlp_introspector_joint_sweep_layer_token.sh` | MAIN GRID: 8 layers x 8 positions x 5 neurons in two cost regimes (KL budget 0.1, and unanchored for the ceiling + measured cost) = 640 runs |
+| `train_single_mlp_introspector_joint_weight_sweep.sh` | joint-loss weight `W` at 3 (layer, position, KL-budget) cells x 6 weights x 5 neurons = 90 runs; fixes `W` for the main grid and gives the endogenous-vs-interventional pareto with error bars. Plot with `plotters/plot_weight_sweep.py` |
+| `train_single_mlp_introspector_{endogenous,joint}_sweep_layer_token_{llama323b,llama318b}.sh` | the SFT baseline and the main grid on Llama-3.2-3B / Llama-3.1-8B: 4 layers x 4 positions x 5 neurons, at the 1B hyperparameters. `-t 1-32` |
+| `train_single_mlp_introspector_joint_lr_sweep.sh` (+ `train_single_mlp_introspector_joint_lr_sweep_cache.sh`) | LR sweep for any model (`SWEEP_MODEL=`): did the 1B learning rate transfer? The `_cache` script builds its 3 caches first; `train_single_mlp_introspector_joint_lr_sweep_llama318b.sh` is the original 8B-only sweep. Read with `plotters/plot_lr_sweep.py --model <key>` |
+| `train_single_mlp_introspector_joint_sweep_layer_token_<model>_hyper_tuned.sh` | the main grid at the LR the sweep picked, KL 0.1 only, 4 layers x 4 positions x 5 neurons = 80 runs, for `llama323b`, `llama318b`, `qwen3_06b`, `qwen3_17b`, `qwen3_4b`. Compare with `plotters/compare_sft_vs_joint.py --model-suffix _<model>_hyper_tuned`; scaling across models in `plotters/compare_model_scaling.py` |
+| `train_single_mlp_introspector_length_generalization.sh` (+ `train_single_mlp_introspector_length_generalization_sft.sh`) | LENGTH GENERALIZATION: train on a narrow window at the end of the text, test how far back the readout reaches. 10 cells x 5 neurons, joint `W=0.01`; the `_sft` script is the `W=1.0` arm on identical data. Plot with `plotters/plot_length_generalization.py --compare mlp_lengen:Joint mlp_lengen_sft:SFT` |
+| `train_single_mlp_introspector_layer_generalization.sh` | LAYER GENERALIZATION: one neuron index (picked by `data_prep/select_layer_gen_index.py`) trained on even layers 0-14, tested on odd layers 1-13. Groups via `GROUP=`. Plot with `plotters/plot_layer_generalization.py` |
+| `train_single_mlp_introspector_neuron_generalization.sh` | NEURON (index) GENERALIZATION: does the readout carry neurons it never trained on, and what do extra neurons cost the trained ones? One table row per run, grouped (scaling, single, epochs, ...); add a row and bump `#$ -t`. Plot with `plotters/plot_neuron_generalization.py` |
+| `score_prompt_baseline_layer_token.sh` | PROMPTED BASELINE over the main grid (320 runs, 64 tasks, no training): the untrained model asked with the grid's prompts, ridge probes on its final hidden state pooled over k=0..16 greedily generated tokens; endo + joint probes, verbal readout, no-prompt control, OOD. `MODE=lc` is the probe learning-curve pilot. Aggregate with `plotters/plot_prompt_baseline.py` |
+| `score_head_knockout_joint_grid.sh` | single-head knockout over the main grid's KL 0.1 arm (320 runs, 64 tasks): which heads each evaluation needs. Plot with `plotters/plot_head_knockout.py` and `plotters/plot_knockout_head_gating.py` |
+| `run_circuit_localization.sh` | one GPU job holding the other circuit analyses on the main grid (LoRA weight norms, direct attribution, injection specificity, gradient attribution, mover heads, head ablation, head taxonomy); uncomment the step to run |
+| `train_single_mlp_introspector_regressor_joint_loss_prev_token_hyper.sh` | learning rate (6 arms) for joint training on one neuron at random positions in [-31,-1]; `GATE` switches the gated control arm. Mostly a playground for testing new features and manual hyperparameter tuning |
+
+### `sae/` -- SAE features, gemma-2-2b (details in `sae/README.md`)
+
+| script | what it runs |
+|---|---|
+| `precompute_sae_feature_stats.sh` | per-layer SAE feature density stats (one task per layer, skips existing); the sweep's feature picker needs these to avoid dead/punctuation features. SLURM |
+| `annotate_sae_features_neuronpedia.sh` | attaches Neuronpedia labels to those stats parquets (layers 0 5 10 15 20). Plain bash |
+| `generate_sae_steering_samples.sh` | blinded steered-vs-unsteered text samples for judging which features steer cleanly (the layer-9 selection). SLURM |
+| `submit_sae_sweep.sh` -> `cache_sae_sweep.sh` + `train_sae_sweep.sh` (grid in `sweep_common.sh`, features in `sweep_features.txt`) | SAE LAYER x POSITION GRID: 4 layers x 4 positions x 3 features x `W` in {1.0, 0.9}, gate off, one cache per cell then 96 training tasks. Plot with `plotters/plot_sae_sweep.py`. SLURM |
+| `train_sae_joint_layer9.sh` | the layer-9 reference: 5 judged features at the last token, joint gate-off training at `W` (default 0.5). Plot with `plotters/plot_sae_joint_results.py`, `plot_sae_balanced_accuracy.py`, `plot_sae_confusion.py`. SLURM |
+| `train_single_sae_introspector_sweep_layer_position.sh` | SAE DETECTION grid on SCC: 8 layers x 8 positions x {gate on, gate off} = 128 cells, the features trained inside each cell; the SAE analogue of the endogenous neuron sweep |
+| `train_sae_intervention_pilot.sh` | interventional SAE detection training on 3 features x 3 positions: does steering on/off during training break the bypass before the full grid is worth running |
+| `build_featgen_pool_layer9.sh` | the 200-feature layer-9 POOL for feature generalization: density band + >=50 positives at the 32-token readout, Neuronpedia labels, near-duplicate labels removed, judged features first |
+| `cache_sae_feature_generalization.sh` + `train_sae_feature_generalization.sh` (table in `featgen_common.sh`) | SAE FEATURE GENERALIZATION: N in {1,3,10,30,100} layer-9 features at 300k total rows, label-prompt arm (tasks 1-5) then index-prompt control (6-10), plus the label arm at 100k rows per feature for N=10/30/100 (11-13); scored on all 200 pool features (seen / held out) + a steer x ask distractor matrix. Aggregate with `plotters/plot_sae_feature_generalization.py`; see `sae/README.md` section 8 |
+| `score_sae_prompt_baseline.sh` | SAE PROMPTED BASELINE: the untrained gemma-2-2b over the grid's 48 (feature, position) runs + the 5 layer-9 runs, index and label prompts (`PROMPT=`); verbal@k (paraphrase-matched words), logit, probe@k with val-chosen thresholds, no-prompt control, learning curve, steering-scale sweep. `STAGE=cache` builds the 17 caches first. Aggregate with `plotters/plot_sae_prompt_baseline.py`; see `sae/README.md` section 9 |
+
+### `attention/` -- pre-softmax attention logits (`A`)
+
+| script | what it runs |
+|---|---|
+| `pilot/pilot_attn_logit_one_cell.sh` | **run this first.** One cell of the grid at 3K samples / 2 heads, with a printed PASS/FAIL verdict on cache alignment, the injection-scale saturation table, and a wall-time extrapolation for sizing `h_rt` |
+| `1-1_..._sweep_layer_srctoken.sh` + `1-2_..._sweep_layer_srctoken.sh` | ATTENTION LOGIT grid: 8 layers x 10 source offsets x 8 heads x {gate on, off} = 1280 runs, destination pinned to the last token. One script split in two array ranges (`-t 1-80`, `-t 81-160`). `HEAD_SELECT=random` (default) samples 8 heads per layer; `HEAD_SELECT=fixed` pins (0 4 8 12 16 20 24 28) -- the same file is both experiments |
+| `analysis/1_attn_logit_analysis.sh` | plots the grid with `plotters/plot_attention_srctoken_sweep.py` |
+
+### `attention_weight/` -- post-softmax attention weights (`P`), in stages
+
+| script | what it runs |
+|---|---|
+| `1_scan.sh` | **run this first for `P`.** Measures the post-softmax weight over the WHOLE 16 layer x 32 head x 10 offset grid (one forward per batch) and lists the cells worth training on. Writes nothing to `data/` |
+| `pilot/pilot_attn_weight_one_cell.sh` | the `P` pilot: one picked cell end to end, with verdicts on alignment, cached-target range, row-sum preservation, injection domain and saturation, plus `tests/validate_attention_weights.py` |
+| `2_train_attn_weight_endogenous_picked_cells.sh` | STAGE 2, endogenous: 6 hand-picked cells ({lower, mid, upper layer} x {source near, far}) x 3 arms (gate off + KL 0.1, gate off unanchored, gate on) x 3 heads. `-t 1-6` |
+| `2-0_cache_attn_weight_300K.sh` -> `2-1_..._300K.sh` | Stage 2 at 300K train / 30K test: 2-0 builds the six cell caches that 2-1, 3-1 and 4-1 share; 2-1 trains one arm per task. `-t 1-6`, then `-t 1-18` |
+| `3_train_attn_weight_joint_weight_sweep.sh` | STAGE 3: joint-loss weight `W` at the 6 cells x 6 weights x 3 heads = 108 runs; the `P` analogue of the neuron weight sweep, and what fixes `W` for stage 4. `-t 1-36` |
+| `3-1_..._300K.sh` / `3-2_..._unanchored_300K.sh` | Stage 3 at 300K on 2-0's caches, KL 0.1 and unanchored. Full run `-t 1-36` |
+| `4_train_attn_weight_interventional_picked_cells.sh` (+ `4-1_..._300K.sh`) | STAGE 4: interventional training at the chosen `W`, 6 cells x {KL 0.1, unanchored} = 12 tasks x 3 heads. `-t 1-12` |
+| `L7H4M1/{1,2,4}_*.sh` | L7 h4 @-1 only, W in {0, .01, .03, .1, .3}, one head, Stage 3 settings otherwise. 1 = sigmoid head, 2 = training injection U(0,1) in probability space (`prob_uniform`), 4 = 1 + 2 + empirical eval. Shared body in `_common.sh`. `-t 1-5`; `SMOKE=1` for a 2000-row check |
+| `L7H4M1/3_empirical_logit_eval.sh` | no training: re-evaluates Stage 3's L7 h4 checkpoints with injection drawn from the cell's own log-odds histogram (`empirical_logit`). One job |
+| `7-0_cache_dst_src_grid_300K.sh` | builds the nine per-DESTINATION 300K/30K caches for 7-1 (3 pinned heads x every reachable source offset each) by running 7-1 with `CACHE_ONLY=1`. `-t 1-9` |
+| `7-1_train_dst_src_grid_endogenous_300K.sh` | (destination, source) PAIR GRID, endogenous, gate off unanchored: every `src <= dst` pair over absolute offsets {0 -1 -3 -7 -11 -15 -19 -23 -27 -31} (0 = last token, -31 = BOS) minus the constant (-31,-31) = 54 pairs x 3 pinned heads (L2 h20, L7 h9, L11 h25). Absolute dst `D` is token selector `D-1`, src `S` is `@(S-D)`. Holds on 7-0. `-t 1-54`; plot with `plotters/plot_attention_dst_src_grid.py` |
+| `analysis/1_attn_weight_analysis.sh` | everything a Stage 2 group produced, in one GPU job: gradient attribution, then the tables and figures. `2_..._endo_60K.sh` / `2-1_..._endo_300K.sh` are thin wrappers that point it at a group |
+| `analysis/2_transmission_probe.sh` | no training: does an injected weight reach the readout token at all (`mechanistic_analysis/probe_attention_weight_transmission.py`) |
+| `analysis/7-1_dst_src_grid_analysis.sh` | CPU-only figures for the 7-1 pair grid; safe on a partial sweep |
+
+### `attention_weight/paper/` -- the attention-weight experiments in the paper
+
+The grid throughout: layers {2 6 10 14} x source offsets {-1 -3 -11 -19 -27}, 3 hand-picked
+heads per cell, destination = last token, train 300K / test 30K.
+
+| script | what it runs |
+|---|---|
+| `1_grid_endogenous.sh` | experiment 1: the grid, endogenous, linear readout. 20 cells x 3 heads = 60 runs. Full run `-t 1-20` |
+| `1-1_grid_endogenous_logistic_norm_dev.sh` | experiment 1-1: experiment 1 with a sigmoid head and normalized-deviance loss. The SFT panel of the paper (`plotters/plot_paper_sft_panel_c.py`) |
+| `2_grid_interventional.sh` | experiment 2: the grid with the joint loss, `W` in {0.01, 0.1, 0.3}, 180 runs, paired with experiment 1 |
+| `2-1_..._prob_true_dist.sh` / `2-2_..._prob_uniform.sh` | experiment 2 with 1-1's readout, injection drawn from the cell's own distribution (2-1) or uniformly over [0, 1] (2-2). 2-2 at `W=0.3` is the joint-loss panel of the paper (`plotters/plot_paper_joint_loss_panel_c.py`) |
+| `1-0_reeval_1_...sh`, `2-0_reeval_2_...sh`, `2-1-0_reeval_1-1_...sh` | no training: re-score finished runs of 1, 2 and 1-1 under the `empirical_prob` injection (`trainers/train_introspector_joint.py --interv-eval-only`), so they pair with 2-1 / 2-2 |
+| `3-1-0_cache_multipairs_lengen.sh` -> `3-1_multipairs_lengen_endogenous_logistic_norm_dev.sh` | experiment 3-1: one run learns every (dst, src) pair of a head, across training lengths 16-128, then length generalization. Plot with `plotters/plot_multipairs_lengen.py` |
+| `4-2-1_multipairs_lengen_interventional_..._prob_uniform.sh` | 3-1 with the joint loss at `W=0.3` and uniform injection |
+| `5_train_attn_weight_joint_weight_sweep_unanchored_300K_..._prob_uniform.sh` | the unanchored `W` sweep of 3-2 with 2-2's readout and injection: 6 cells x 6 `W` x 3 heads |
 
 ## SAE-specific notes
 
@@ -120,8 +179,8 @@ post-softmax weight. The same conventions as above apply, plus:
   `plotters/plot_attention_srctoken_sweep.py` marks both.
 - **Prompt ambiguity is measured, not assumed.** The prompt names the source token by
   string only, so a token repeated in the 32-token context does not identify a position.
-  `cache_signals` records `src_token_unique_rate` in the cache metadata; split on it
-  rather than assuming the cost is zero.
+  `cache_signals` records per-row `src_token_unique` / `dst_token_unique` columns in the
+  cache; split on them rather than assuming the cost is zero.
 - The neuron analysis scripts parse `N<layer>.<index>` out of run names and skip
   non-matching directories **without warning**, so they ignore attention runs. Use
   `plotters/plot_attention_srctoken_sweep.py`, which owns its own pattern; do not widen

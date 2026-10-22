@@ -1,10 +1,11 @@
 """mechanistic_analysis/: every script loads the way scripts/ runs it, and the readout
 decomposition the circuit traces rest on adds up.
 
-trace_introspection_circuit.py attributes the regression readout to residual writes
-through a FROZEN final RMSNorm. Every per-layer and per-head number downstream is only
-meaningful if those pieces sum back to the prediction, so that identity is checked here
-on random tensors. The knockout statistics have their own file (test_knockout_stats.py).
+mechanistic_analysis/trace_introspection_circuit.py attributes the regression readout to
+residual writes through a FROZEN final RMSNorm. Every per-layer and per-head number
+downstream is only meaningful if those pieces sum back to the prediction, so that
+identity is checked here on random tensors. The knockout statistics have their own file
+(test_knockout_stats.py).
 """
 import numpy as np
 import pytest
