@@ -34,7 +34,7 @@
 #              is no --intervention-extreme-scale and no `_scale` token in the run name.
 #
 # RUN NAMES follow 2-2 (`joint_<sig>_POS-1_gateoff_klnone_w<W>_300K`), which RUN_RE in
-# analysis/plot_attention_srctoken_sweep.py parses. 3-2's notebook RUN_RE requires a
+# plotters/plot_attention_srctoken_sweep.py parses. 3-2's notebook RUN_RE requires a
 # `_scale` token, so reusing it on this group needs that token made optional.
 #
 # EVALUATION, as 2-2: the headline interventional corr stays gaussian@1 in log-odds
@@ -150,7 +150,7 @@ SAMPLER="{\"type\":\"attention_layer_sampler\",\"signal_type\":\"attention_weigh
 
 mkdir -p experiment_configs/$EXP_GROUP
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL_TAG}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL_TAG}" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples $TRAIN_SAMPLES \
@@ -180,7 +180,7 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
   echo
   echo "=== [$CELL_TAG W=$W sample $SAMPLE] $EXP_NAME ==="
 
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-1B \
       --train-dataset allenai/c4 --train-dataset-split "train" \
@@ -218,12 +218,12 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
     echo "FATAL: no cache at $CACHE_DIR -- qsub scripts/attention_weight/2-0_cache_attn_weight_300K.sh first" >&2
     exit 1
   fi
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
   if [ "$SAMPLE" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
   # No --kl-anchor-target / --require-kl-anchor: this is the unanchored arm.
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       --interv-eval-distributions "$INTERV_EVALS" \
@@ -235,7 +235,7 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
   # LM cost as a function of W. Unanchored, nothing holds the KL down, so this measures
   # what each W actually costs the model -- score every head for the error bar.
   if [ "${SMOKE:-0}" != "1" ]; then
-    python score_lm_degradation.py --config "$CONFIG"
+    python evals/score_lm_degradation.py --config "$CONFIG"
   fi
 done
 

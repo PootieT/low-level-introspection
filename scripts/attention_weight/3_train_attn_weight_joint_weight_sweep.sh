@@ -14,7 +14,7 @@
 # STAGE 3: joint-loss WEIGHT (W) sweep, to fix W for the interventional runs.
 #
 # L = W * L_endogenous + (1 - W) * L_interventional. W = 1 is pure endogenous,
-# W = 0 pure interventional; train_introspector_joint.py skips the zero-weighted forward
+# W = 0 pure interventional; trainers/train_introspector_joint.py skips the zero-weighted forward
 # entirely, so the endpoints cost what a single-objective trainer costs.
 #
 # 6 cells x 6 weights x 3 heads = 108 runs, one array task per (cell, W). This mirrors
@@ -119,7 +119,7 @@ SAMPLER="{\"type\":\"attention_layer_sampler\",\"signal_type\":\"attention_weigh
 
 mkdir -p experiment_configs/$EXP_GROUP
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL_TAG}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL_TAG}" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples $TRAIN_SAMPLES \
@@ -149,7 +149,7 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
   echo
   echo "=== [$CELL_TAG W=$W sample $SAMPLE] $EXP_NAME ==="
 
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-1B \
       --train-dataset allenai/c4 --train-dataset-split "train" \
@@ -176,11 +176,11 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
 
   # Reuses Stage 2's dataset. If this rebuilds, something entered the cache identity
   # that should not have -- check before letting 36 tasks each rebuild 60K examples.
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
   if [ "$SAMPLE" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       --kl-anchor-target $KL_BUDGET \
@@ -190,14 +190,14 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
       $OVERWRITE
 
   # LM cost as a function of W: a weight that buys reading by damaging the model more is
-  # not free, and that is the third panel of analysis/plot_weight_sweep.py.
-  python score_lm_degradation.py --config "$CONFIG"
+  # not free, and that is the third panel of plotters/plot_weight_sweep.py.
+  python evals/score_lm_degradation.py --config "$CONFIG"
 done
 
 echo
 echo "=========================================================="
 echo "STAGE 3 (cell=$CELL_TAG, W=$W) DONE."
 echo "When all 18 tasks finish, pick W from the pareto:"
-echo "  python analysis/plot_weight_sweep.py   # ported to this EXP_GROUP"
+echo "  python plotters/plot_weight_sweep.py   # ported to this EXP_GROUP"
 echo "End date : $(date)"
 echo "=========================================================="

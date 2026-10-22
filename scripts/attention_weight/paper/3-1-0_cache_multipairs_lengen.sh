@@ -16,8 +16,8 @@
 #
 #   tasks 1-4  one training length n each (16 32 64 128): the base cache (train 300K /
 #              dev / test = the n grid), then every length cache (m > n) and OOD cache
-#              those runs evaluate on (train_introspector_joint.py --prepare-only)
-#   task  5    the injection pool (cache_signals.py --pair-pool), shared by every n
+#              those runs evaluate on (trainers/train_introspector_joint.py --prepare-only)
+#   task  5    the injection pool (data_prep/cache_signals.py --pair-pool), shared by every n
 #
 # The three heads of an n share all of these, so each is built by exactly one task here
 # and the training tasks only read them (see 3-1's header for the race this avoids).

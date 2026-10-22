@@ -33,5 +33,5 @@ FEATS=($(features_for_layer "$LAYER"))
 # Any feature/weight of the cell gives the same dataset_name; use F1 at the first weight.
 CONFIG=$(make_config "${FEATS[0]}" "$POS" "${WEIGHTS[0]}")
 echo "=== cache layer=$LAYER pos=$POS features=${FEATS[*]} -> $CONFIG ==="
-python cache_signals.py --config "$CONFIG"          # no-op if already built
+python data_prep/cache_signals.py --config "$CONFIG"          # no-op if already built
 echo "Cache built: $(date)"

@@ -22,7 +22,7 @@
 # WHY DETECTION. SAE features are sparse (~1% density), so at a fixed position a
 # magnitude target is ~all zeros and a regressor wins by predicting 0. The readout is
 # binary ("active"/"inactive") in the model's own tokens, scored with AP (the
-# imbalance-honest headline) and AUROC; see train_sae_detector.py.
+# imbalance-honest headline) and AUROC; see trainers/train_sae_detector.py.
 #
 # FEATURE SELECTION. Drawn DENSITY-STRATIFIED from the per-layer parquet built by
 # precompute_sae_feature_stats.sh: the valid pool is sorted by density and split into
@@ -124,7 +124,7 @@ for SAMPLE in $(seq 0 $((N_FEAT_TRAIN - 1))); do
 
   # every sample passes the SAME feature list, so all of them resolve to one cached
   # dataset; --signal-filter is what differs and is not part of the cache identity
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model google/gemma-2-2b \
       --objective detection \
@@ -163,14 +163,14 @@ for SAMPLE in $(seq 0 $((N_FEAT_TRAIN - 1))); do
       $OVERWRITE
 
   # builds the cell's N-feature dataset on SAMPLE=0, no-ops for the other samples
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
   # alignment regression check once per cell rather than on every run (it is a
   # property of the data pipeline, so one run per dataset is enough).
   # WANT: best offset +0, corr ~1.0, "alignment OK".
   if [ "$SAMPLE" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
-  python train_sae_detector.py \
+  python trainers/train_sae_detector.py \
       --config "$CONFIG" \
       $DRIFT \
       $OOD_FLAG \
@@ -180,7 +180,7 @@ for SAMPLE in $(seq 0 $((N_FEAT_TRAIN - 1))); do
   # the adapter never ran over ordinary text, so a plain PEFT forward describes a
   # model that does not exist). Run them once per cell.
   if [ "$GATE" = "off" ] && [ "$SAMPLE" -eq 0 ]; then
-    python score_lm_degradation.py --config "$CONFIG"
-    python score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200
+    python evals/score_lm_degradation.py --config "$CONFIG"
+    python evals/score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200
   fi
 done

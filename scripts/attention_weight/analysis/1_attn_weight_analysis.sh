@@ -35,7 +35,7 @@
 #
 # WHAT THIS DOES *NOT* PRODUCE. The Layer x Head exact-decomposition grid (16x32) and the
 # Layer x Position MLP grid from the plan's section 7-2. Those come from
-# trace_introspection_circuit.py, which does not run on an attention_weight config: its
+# mechanistic_analysis/trace_introspection_circuit.py, which does not run on an attention_weight config: its
 # signal_ranges key is a 2-tuple (:430) while attention runs build 3-tuples, and
 # SIGNAL_PATH_RESOLVERS (:307-320) raises NotImplementedError for attention. Porting it is
 # a separate piece of work.
@@ -92,7 +92,7 @@ EXP_GROUP=${EXP_GROUP:-attn_weight_endo_picked}
 RUNS=outputs/runs/$EXP_GROUP
 CONFIGS=experiment_configs/$EXP_GROUP
 PLOTS=outputs/plots/$EXP_GROUP
-# One subdirectory per attributed run, written by attribute_attention_weight_readout.py.
+# One subdirectory per attributed run, written by mechanistic_analysis/attribute_attention_weight_readout.py.
 ATTR_ROOT=plots/$EXP_GROUP/attribution
 
 # The source offset that IS BOS: -(seq_length - 1), from the Stage 2 cache at seq 32.
@@ -164,7 +164,7 @@ for cfg in "${TARGETS[@]}"; do
   echo "[2] === attribution: $name ==="
   n_failed_before=${#FAILED[@]}
   run_step "$name attribution" \
-    python attribute_attention_weight_readout.py --config "$cfg" --attr-method "$ATTR_METHOD"
+    python mechanistic_analysis/attribute_attention_weight_readout.py --config "$cfg" --attr-method "$ATTR_METHOD"
   if [ ${#FAILED[@]} -eq "$n_failed_before" ]; then
     N_OK=$((N_OK + 1))
   elif [ "$N_OK" -eq 0 ]; then
@@ -183,7 +183,7 @@ for cfg in "${TARGETS[@]}"; do
   echo
   echo "[3] === attribution figures: $name ==="
   run_step "$name attribution plots" \
-    python analysis/plot_attention_weight_attribution.py "$attr_dir"
+    python plotters/plot_attention_weight_attribution.py "$attr_dir"
 done
 
 ## ---- 4. the headline readout figure: arm x eval ----
@@ -195,21 +195,21 @@ done
 echo
 echo "[4] === readout by arm (arm_grid_corr.png) ==="
 run_step "readout by arm" \
-  python analysis/plot_attention_srctoken_sweep.py "$RUNS" --bos-offset "$BOS_OFFSET"
+  python plotters/plot_attention_srctoken_sweep.py "$RUNS" --bos-offset "$BOS_OFFSET"
 
 ## ---- 5. master tables + scale sweep / OOD / skew figures ----
 echo
 echo "[5] === master tables and diagnostics ==="
 run_step "master tables" \
-  python analysis/summarize_attention_weight_stage2.py "$RUNS" --configs-dir "$CONFIGS"
+  python plotters/summarize_attention_weight_stage2.py "$RUNS" --configs-dir "$CONFIGS"
 
 ## ---- 6. cost of access: measured KL against readout quality ----
 # gate off only: with the gate on the adapter never touches ordinary text, so the KL is
-# 0 by construction and score_lm_degradation.py refuses to run at all.
+# 0 by construction and evals/score_lm_degradation.py refuses to run at all.
 echo
 echo "[6] === KL / capability frontier ==="
 run_step "KL frontier" \
-  python analysis/plot_kl_tradeoff.py --exp-group "$EXP_GROUP" --gate off
+  python plotters/plot_kl_tradeoff.py --exp-group "$EXP_GROUP" --gate off
 
 ## ---- what was produced ----
 echo

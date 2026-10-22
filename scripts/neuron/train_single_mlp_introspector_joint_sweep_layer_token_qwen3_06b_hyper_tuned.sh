@@ -19,7 +19,7 @@
 # cd /projectnb/llamagrp/peter/low-level-introspection
 # qsub scripts/neuron/train_single_mlp_introspector_joint_sweep_layer_token_qwen3_06b_hyper_tuned.sh
 # # once runs finish (the SFT arm at the tuned LR comes later and joins the same table):
-# python analysis/compare_sft_vs_joint.py --model-suffix _qwen3_06b_hyper_tuned
+# python plotters/compare_sft_vs_joint.py --model-suffix _qwen3_06b_hyper_tuned
 # <<< SUBMIT
 #
 # The same recipe as the Llama *_hyper_tuned grids (there is no earlier Qwen3-0.6B-Base grid):
@@ -103,7 +103,7 @@ echo "cell=$CELL_TAG regime=$KL_TAG lr=$LR"
 
 ## ---- resolve this layer's neuron set ONCE (identical at every position) ----
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL_TAG}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL_TAG}" \
     --model Qwen/Qwen3-0.6B-Base \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples 300000 \
@@ -137,7 +137,7 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
 
   # every sample passes the SAME neuron list, so all 5 share one cached dataset;
   # --signal-filter is not part of the cache identity
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model Qwen/Qwen3-0.6B-Base \
       --train-dataset allenai/c4 \
@@ -176,16 +176,16 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
       $OVERWRITE
 
   # builds the cell's dataset on first use (or finds the existing one), no-ops afterwards
-  python cache_signals.py --config "$CONFIG"
+  python data_prep/cache_signals.py --config "$CONFIG"
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $KL_FLAG \
       $OOD_FLAG \
       $OVERWRITE
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $KL_FLAG \
@@ -196,12 +196,12 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
   # LM cost. Both scorers skip when their output exists, so resubmitting a partially
   # finished task is cheap.
   if [ "$SAMPLE" -lt "$LM_SCORE_N" ]; then
-    python score_lm_degradation.py --config "$CONFIG"
+    python evals/score_lm_degradation.py --config "$CONFIG"
   fi
   # benchmarks are far more expensive and vary with the training config, not the
   # neuron -> one per cell
   if [ "$SAMPLE" -eq 0 ]; then
-    python score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200 \
+    python evals/score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200 \
       || echo "WARNING: lighteval failed for $EXP_NAME (unverified on Qwen); continuing"
   fi
 done

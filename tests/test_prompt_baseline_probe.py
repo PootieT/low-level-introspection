@@ -1,9 +1,9 @@
-"""Unit tests for the prompted baseline's weighted ridge probe (score_prompt_baseline.py)."""
+"""Unit tests for the prompted baseline's weighted ridge probe (evals/score_prompt_baseline.py)."""
 import numpy as np
 import torch
 from sklearn.linear_model import Ridge
 
-import score_prompt_baseline as spb
+import evals.score_prompt_baseline as spb
 
 
 def _blocks(n=500, H=24, seed=0):

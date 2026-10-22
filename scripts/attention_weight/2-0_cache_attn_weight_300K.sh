@@ -15,7 +15,7 @@
 #
 # One task per cell, so no two tasks ever write the same cache directory. The training
 # scripts split each cell over several concurrent tasks (2-1: 3 arms, 3-1: 6 weights,
-# 4-1: 2 regimes), and cache_signals.py skips on `train/` existing alone -- if they built
+# 4-1: 2 regimes), and data_prep/cache_signals.py skips on `train/` existing alone -- if they built
 # the cache themselves, the losers of the race could read a half-written dataset with no
 # error. So they refuse to build it and wait for this job via `#$ -hold_jid attn_w_cache300K`.
 #

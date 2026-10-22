@@ -130,7 +130,7 @@ class UniformLayerSampler(BaseModel):
 class SAEFeatureSampler(BaseModel):
     """Select SAE features to introspect on by interpretability-friendly criteria
     instead of listing raw indices. Feature stats (activation density) come from a
-    pre-computed stats file (see scripts/select_sae_features.py); interp scores /
+    pre-computed stats file (see data_prep/select_sae_features.py); interp scores /
     labels come from Neuronpedia. Selection deliberately avoids dead features (no
     signal) and ultra-dense ones (trivially always-on)."""
     type: Literal["sae_feature_sampler"]
@@ -154,7 +154,7 @@ class SAEFeatureSampler(BaseModel):
     # exposes descriptions but NOT auto-interp scores for the Gemma Scope res-16k
     # features (scores: []), so this floor is effectively inert for that release --
     # feature selection is instead decided by the steering judge
-    # (generate_sae_steering_samples.py + out-of-band judging). annotate_sae_features_
+    # (data_prep/generate_sae_steering_samples.py + out-of-band judging). annotate_sae_features_
     # neuronpedia.py still records interp_score when a release does provide one.
     min_interp_score: float | None = None
     seed: int = 0

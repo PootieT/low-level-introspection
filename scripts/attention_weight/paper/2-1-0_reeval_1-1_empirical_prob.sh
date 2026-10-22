@@ -18,7 +18,7 @@
 # 2-1 trains on empirical_prob draws and scores both gaussian (1-1's headline) and
 # empirical_prob. 1-1 was only ever scored with gaussian, so its runs have no
 # empirical_prob number to pair with. This loads each finished 1-1 checkpoint and runs
-# ONLY that eval (train_introspector_joint.py --interv-eval-only), writing one new file,
+# ONLY that eval (trainers/train_introspector_joint.py --interv-eval-only), writing one new file,
 # interventional_test_metrics_empirical_prob.json (+ its predictions csv and scatter),
 # into the 1-1 run directory. Nothing 1-1 already wrote is touched.
 #
@@ -106,7 +106,7 @@ for H in "${HEADS[@]}"; do
     exit 1
   fi
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --interv-eval-only \
       --checkpoint "${CKPTS[0]}" \

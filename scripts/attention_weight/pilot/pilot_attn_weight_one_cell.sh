@@ -48,7 +48,7 @@
 # here instead, and expect it to take as long as a sweep task.
 #
 # PICK THE CELL FROM THE SCAN, not from this file's defaults. Stage 1
-# (scan_attention_weight_spread.py) ranks all 16 x 32 x 10 cells by spread and prints a
+# (mechanistic_analysis/scan_attention_weight_spread.py) ranks all 16 x 32 x 10 cells by spread and prints a
 # recommendation; the defaults below are only a plausible mid-stack cell to smoke-test
 # the pipeline with before the scan has run.
 #
@@ -175,7 +175,7 @@ echo "=========================================================="
 # Generated, not run: it keeps resolution.py the single source of truth for which heads
 # a (seed, layer) maps to, instead of duplicating the selection in shell.
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL}" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples $TRAIN_SAMPLES \
@@ -215,7 +215,7 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
 
   # Every sample passes the SAME signal list so all heads resolve to one cached
   # dataset; --signal-filter is what differs and is not part of the cache identity.
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-1B \
       --train-dataset allenai/c4 \
@@ -257,7 +257,7 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
   # Builds the cell's 8-head dataset on SAMPLE=0 and no-ops afterwards. If the second
   # sample re-caches, --signal-filter has leaked into the dataset identity.
   t0=$SECONDS
-  python cache_signals.py --config "$CONFIG" $CACHE_OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $CACHE_OVERWRITE
   dt=$((SECONDS - t0))
   if [ "$SAMPLE" -eq 0 ]; then
     CACHE_SECONDS=$dt
@@ -305,7 +305,7 @@ PYEOF
   fi
 
   t0=$SECONDS
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       --force-drift-eval \
@@ -389,10 +389,10 @@ if preds.exists():
         print("        the Stage-1 scan did not mark `dead`.")
 
 # [4] ROW SUM and [5] DOMAIN: properties of the write path, checked directly rather
-# than inferred from a metric. validate_attention_weights.py is the full version; this
+# than inferred from a metric. tests/validate_attention_weights.py is the full version; this
 # re-runs its two load-bearing checks against THIS cell's trained checkpoint context so
 # a pilot log is self-contained.
-print("\n[4] ROW SUM / [5] DOMAIN -- see validate_attention_weights.py, run below.")
+print("\n[4] ROW SUM / [5] DOMAIN -- see tests/validate_attention_weights.py, run below.")
 
 sweep = run / "interventional_scale_sweep.csv"
 if sweep.exists():
@@ -443,9 +443,9 @@ PYEOF
 # without a second command.
 echo
 echo "=========================================================="
-echo "=== PORT CHECKS (validate_attention_weights.py)"
+echo "=== PORT CHECKS (tests/validate_attention_weights.py)"
 echo "=========================================================="
-python validate_attention_weights.py --layer $LAYER --src-offset $SRC_OFFSET
+python tests/validate_attention_weights.py --layer $LAYER --src-offset $SRC_OFFSET
 
 echo
 echo "=========================================================="

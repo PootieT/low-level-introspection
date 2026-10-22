@@ -7,7 +7,7 @@
 # One introspector per row, trained on the first N features of the layer-9 pool
 # (data/sae_featgen/pool_layer9.json, built by build_featgen_pool_layer9.sh) and
 # evaluated on ALL 200 pool features -- trained ones are the seen arm, the rest the
-# held-out arm (score_sae_feature_generalization.py).
+# held-out arm (evals/score_sae_feature_generalization.py).
 #
 #   arm=label   the prompt names each feature by its Neuronpedia explanation
 #               (prompt_sae_label). The hypothesis: addressing by MEANING gives a
@@ -131,7 +131,7 @@ negative_keep() {   # negative_keep N TOTAL -> the cache's inactive-row keep rat
 make_pool_config() {
     local feats; feats=$(pool_features) || return 1
     rm -f "$POOL_CONFIG"
-    python generate_experiment_config.py \
+    python data_prep/generate_experiment_config.py \
         --experiment-name "_featgen_pool_L${LAYER}" \
         --model $MODEL --objective detection \
         --train-dataset allenai/c4 --train-dataset-split "train" \
@@ -170,7 +170,7 @@ make_run_config() {
     esac
     local config=experiment_configs/$EXP_GROUP/saeFeatgen_${name}.json
     rm -f "$config"
-    python generate_experiment_config.py \
+    python data_prep/generate_experiment_config.py \
         --experiment-name "saeFeatgen_${name}" \
         --model $MODEL \
         --objective detection --detection-balance-pos-frac 0.5 \

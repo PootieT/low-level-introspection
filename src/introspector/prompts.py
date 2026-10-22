@@ -4,7 +4,7 @@ from typing import Literal
 
 
 # The index the PROMPT shows is not the raw cached `token_position`.
-# cache_signals.py tokenizes with add_special_tokens=True, so position 0 is BOS and
+# data_prep/cache_signals.py tokenizes with add_special_tokens=True, so position 0 is BOS and
 # the first *visible* text token sits at position 1. Displaying the raw position
 # would ask the model to count a token it cannot see. Subtracting the BOS makes the
 # displayed number 0-based over exactly the text the model reads.

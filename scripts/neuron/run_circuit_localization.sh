@@ -35,25 +35,25 @@ set -e
 
 ####### for joint-loss sweep #######
 # compare lora norm across layers
-#python analysis/compare_lora_weight_patterns.py --group mlp_joint_grid_layer_token --run-glob 'joint_*kl0.1*' --from-cache
+#python plotters/compare_lora_weight_patterns.py --group mlp_joint_grid_layer_token --run-glob 'joint_*kl0.1*' --from-cache
 
 # look at direct attribution from each layer components to final regressor direction, look at token level signal
-#python trace_introspection_circuit.py --group mlp_joint_grid_layer_token --run-glob 'joint_*kl0.1*'
+#python mechanistic_analysis/trace_introspection_circuit.py --group mlp_joint_grid_layer_token --run-glob 'joint_*kl0.1*'
 
 # inject {native, foreign} signal in randomly chosen (by index/layer/position) neurons and look at affects in trained neuron
-#python score_injection_specificity.py --group mlp_joint_grid_layer_token --run-glob 'joint_*kl0.1*' --from-cache --n-test 500
+#python mechanistic_analysis/score_injection_specificity.py --group mlp_joint_grid_layer_token --run-glob 'joint_*kl0.1*' --from-cache --n-test 500
 
 # run endogenous eval setting, compute gradient X activation for all neuron in (L, t, i)
-#python score_gradient_attribution.py --group mlp_joint_grid_layer_token --run-glob 'joint_*kl0.1*' --from-cache --n-test 500
+#python mechanistic_analysis/score_gradient_attribution.py --group mlp_joint_grid_layer_token --run-glob 'joint_*kl0.1*' --from-cache --n-test 500
 
 # trace the top contributors to mover head that moves info to final token regressor direction
-#python trace_mover_head.py --group mlp_joint_grid_layer_token --run-glob 'joint_*kl0.1*'
+#python mechanistic_analysis/trace_mover_head.py --group mlp_joint_grid_layer_token --run-glob 'joint_*kl0.1*'
 
 # ablate heads and check evaluations to see which kind of heads ablate which eval, how are they related
-#python score_head_ablation.py --group mlp_joint_grid_layer_token --run-glob 'joint_*kl0.1*' --skip-existing
+#python mechanistic_analysis/score_head_ablation.py --group mlp_joint_grid_layer_token --run-glob 'joint_*kl0.1*' --skip-existing
 
 # analyze head taxonomy distribution
-#python analysis/plot_head_taxonomy.py --group mlp_joint_grid_layer_token --kl kl0.1
+#python plotters/plot_head_taxonomy.py --group mlp_joint_grid_layer_token --kl kl0.1
 
 # replot trace mover head plots b ut with head knockout experimients
-python trace_mover_head.py --group mlp_joint_grid_layer_token --run-glob 'joint_*_kl0.1_*' --heads-from-knockout --top-heads 4
+python mechanistic_analysis/trace_mover_head.py --group mlp_joint_grid_layer_token --run-glob 'joint_*_kl0.1_*' --heads-from-knockout --top-heads 4

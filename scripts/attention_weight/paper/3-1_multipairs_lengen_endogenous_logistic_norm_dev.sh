@@ -49,7 +49,7 @@
 #
 # INTERVENTIONAL EVAL: gaussian and empirical_prob, both PER ABSOLUTE PAIR, from the
 # injection pool -- POOL_DOCS train documents read at 512 tokens at every pair any eval
-# length asks for (cache_signals.py --pair-pool). It covers dst >= n, which no n-token
+# length asks for (data_prep/cache_signals.py --pair-pool). It covers dst >= n, which no n-token
 # training cache contains, and uses no test document. No scale sweep.
 #
 # RECIPE: 1-1's gate-off unanchored arm (klnone:off), logistic head + normalized deviance.
@@ -70,7 +70,7 @@
 # Usage
 #   qsub scripts/attention_weight/paper/3-1-0_cache_multipairs_lengen.sh
 #   qsub scripts/attention_weight/paper/3-1_multipairs_lengen_endogenous_logistic_norm_dev.sh
-#   python analysis/plot_multipairs_lengen.py --exp-group attn_weight_paper31_multipairs_lengen_endo_logistic_ndev_300K
+#   python plotters/plot_multipairs_lengen.py --exp-group attn_weight_paper31_multipairs_lengen_endo_logistic_ndev_300K
 # ============================================================================
 
 echo "=========================================================="
@@ -187,7 +187,7 @@ echo "  eval lengths > n: ${EVAL_LENGTHS_CSV:-none}   test docs: $TEST_DOCS"
 echo "  output: $OUT_ROOT"
 echo "=========================================================="
 
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "$EXP_NAME" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 \
@@ -232,12 +232,12 @@ if [ -n "$EVAL_LENGTHS_CSV" ]; then LENGTH_FLAGS="--length-eval --eval-lengths $
 ## ---- CACHE_ONLY (3-1-0) ----
 if [ "$CACHE_ONLY" = "1" ]; then
   if [ "$TASK" = "pool" ]; then
-    python cache_signals.py --config "$CONFIG" --pair-pool
+    python data_prep/cache_signals.py --config "$CONFIG" --pair-pool
     touch $MARKERS/pool.done
   else
-    python cache_signals.py --config "$CONFIG"
+    python data_prep/cache_signals.py --config "$CONFIG"
     # every length and OOD cache this n's runs will ask for, built once here
-    python train_introspector_joint.py --config "$CONFIG" --prepare-only \
+    python trainers/train_introspector_joint.py --config "$CONFIG" --prepare-only \
         $LENGTH_FLAGS --ood-eval
     touch $MARKERS/n${N}.done
   fi
@@ -256,7 +256,7 @@ done
 # Cache-alignment check once per n: it is a property of the cached dataset.
 if [ "$HEAD_IDX" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
-python train_introspector_joint.py \
+python trainers/train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     --scale-sweep "" \
@@ -268,7 +268,7 @@ python train_introspector_joint.py \
 
 # LM cost of the unanchored arm, two heads for an error bar (as 1-1)
 if [ "$HEAD_IDX" -lt 2 ] && [ "${SMOKE:-0}" != "1" ]; then
-  python score_lm_degradation.py --config "$CONFIG"
+  python evals/score_lm_degradation.py --config "$CONFIG"
 fi
 
 echo

@@ -33,14 +33,14 @@
 #
 # ONE ARRAY TASK PER (CELL, W), three trainings each. CELL is the outer dimension and W
 # the inner one, so the three W arms of a cell are adjacent tasks and run concurrently on
-# ONE cell dataset. That is why this script never builds a cache: cache_signals.py skips
+# ONE cell dataset. That is why this script never builds a cache: data_prep/cache_signals.py skips
 # on `train/` existing alone, so concurrent builders could read a half-written dataset
 # with no error. The caches are experiment 1's -- every config argument below that enters
 # the cache identity is copied from 1_grid_endogenous.sh (W and --ood-eval are trainer
 # CLI flags, not config), and a missing cache is FATAL rather than built.
 #
 # RUN NAMES HAVE NO `_scale4_` TOKEN, unlike 3-2's. RUN_RE in
-# analysis/plot_attention_srctoken_sweep.py expects `_gate.._kl.._w..` adjacent; a token in
+# plotters/plot_attention_srctoken_sweep.py expects `_gate.._kl.._w..` adjacent; a token in
 # between leaves kl and w unmatched (w = NaN) without an error. SCALE is constant across
 # both paper experiments, so nothing is lost.
 #
@@ -150,7 +150,7 @@ for SAMPLE in 0 1 2; do
   echo
   echo "=== [$CELL_TAG W=$W head $SAMPLE] $EXP_NAME ==="
 
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-1B \
       --train-dataset allenai/c4 \
@@ -201,13 +201,13 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
     echo "FATAL: no cache at $CACHE_DIR -- qsub scripts/attention_weight/paper/1_grid_endogenous.sh first" >&2
     exit 1
   fi
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
   # Cache-alignment check once per (cell, W): cheap, and it is what tells a normalization
   # mismatch apart from a low score.
   if [ "$SAMPLE" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       --scale-sweep "$SCALE_SWEEP" \
@@ -215,7 +215,7 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
       $OOD_FLAG \
       $OVERWRITE
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $OOD_FLAG \
@@ -224,7 +224,7 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
 
   # LM cost as a function of W. Unanchored, nothing holds the KL down, so this measures
   # what each W actually costs the model -- score every head for the error bar (as 3-2).
-  python score_lm_degradation.py --config "$CONFIG"
+  python evals/score_lm_degradation.py --config "$CONFIG"
 done
 
 echo

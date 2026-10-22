@@ -17,7 +17,7 @@
 #
 # A 3 x 2 design, one array task per cell:
 #     {lower, mid, upper layer} x {source NEAR the destination, source FAR from it}
-# picked by hand from scan_attention_weight_spread.py's tables (Stage 1). This is NOT a
+# picked by hand from mechanistic_analysis/scan_attention_weight_spread.py's tables (Stage 1). This is NOT a
 # sweep -- the attention-LOGIT sweep already ran 1280 cells and came out flat (mean corr
 # 0.894, no variation across layer or offset), so this experiment measures every cell
 # first and trains a few good ones instead of sampling at random.
@@ -86,7 +86,7 @@ export WANDB_RUN_GROUP=$EXP_GROUP
 OUT_ROOT=outputs/runs/$EXP_GROUP
 
 ## ---- the six hand-picked cells: {lower, mid, upper} x {near, far} ----
-# Hand-picked from scan_attention_weight_spread.py's tables (run 1_scan.sh first).
+# Hand-picked from mechanistic_analysis/scan_attention_weight_spread.py's tables (run 1_scan.sh first).
 # Format: band:layer:head:src_offset, ordered NEAR first then FAR so that
 # `-t 1-3` alone runs the near arm and `-t 4-6` the far one.
 #
@@ -166,7 +166,7 @@ SAMPLER="{\"type\":\"attention_layer_sampler\",\"signal_type\":\"attention_weigh
 # (seed, layer) -> head-set mapping instead of duplicating the selection in shell.
 mkdir -p experiment_configs/$EXP_GROUP
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL_TAG}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL_TAG}" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples $TRAIN_SAMPLES \
@@ -211,7 +211,7 @@ for ARM in "${ARMS[@]}"; do
 
     # Every sample passes the SAME signal list so all heads resolve to one cached
     # dataset; --signal-filter is what differs and is not part of the cache identity.
-    python generate_experiment_config.py \
+    python data_prep/generate_experiment_config.py \
         --experiment-name "$EXP_NAME" \
         --model meta-llama/Llama-3.2-1B \
         --train-dataset allenai/c4 \
@@ -253,7 +253,7 @@ for ARM in "${ARMS[@]}"; do
     # Builds the cell's 8-head dataset the first time and no-ops afterwards, including
     # across arms (the arms differ only in trainer CLI flags, which are not part of the
     # dataset identity).
-    python cache_signals.py --config "$CONFIG" $OVERWRITE
+    python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
     # Cache-alignment check once per (cell, arm): it is a property of the data pipeline,
     # so one run per dataset is enough. For a post-softmax weight this is the only
@@ -261,7 +261,7 @@ for ARM in "${ARMS[@]}"; do
     # catches is a NORMALIZATION mismatch, which otherwise just looks like a low score.
     if [ "$SAMPLE" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
-    python train_introspector_joint.py \
+    python trainers/train_introspector_joint.py \
         --config "$CONFIG" \
         --joint-loss-weight $W \
         --scale-sweep "$SCALE_SWEEP" \
@@ -270,7 +270,7 @@ for ARM in "${ARMS[@]}"; do
         $OOD_FLAG \
         $OVERWRITE
 
-    python train_introspector_joint.py \
+    python trainers/train_introspector_joint.py \
         --config "$CONFIG" \
         --joint-loss-weight $W \
         $KL_FLAG \
@@ -285,7 +285,7 @@ for ARM in "${ARMS[@]}"; do
     if [ "$GATE" = "off" ]; then
       if [ "$KL_TAG" = "klnone" ]; then LM_SCORE_N=2; else LM_SCORE_N=1; fi
       if [ "$SAMPLE" -lt "$LM_SCORE_N" ]; then
-        python score_lm_degradation.py --config "$CONFIG"
+        python evals/score_lm_degradation.py --config "$CONFIG"
       fi
     fi
   done

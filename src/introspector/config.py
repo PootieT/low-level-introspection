@@ -83,7 +83,7 @@ class TrainingConfig(BaseModel):
     # fraction so a sparse feature can't be learned as "always inactive". Eval/test
     # keep the natural distribution; metrics are AUROC/AP (imbalance-robust).
     detection_balance_pos_frac: float = 0.5
-    # MULTI-FEATURE detection (train_sae_detector_joint.py). When set, the train split
+    # MULTI-FEATURE detection (trainers/train_sae_detector_joint.py). When set, the train split
     # is resampled to exactly this many rows in total, split EQUALLY across the trained
     # features (budget // N each), each feature's share balanced to
     # detection_balance_pos_frac: inactive rows subsampled, active rows repeated. None
@@ -105,7 +105,7 @@ class TrainingConfig(BaseModel):
     # "gaussian": N(mean, std) fit to the neuron's empirical activations
     # "extreme": U over a range intervention_extreme_scale x wider than empirical (sanity check)
     # "empirical_prob": one of the cell's own train-split attention weights, as-is
-    # (attention_weight only; train_introspector_joint.py)
+    # (attention_weight only; trainers/train_introspector_joint.py)
     intervention_signal_distribution: str = "uniform"
     # how much wider than the empirical range to sample from when
     # intervention_signal_distribution == "extreme"
@@ -122,7 +122,7 @@ class TrainingConfig(BaseModel):
     # regression head: "identity" = linear (the default every earlier run used),
     # "sigmoid" = logistic probe for probability targets (SigmoidRegressionHead)
     regression_head_activation: str = "identity"
-    # regression loss, read ONLY by train_introspector_joint.py (other trainers refuse a
+    # regression loss, read ONLY by trainers/train_introspector_joint.py (other trainers refuse a
     # non-default value): "var_norm_mse" = MSE / var(target), "norm_deviance" = the
     # Bernoulli deviance KL(p||q) / KL(p||p_bar), for a sigmoid head on probability targets.
     # Both read as ~1 - R^2, so a joint loss mixes them at a balance set by w, not by scale.

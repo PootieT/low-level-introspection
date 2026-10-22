@@ -46,7 +46,7 @@ N_DOCS=${N_DOCS:-4000}
 BATCH_SIZE=${BATCH_SIZE:-64}
 OUT=${OUT:-plots/attn_weight_scan}
 
-python scan_attention_weight_spread.py \
+python mechanistic_analysis/scan_attention_weight_spread.py \
     --n-docs $N_DOCS \
     --batch-size $BATCH_SIZE \
     --out "$OUT"

@@ -32,7 +32,7 @@
 # cost of a heavily degraded LM there (ppl x5.7) -- so compare W-shapes WITHIN a
 # cell, never absolute corr ACROSS cells with different budgets.
 #
-# W=0 is pure interventional and W=1 pure endogenous; train_introspector_joint.py
+# W=0 is pure interventional and W=1 pure endogenous; trainers/train_introspector_joint.py
 # skips the zero-weighted forward, so the endpoints cost what a single-objective
 # trainer costs.
 # ============================================================================
@@ -83,7 +83,7 @@ echo "cell=$CELL_TAG  W=$W"
 
 ## ---- resolve this layer's neuron set ONCE (identical at every weight) ----
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL_TAG}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL_TAG}" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples 300000 \
@@ -117,7 +117,7 @@ for SAMPLE in $(seq 0 $((N_NEURONS - 1))); do
 
   # all samples pass the SAME neuron list, so the 5 runs share one cached dataset;
   # --signal-filter is what differs and is not part of the cache identity
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-1B \
       --train-dataset allenai/c4 \
@@ -155,9 +155,9 @@ for SAMPLE in $(seq 0 $((N_NEURONS - 1))); do
       $OVERWRITE
 
   # builds the cell's 5-neuron dataset on the first sample, no-ops afterwards
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       --kl-anchor-target $KL \
@@ -166,8 +166,8 @@ for SAMPLE in $(seq 0 $((N_NEURONS - 1))); do
   # LM cost. Both scorers skip when their output already exists, so re-submitting a
   # partially-finished task is cheap. Benchmarks only on SAMPLE=0: they are far more
   # expensive than the KL scorer and vary with the training config, not the neuron.
-  python score_lm_degradation.py --config "$CONFIG"
+  python evals/score_lm_degradation.py --config "$CONFIG"
   if [ "$SAMPLE" -eq 0 ]; then
-    python score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200
+    python evals/score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200
   fi
 done

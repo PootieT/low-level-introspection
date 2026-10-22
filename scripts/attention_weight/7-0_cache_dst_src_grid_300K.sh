@@ -16,7 +16,7 @@
 # One task per destination (absolute offsets 0 -1 -3 -7 -11 -15 -19 -23 -27; -31 has only
 # the dropped (-31,-31) pair). Each dataset holds the three pinned heads at every source
 # offset that destination can reach -- up to 30 signals, still one forward per text.
-# 7-1 runs six to ten pairs per destination concurrently, and cache_signals.py skips on
+# 7-1 runs six to ten pairs per destination concurrently, and data_prep/cache_signals.py skips on
 # `train/` existing alone, so if 7-1 built caches itself the losers of the race could read
 # a half-written dataset with no error. It refuses to, and holds on this job instead.
 #

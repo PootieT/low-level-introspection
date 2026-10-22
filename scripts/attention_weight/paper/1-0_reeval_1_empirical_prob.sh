@@ -21,7 +21,7 @@
 # (notebook/attention_weight/paper/1_grid_endogenous_analysis.ipynb) also draws the grid
 # with empirical_prob injection -- one of the cell's own train-split weights, as-is --
 # so this loads each finished experiment-1 checkpoint and runs ONLY that eval
-# (train_introspector_joint.py --interv-eval-only), writing one new file,
+# (trainers/train_introspector_joint.py --interv-eval-only), writing one new file,
 # interventional_test_metrics_empirical_prob.json (+ its predictions csv and scatter),
 # into the run directory. Nothing experiment 1 already wrote is touched.
 #
@@ -108,7 +108,7 @@ for H in "${HEADS[@]}"; do
     exit 1
   fi
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --interv-eval-only \
       --checkpoint "${CKPTS[0]}" \

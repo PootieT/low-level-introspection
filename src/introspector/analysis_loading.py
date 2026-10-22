@@ -216,9 +216,9 @@ def load_run_for_analysis(
     text consecutively, so a prefix stays balanced across signals where a random subset
     would not).
     """
-    from train_introspector import (  # local: heavy module, and it imports this package
+    from trainers.train_introspector import (  # local: heavy module, and it imports this package
         INTROSPECTION_SEPARATOR, drop_invalid_positions, preprocess_example)
-    from train_introspector_joint import UngatedCollator
+    from trainers.train_introspector_joint import UngatedCollator
     from .prompts import PROMPT_REGISTRY
 
     if not isinstance(config, ExperimentConfig):

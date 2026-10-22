@@ -17,7 +17,7 @@
 # CPU ONLY. Everything here reads metrics files the training runs already wrote; there is
 # no attribution step as in 1_attn_weight_analysis.sh, so no GPU is requested.
 #
-# SAFE ON A PARTIAL SWEEP. analysis/plot_attention_dst_src_grid.py prints every pair with
+# SAFE ON A PARTIAL SWEEP. plotters/plot_attention_dst_src_grid.py prints every pair with
 # no run or fewer than 3 heads and marks them in the figures ("--" / "n=2"), so this can be
 # run while 7-1 is still filling in; rerun it once all 54 tasks are done.
 #
@@ -72,7 +72,7 @@ if [ "$N_DONE" -lt "$EXPECTED_RUNS" ]; then
   echo "NOTE: partial sweep -- the figures mark the missing cells; rerun when 7-1 is done."
 fi
 
-python analysis/plot_attention_dst_src_grid.py "$RUNS" --out "$PLOTS"
+python plotters/plot_attention_dst_src_grid.py "$RUNS" --out "$PLOTS"
 
 echo
 echo "=========================================================="

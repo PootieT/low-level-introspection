@@ -19,16 +19,16 @@ ones if --include-uncertain). Runs detected as --keep-model are never touched.
 Typical use on the cluster
 ---------------------------
 # 1) DRY RUN: just classify and write outputs/plots/relocate_manifest.csv
-python analysis/relocate_wrong_model_runs.py \
+python utils/relocate_wrong_model_runs.py \
     --runs-root /projectnb/llamagrp/<you>/low-level-introspection/outputs/runs \
     --source mlp_endo_sweep_layer_token \
     --target mlp_endo_sweep_layer_token_llama323b
 
 # 2) MERGE the 3B runs into the 3B group (skips names already present there):
-python analysis/relocate_wrong_model_runs.py ... --apply --action move
+python utils/relocate_wrong_model_runs.py ... --apply --action move
 
 # 3) Or DELETE them (defaults to moving to a _trash_ dir, not hard rm):
-python analysis/relocate_wrong_model_runs.py ... --apply --action delete
+python utils/relocate_wrong_model_runs.py ... --apply --action delete
 """
 import os
 import csv

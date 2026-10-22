@@ -47,7 +47,7 @@
 #   feature_generalization_distractor*.csv   steer x ask matrix + summary
 #   train_balance_by_feature.csv             realized rows / repeats per trained feature
 #   run_spec.json                            the table row, read by the plotter
-# Aggregate: python analysis/plot_sae_feature_generalization.py
+# Aggregate: python plotters/plot_sae_feature_generalization.py
 # ============================================================================
 
 echo "=========================================================="
@@ -76,7 +76,7 @@ echo "row: name=$NAME group=$R_GROUP arm=$ARM n_features=$N_FEAT total_rows=$TOT
 CONFIG=$(make_run_config "$NAME" "$ARM" "$N_FEAT" "$TOTAL" "$CACHE_FEATS")
 for c in "$POOL_CONFIG" "$CONFIG"; do
     d=$(cache_dir_of "$c")
-    # metadata.json is written last by cache_signals.py, so it marks a COMPLETE cache
+    # metadata.json is written last by data_prep/cache_signals.py, so it marks a COMPLETE cache
     if [ ! -f "$d/metadata.json" ]; then
         echo "ERROR: cache $d missing for $c; run cache_sae_feature_generalization.sh first" >&2
         exit 1
@@ -98,11 +98,11 @@ json.dump({"name": "$NAME", "group": "$R_GROUP", "arm": "$ARM", "n_features": $N
           open("$RUN_DIR/run_spec.json", "w"), indent=2)
 PY
 
-python train_sae_detector_joint.py --config "$CONFIG" \
+python trainers/train_sae_detector_joint.py --config "$CONFIG" \
     --joint-loss-weight $W --kl-anchor-target $KL_TARGET --force-drift-eval \
     --feature-gen-pool-config "$POOL_CONFIG"
 
 # Re-run ONLY the eval on an existing checkpoint:
-#   python train_sae_detector_joint.py --config "$CONFIG" --joint-loss-weight $W \
+#   python trainers/train_sae_detector_joint.py --config "$CONFIG" --joint-loss-weight $W \
 #       --feature-gen-only --feature-gen-pool-config "$POOL_CONFIG"
 echo "Done: $(date)"

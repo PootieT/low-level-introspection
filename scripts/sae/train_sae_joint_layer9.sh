@@ -34,7 +34,7 @@ for SIG in "${FEATURES[@]}"; do
   CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
   echo "=== joint feature=$SIG W=$W -> $EXP_NAME ==="
 
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model google/gemma-2-2b \
       --objective detection --detection-balance-pos-frac 0.5 \
@@ -50,10 +50,10 @@ for SIG in "${FEATURES[@]}"; do
       --learning-rate $LR --warmup-ratio 0.03 --lr-scheduler-type cosine --save-steps 0.25 \
       --cache-dir data --output-dir outputs/runs/$EXP_GROUP --output "$CONFIG"
 
-  python cache_signals.py --config "$CONFIG"          # shared cache; no-op if built
+  python data_prep/cache_signals.py --config "$CONFIG"          # shared cache; no-op if built
 
   if [ "$first" = "1" ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
-  python train_sae_detector_joint.py --config "$CONFIG" --joint-loss-weight $W \
+  python trainers/train_sae_detector_joint.py --config "$CONFIG" --joint-loss-weight $W \
       --kl-anchor-target $KL_TARGET $DRIFT
   first=0
 done

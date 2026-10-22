@@ -72,15 +72,15 @@ on the text region (`--kl-anchor-target 0.1`, matching the neuron track).
 ### Entry points
 | file | role |
 |---|---|
-| `validate_sae_hook.py` | **Gate 0.** Is the SAE applied to the right residual? (FVU ≪ 0.35, L0 in the tens, BOS excluded.) |
-| `select_sae_features.py` | Streaming density pass → per-layer feature-stats parquet. |
-| `annotate_sae_features_neuronpedia.py` | Attach Neuronpedia concepts to the density-selected features (network-only). |
-| `generate_sae_steering_samples.py` | Blinded steered-vs-unsteered samples for the out-of-band steering judge. |
-| `cache_signals.py` | Shared cacher; the `sae` branch encodes features after capturing the residual. |
-| `train_sae_detector_joint.py` | **The trainer.** Joint endogenous + interventional loss, gate off, LM head, KL anchor. |
-| `analysis/plot_sae_joint_results.py` | Figures from the joint metrics (balanced acc / precision). |
+| `tests/validate_sae_hook.py` | **Gate 0.** Is the SAE applied to the right residual? (FVU ≪ 0.35, L0 in the tens, BOS excluded.) |
+| `data_prep/select_sae_features.py` | Streaming density pass → per-layer feature-stats parquet. |
+| `data_prep/annotate_sae_features_neuronpedia.py` | Attach Neuronpedia concepts to the density-selected features (network-only). |
+| `data_prep/generate_sae_steering_samples.py` | Blinded steered-vs-unsteered samples for the out-of-band steering judge. |
+| `data_prep/cache_signals.py` | Shared cacher; the `sae` branch encodes features after capturing the residual. |
+| `trainers/train_sae_detector_joint.py` | **The trainer.** Joint endogenous + interventional loss, gate off, LM head, KL anchor. |
+| `plotters/plot_sae_joint_results.py` | Figures from the joint metrics (balanced acc / precision). |
 | `scripts/sae/{sweep_common,cache_sae_sweep,train_sae_sweep,submit_sae_sweep}.sh` | The layer x position sweep (§7). |
-| `analysis/plot_sae_sweep.py` | Layer x position figures + `sweep_summary.csv` for the sweep. |
+| `plotters/plot_sae_sweep.py` | Layer x position figures + `sweep_summary.csv` for the sweep. |
 
 ---
 
@@ -88,7 +88,7 @@ on the text region (`--kl-anchor-target 0.1`, matching the neuron track).
 
 ```bash
 # 0. validate the hook (once per model × release × layer family)
-python validate_sae_hook.py --model google/gemma-2-2b \
+python tests/validate_sae_hook.py --model google/gemma-2-2b \
     --sae-release gemma-scope-2b-pt-res-canonical --layer 9 --width 16k --site res
 
 # 1. per-layer density stats  (writes data/sae_stats/gemma2-2b_res{L}_16k.parquet)
@@ -106,7 +106,7 @@ sbatch scripts/sae/generate_sae_steering_samples.sh
 W=0.9 sbatch scripts/sae/train_sae_joint_layer9.sh     # also W=1.0 (=endogenous), 0.75, 0.5
 
 # 4. figures
-python analysis/plot_sae_joint_results.py --runs outputs/runs/sae_l9_joint --weight 0.9
+python plotters/plot_sae_joint_results.py --runs outputs/runs/sae_l9_joint --weight 0.9
 ```
 
 The steering gate decides which features to train on; the 5 layer-9 features that passed
@@ -120,16 +120,16 @@ are the default `FEATURES` in `train_sae_joint_layer9.sh`.
 > `data/sae_stats/` and `data/sae_steering_samples/`):
 >
 > ```bash
-> python select_sae_features.py --model google/gemma-2-2b \
+> python data_prep/select_sae_features.py --model google/gemma-2-2b \
 >     --sae-release gemma-scope-2b-pt-res-canonical --layer 9 --width 16k --site res \
 >     --n-tokens 2000000 --max-seq-length 128 --fixed-position -1 \
 >     --min-density 1e-3 --max-density 1e-2 \
 >     --out data/sae_stats/gemma2-2b_res9_16k.parquet
-> python annotate_sae_features_neuronpedia.py \
+> python data_prep/annotate_sae_features_neuronpedia.py \
 >     --stats data/sae_stats/gemma2-2b_res9_16k.parquet \
 >     --model gemma-2-2b --layer 9 --width 16k --site res \
 >     --out data/sae_stats/gemma2-2b_res9_16k.annotated.parquet
-> python generate_sae_steering_samples.py \
+> python data_prep/generate_sae_steering_samples.py \
 >     --annotated data/sae_stats/gemma2-2b_res9_16k.annotated.parquet \
 >     --model google/gemma-2-2b --layer 9 --width 16k --site res \
 >     --out-dir data/sae_steering_samples
@@ -218,7 +218,7 @@ generated token.
 **Alignment first — the sanity gate.** This catches one silent bug: *steering/reading the
 wrong token.* Every `--force-drift-eval` run prints and saves `sae_cache_alignment.json`.
 
-*What the cache is.* Training and eval read a dataset precomputed once by `cache_signals.py`.
+*What the cache is.* Training and eval read a dataset precomputed once by `data_prep/cache_signals.py`.
 Each row stores the text, `token_position` (which token we introspect on), the `token`
 string there, and `activation` — the feature's value at that token, computed by the FROZEN
 base model + SAE encoder. That `activation` is the endogenous label.
@@ -369,7 +369,7 @@ DRY_RUN=1 bash scripts/sae/submit_sae_sweep.sh                 # print the plan
 bash scripts/sae/submit_sae_sweep.sh                           # WEIGHTS="..." / MAX_PARALLEL=N
 
 # 5. figures -> outputs/plots/sae_layerpos_joint/
-python analysis/plot_sae_sweep.py --runs outputs/runs/sae_layerpos_joint \
+python plotters/plot_sae_sweep.py --runs outputs/runs/sae_layerpos_joint \
     --anchor outputs/runs/sae_l9_joint
 ```
 
@@ -411,12 +411,12 @@ features it never trained on?
 
 | file | role |
 |---|---|
-| `build_sae_featgen_pool.py` | the 200-feature pool: `candidates` (density band + positives floor, seeded random sample), `build` (labels, near-duplicate removal, ordering, label-similarity matrix) |
+| `data_prep/build_sae_featgen_pool.py` | the 200-feature pool: `candidates` (density band + positives floor, seeded random sample), `build` (labels, near-duplicate removal, ordering, label-similarity matrix) |
 | `src/introspector/sae_featgen.py` | row budget (`balance_rows_per_feature`), pool loading, nearest-trained-label similarity |
-| `train_sae_detector_joint.py` | multi-feature path (`main_multi`), taken when `detection_total_train_rows` is set. The single-feature `main()` is untouched. |
-| `score_sae_feature_generalization.py` | eval on every pool feature (seen / held out) + the steer x ask distractor matrix |
+| `trainers/train_sae_detector_joint.py` | multi-feature path (`main_multi`), taken when `detection_total_train_rows` is set. The single-feature `main()` is untouched. |
+| `evals/score_sae_feature_generalization.py` | eval on every pool feature (seen / held out) + the steer x ask distractor matrix |
 | `scripts/sae/featgen_common.sh` | the run table + config generation |
-| `analysis/plot_sae_feature_generalization.py` | figures + CSVs |
+| `plotters/plot_sae_feature_generalization.py` | figures + CSVs |
 
 ```bash
 qsub scripts/sae/build_featgen_pool_layer9.sh        # gate 0, stats, candidates, Neuronpedia, pool
@@ -427,7 +427,7 @@ qsub -t 6-10 scripts/sae/train_sae_feature_generalization.sh                    
 qsub -v STAGE_GROUPS=data100k scripts/sae/cache_sae_feature_generalization.sh
 qsub -hold_jid sae_featgen_cache -t 11 -l h_rt=24:00:00 scripts/sae/train_sae_feature_generalization.sh
 qsub -hold_jid sae_featgen_cache -t 12-13 -l h_rt=48:00:00 scripts/sae/train_sae_feature_generalization.sh
-python analysis/plot_sae_feature_generalization.py
+python plotters/plot_sae_feature_generalization.py
 ```
 
 **Design.**
@@ -468,7 +468,7 @@ python analysis/plot_sae_feature_generalization.py
 - **Pool selection.**
   - Same density band as section 3, plus >= 50 projected positives at the readout.
   - `pos_density` is measured at the last token of a 32-token window
-    (`select_sae_features.py --pos-window 32`). At 128 tokens the last token is often
+    (`data_prep/select_sae_features.py --pos-window 32`). At 128 tokens the last token is often
     the document's end, which is a different population.
   - Near-duplicate labels are dropped at all-MiniLM-L6-v2 cosine >= 0.7. Paraphrases
     measured 0.65-0.82, unrelated labels ~0.15.
@@ -492,7 +492,7 @@ python analysis/plot_sae_feature_generalization.py
 
 ## 9. Prompted baseline (untrained model)
 
-The SAE analogue of the neuron track's `score_prompt_baseline.py`. The UNTRAINED
+The SAE analogue of the neuron track's `evals/score_prompt_baseline.py`. The UNTRAINED
 gemma-2-2b is asked with the trained runs' own prompts, on the same cache, test split
 and steering, for every (feature, position) of the layer x position grid plus the
 layer-9 reference runs: 53 runs per prompt arm.
@@ -501,8 +501,8 @@ layer-9 reference runs: 53 runs per prompt arm.
 qsub -N sae_pb_cache -v STAGE=cache -t 1-17 scripts/sae/score_sae_prompt_baseline.sh
 qsub -hold_jid sae_pb_cache -v PROMPT=index -t 1-27 scripts/sae/score_sae_prompt_baseline.sh
 qsub -hold_jid sae_pb_cache -v PROMPT=label -t 1-27 scripts/sae/score_sae_prompt_baseline.sh
-python analysis/plot_sae_prompt_baseline.py          # the 48 grid runs; --include-l9 adds the 5 layer-9 runs
-python analysis/plot_sae_prompt_baseline.py --from-tables outputs/plots/sae_prompt_baseline   # re-plot a synced folder
+python plotters/plot_sae_prompt_baseline.py          # the 48 grid runs; --include-l9 adds the 5 layer-9 runs
+python plotters/plot_sae_prompt_baseline.py --from-tables outputs/plots/sae_prompt_baseline   # re-plot a synced folder
 ```
 
 The figures compare the baseline with the trained SFT and joint arms on the grid only: the layer-9
@@ -510,7 +510,7 @@ reference runs are scored but left out by default.
 
 **Prompt arms.** `index` is the trained prompt. `label` names the feature by its
 Neuronpedia explanation (`scripts/sae/sweep_feature_labels.json`, from
-`fetch_sae_feature_labels.py`), as in the feature-generalization label arm. Plain
+`data_prep/fetch_sae_feature_labels.py`), as in the feature-generalization label arm. Plain
 `\n\n` replaces the learned separator token, which is random noise to an untrained model.
 
 **Readouts.** Every readout makes a hard active/inactive call scored by balanced

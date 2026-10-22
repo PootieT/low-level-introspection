@@ -160,7 +160,7 @@ fi
 # Generated, not run: it exists so resolution.py stays the single source of truth for
 # which heads a (seed, layer) maps to, instead of the selection being duplicated here.
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL}" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples 300000 \
@@ -194,7 +194,7 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
 
   # every sample passes the SAME signal list, so all 8 resolve to one cached dataset;
   # --signal-filter is what differs and is not part of the cache identity
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-1B \
       --train-dataset allenai/c4 \
@@ -234,7 +234,7 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
       $OVERWRITE
 
   # builds the cell's 8-head dataset on SAMPLE=0, no-ops for the other 7
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
   # Cache-alignment regression check once per cell (it is a property of the data
   # pipeline, so one run per dataset is enough). For attention this is the ONLY
@@ -243,14 +243,14 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
   # by one, this is where it shows. Want best offset +0, corr ~0.9999, "alignment OK".
   if [ "$SAMPLE" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $DRIFT \
       $OOD_FLAG \
       $OVERWRITE
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     $DRIFT \

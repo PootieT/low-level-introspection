@@ -83,7 +83,7 @@ SAMPLER="{\"type\":\"attention_layer_sampler\",\"signal_type\":\"attention_weigh
 
 mkdir -p experiment_configs/$EXP_GROUP
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL_TAG}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL_TAG}" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples $TRAIN_SAMPLES \
@@ -114,7 +114,7 @@ EXP_NAME="joint_${SIG}_POS${DST_POS}_gate${GATE}_${VARIANT_TAG}_kl${KL_BUDGET}_w
 CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
 echo "=== [$CELL_TAG W=$W] $EXP_NAME ==="
 
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "$EXP_NAME" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" \
@@ -142,9 +142,9 @@ python generate_experiment_config.py \
 
 # Must be a no-op: the cache is Stage 2's. If this starts building 60K examples, a
 # field that should not be part of the cache identity has become part of it.
-python cache_signals.py --config "$CONFIG"
+python data_prep/cache_signals.py --config "$CONFIG"
 
-python train_introspector_joint.py \
+python trainers/train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     --kl-anchor-target $KL_BUDGET \
@@ -155,7 +155,7 @@ python train_introspector_joint.py \
     $SMOKE_FLAG
 
 if [ "${SMOKE:-0}" != "1" ]; then
-  python score_lm_degradation.py --config "$CONFIG"
+  python evals/score_lm_degradation.py --config "$CONFIG"
 fi
 
 echo

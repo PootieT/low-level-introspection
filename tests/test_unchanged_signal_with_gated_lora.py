@@ -10,7 +10,7 @@ from src.introspector.models.signal_paths import resolve_mlp_signal_path
 from src.introspector.training.collator import LoRAGatingCollator
 from src.introspector.training.model import replace_model_with_gated_version, replace_lora_with_gated_version
 from src.introspector.utils import get_quantization_config
-from train_introspector import INTROSPECTION_SEPARATOR
+from trainers.train_introspector import INTROSPECTION_SEPARATOR
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B"
 LORA_PATH = "./test_artifacts/random_lora_model"

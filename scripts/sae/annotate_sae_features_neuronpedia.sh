@@ -19,7 +19,7 @@ for LAYER in "${LAYERS[@]}"; do
         continue
     fi
     echo "annotating layer $LAYER -> $OUT"
-    python annotate_sae_features_neuronpedia.py \
+    python data_prep/annotate_sae_features_neuronpedia.py \
         --stats "$STATS" \
         --model gemma-2-2b --layer $LAYER --width 16k --site res \
         --max-fetch ${MAX_FETCH:-200} \

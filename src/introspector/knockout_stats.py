@@ -1,5 +1,5 @@
 """
-Statistics for single-head knockouts (score_head_knockout.py and its aggregator).
+Statistics for single-head knockouts (mechanistic_analysis/score_head_knockout.py and its aggregator).
 
 Everything works on per-example PREDICTIONS, not on summary correlations, because
 every knockout is evaluated on the same examples with the same injected values: a

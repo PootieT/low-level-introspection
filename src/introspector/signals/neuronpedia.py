@@ -2,7 +2,7 @@
 tokens).
 
 Feature selection in this repo is otherwise statistics-only (density band +
-projected positives; see `select_sae_features.py`). This module attaches the
+projected positives; see `data_prep/select_sae_features.py`). This module attaches the
 *semantic* side -- the auto-interp explanation, its (best-effort) score, and the
 feature's top-activating tokens -- so downstream selection can enforce "has an
 explanation", "high interp score when available", and can build a concept-probe

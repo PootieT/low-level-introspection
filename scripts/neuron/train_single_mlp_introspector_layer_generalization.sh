@@ -32,7 +32,7 @@
 # INDEX. Chosen by scanning, not picked: index i at layer 0 and at layer 12 are
 #   unrelated neurons, and an arbitrary index is near-silent somewhere -- which would
 #   read as an undefined correlation at that layer, indistinguishable from a
-#   generalization failure. select_layer_gen_index.py ranks candidates by their
+#   generalization failure. data_prep/select_layer_gen_index.py ranks candidates by their
 #   WEAKEST layer's activation std. Every task runs the scan (its pool is cached once;
 #   the choice is deterministic), so the whole array agrees on the index.
 #
@@ -190,7 +190,7 @@ for i in $(echo "$CANDIDATE_INDICES" | tr ',' ' '); do
   SCAN_SIGNALS="${SCAN_SIGNALS:+$SCAN_SIGNALS,}$(signals_for "$ALL_LAYERS" "$i")"
 done
 SCAN_CONFIG=experiment_configs/$EXP_GROUP/_scan_POS${TOKEN_POS}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_scan_POS${TOKEN_POS}" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" \
@@ -204,14 +204,14 @@ python generate_experiment_config.py \
     --prompt-type $PROMPT_TYPE --precision 3 \
     --cache-dir data --output-dir outputs/runs/$EXP_GROUP \
     --output "$SCAN_CONFIG"
-python cache_signals.py --config "$SCAN_CONFIG" $OVERWRITE
-INDEX=$(python select_layer_gen_index.py --config "$SCAN_CONFIG" | tail -1)
+python data_prep/cache_signals.py --config "$SCAN_CONFIG" $OVERWRITE
+INDEX=$(python data_prep/select_layer_gen_index.py --config "$SCAN_CONFIG" | tail -1)
 echo "chosen index: $INDEX"
 
 # ---- step 2: the POOL cache (chosen index x all 15 layers) --------------------------
 POOL_SIGNALS=$(signals_for "$ALL_LAYERS" "$INDEX")
 POOL_CONFIG=experiment_configs/$EXP_GROUP/_pool_i${INDEX}_POS${TOKEN_POS}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_pool_i${INDEX}_POS${TOKEN_POS}" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" \
@@ -225,11 +225,11 @@ python generate_experiment_config.py \
     --prompt-type $PROMPT_TYPE --precision 3 \
     --cache-dir data --output-dir outputs/runs/$EXP_GROUP \
     --output "$POOL_CONFIG"
-python cache_signals.py --config "$POOL_CONFIG" $OVERWRITE
+python data_prep/cache_signals.py --config "$POOL_CONFIG" $OVERWRITE
 
 # ---- step 3: this row's run ----------------------------------------------------------
 TRAIN_SIGNALS=$(signals_for "$LAYERS" "$INDEX")
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "$EXP_NAME" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" \
@@ -264,9 +264,9 @@ json.dump({"name": "$NAME", "group": "$R_GROUP", "index": $INDEX,
           open("$RUN_DIR/run_spec.json", "w"), indent=2)
 PY
 
-python cache_signals.py --config "$CONFIG" $OVERWRITE
+python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
-python train_introspector_joint.py \
+python trainers/train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     --force-drift-eval \
@@ -275,5 +275,5 @@ python train_introspector_joint.py \
     $OVERWRITE
 
 # Re-run ONLY the generalization eval on an existing checkpoint:
-#   python train_introspector_joint.py --config "$CONFIG" --joint-loss-weight $W \
+#   python trainers/train_introspector_joint.py --config "$CONFIG" --joint-loss-weight $W \
 #       --neuron-gen-only --neuron-gen-pool-config "$POOL_CONFIG"

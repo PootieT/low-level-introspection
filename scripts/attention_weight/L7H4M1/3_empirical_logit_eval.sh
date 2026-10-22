@@ -87,7 +87,7 @@ json.dump(cfg, open(dst, "w"), indent=2)
 PY
   echo
   echo "=== [W=$W] $EXP_NAME  <-  $CKPT ==="
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --interv-eval-only \
       --checkpoint "$CKPT" \

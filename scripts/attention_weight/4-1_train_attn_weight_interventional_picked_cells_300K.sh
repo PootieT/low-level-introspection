@@ -122,7 +122,7 @@ SAMPLER="{\"type\":\"attention_layer_sampler\",\"signal_type\":\"attention_weigh
 
 mkdir -p experiment_configs/$EXP_GROUP
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL_TAG}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL_TAG}" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples $TRAIN_SAMPLES \
@@ -152,7 +152,7 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
   echo
   echo "=== [$CELL_TAG $REGIME W=$W sample $SAMPLE] $EXP_NAME ==="
 
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-1B \
       --train-dataset allenai/c4 --train-dataset-split "train" \
@@ -188,11 +188,11 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
     echo "FATAL: no cache at $CACHE_DIR -- qsub scripts/attention_weight/2-0_cache_attn_weight_300K.sh first" >&2
     exit 1
   fi
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
   if [ "$SAMPLE" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       --scale-sweep "$SCALE_SWEEP" \
@@ -201,7 +201,7 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
       $OOD_FLAG \
       $OVERWRITE
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $KL_FLAG \
@@ -213,7 +213,7 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
   # there for an error bar; the anchored arm only needs a spot check.
   if [ "$REGIME" = "unanchored" ]; then LM_SCORE_N=2; else LM_SCORE_N=1; fi
   if [ "$SAMPLE" -lt "$LM_SCORE_N" ]; then
-    python score_lm_degradation.py --config "$CONFIG"
+    python evals/score_lm_degradation.py --config "$CONFIG"
   fi
 done
 
@@ -221,6 +221,6 @@ echo
 echo "=========================================================="
 echo "STAGE 4 @ ${SAMPLE_TAG} (cell=$CELL_TAG, $REGIME) DONE. Next:"
 echo "  attribution in dose mode (an injected value now exists):"
-echo "  python attribute_attention_weight_readout.py --config <config> --mode dose"
+echo "  python mechanistic_analysis/attribute_attention_weight_readout.py --config <config> --mode dose"
 echo "End date : $(date)"
 echo "=========================================================="

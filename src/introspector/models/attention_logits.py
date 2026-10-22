@@ -101,7 +101,7 @@ def introspection_attention_forward(
     # DO NOT fold these three statements back into the one-liner they came from
     # (`F.softmax(..., dtype=torch.float32).to(query.dtype)`). Split this way the kernel
     # sequence is identical when `wport is None`, so every attention_score run stays
-    # bit-for-bit what it was -- that is what validate_attention_logits.py checks and
+    # bit-for-bit what it was -- that is what tests/validate_attention_logits.py checks and
     # what keeps the A sweep's cached numbers comparable to new ones.
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)  # [B, Hq, L, L] fp32
     wport = getattr(module, PORT_ATTR_WEIGHT, None)
@@ -130,7 +130,7 @@ AttentionInterface.register(ATTN_IMPL_NAME, introspection_attention_forward)
 # None, add no mask, and run FULLY BIDIRECTIONAL attention -- every token attending to
 # its own future -- while raising nothing and producing plausible-looking numbers.
 # `eager_mask` is the additive float mask the eager implementation uses, which is exactly
-# what the math above expects. validate_attention_logits.py is what caught this.
+# what the math above expects. tests/validate_attention_logits.py is what caught this.
 AttentionMaskInterface.register(ATTN_IMPL_NAME, eager_mask)
 
 
@@ -323,7 +323,7 @@ class AttentionWeightPort(AttentionLogitPort):
     logit(p_j) = z_j - log R; moving z_j alone leaves R fixed, so logit(p_j) moves by
     exactly the same delta. (Full derivation: md/attention_weight/
     1_attention_weight_experiment_plan.md, section 3-2 (a)-(c). Checked numerically by
-    validate_attention_weights.py, block EQUIVALENCE.)
+    tests/validate_attention_weights.py, block EQUIVALENCE.)
 
     That equality is what lets the A and P experiments be read side by side: both
     intervene by moving one attention logit and letting the row follow.

@@ -18,7 +18,7 @@
 # Migrated from scripts_old_with_off_by_one_bug/. What changed, and why:
 #
 #  BOS / OFF-BY-ONE  preprocess_example used to tokenize without BOS while
-#     cache_signals.py tokenized with it, so the intervention hook injected into
+#     data_prep/cache_signals.py tokenized with it, so the intervention hook injected into
 #     the token AFTER the one the prompt names, and the live neuron matched the
 #     cached target at only ~0.81. Fixed in preprocess_example; every run here
 #     passes --force-drift-eval so the alignment check runs as a regression test
@@ -104,7 +104,7 @@ CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
 echo "$EXP_NAME"
 
 ### generate experiment config first as JSON
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "$EXP_NAME" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 \
@@ -143,12 +143,12 @@ python generate_experiment_config.py \
 ### cache activations and generate dataset
 # no-op once any arm of the sweep has built it (the six LRs resolve to one
 # canonical dataset name); grep the config for the derived dataset_name to see where
-python cache_signals.py --config "$CONFIG" $OVERWRITE
+python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
 ## train introspector
 # --force-drift-eval: runs anyway when GATE=off, but keep it so the gated arm also
 # reports the cache-alignment check
-python train_introspector_joint.py \
+python trainers/train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     --force-drift-eval \
@@ -158,7 +158,7 @@ python train_introspector_joint.py \
 
 # post training analysis of each checkpoint (same config => same gating as training)
 #for CK in outputs/runs/$EXP_GROUP/$EXP_NAME/checkpoint-*; do
-#  python train_introspector_joint.py \
+#  python trainers/train_introspector_joint.py \
 #     --config "$CONFIG" \
 #     --joint-loss-weight $W \
 #     --force-drift-eval \
@@ -167,7 +167,7 @@ python train_introspector_joint.py \
 #done
 
 # evaluate how far model+LoRA has drifted from original model (LM Loss)
-#python score_lm_degradation.py --config "$CONFIG"
+#python evals/score_lm_degradation.py --config "$CONFIG"
 
 # evaluate how far model+LoRA has drifted from original model (small benchmark)
-#python score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200
+#python evals/score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200

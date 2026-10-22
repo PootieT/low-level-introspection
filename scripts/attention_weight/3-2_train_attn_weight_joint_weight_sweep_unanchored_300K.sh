@@ -27,10 +27,10 @@
 # default and the trainer runs with kl_anchor_on=False. With the gate off the adapter is
 # live over the input text, so the KL each W arm reaches IS the LM cost of that W -- the
 # same reading as 4-1's unanchored regime. Runs are tagged `klnone` (as in 4-1), which
-# analysis/plot_weight_sweep.py's KL_RE does not match, so their kl_target is NaN.
+# plotters/plot_weight_sweep.py's KL_RE does not match, so their kl_target is NaN.
 #
-# GATE OFF is not a flag: generate_experiment_config.py is not given
-# --disable-adapter-in-input, so train_introspector_joint.py picks UngatedCollator.
+# GATE OFF is not a flag: data_prep/generate_experiment_config.py is not given
+# --disable-adapter-in-input, so trainers/train_introspector_joint.py picks UngatedCollator.
 #
 # CACHES COME FROM 2-0, and this script refuses to build one, for the same race reason as
 # 3-1 (six W arms of a cell run concurrently against one cell dataset). The KL flags do not
@@ -122,7 +122,7 @@ SAMPLER="{\"type\":\"attention_layer_sampler\",\"signal_type\":\"attention_weigh
 
 mkdir -p experiment_configs/$EXP_GROUP
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL_TAG}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL_TAG}" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples $TRAIN_SAMPLES \
@@ -152,7 +152,7 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
   echo
   echo "=== [$CELL_TAG W=$W sample $SAMPLE] $EXP_NAME ==="
 
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-1B \
       --train-dataset allenai/c4 --train-dataset-split "train" \
@@ -189,12 +189,12 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
     echo "FATAL: no cache at $CACHE_DIR -- qsub scripts/attention_weight/2-0_cache_attn_weight_300K.sh first" >&2
     exit 1
   fi
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
   if [ "$SAMPLE" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
   # No --kl-anchor-target / --require-kl-anchor: this is the unanchored arm.
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       --scale-sweep "$SCALE_SWEEP" \
@@ -203,7 +203,7 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
 
   # LM cost as a function of W. Unanchored, nothing holds the KL down, so this measures
   # what each W actually costs the model -- score every head for the error bar.
-  python score_lm_degradation.py --config "$CONFIG"
+  python evals/score_lm_degradation.py --config "$CONFIG"
 done
 
 echo

@@ -2,7 +2,7 @@
 Bulk-delete checkpoint artifacts, optionally KEEPING a few runs per grid cell.
 
 Sweeps produce one checkpoint per (cell x neuron), and the adapter weights are the
-bulk of it -- but the weight-space analyses (analysis/compare_lora_weight_patterns.py)
+bulk of it -- but the weight-space analyses (plotters/compare_lora_weight_patterns.py)
 need adapter_model.safetensors for at least one neuron per cell. `keep_per_cell`
 keeps that many and deletes the rest.
 

@@ -27,7 +27,7 @@
 # which is exactly equal to shifting the single pre-softmax logit z_j by
 # logit(t) - logit(p_j). So this is the SAME KIND of intervention the attention-logit
 # experiment performed, and the two sets of numbers can be read side by side.
-# validate_attention_weights.py (block EQUIVALENCE) checks that equality numerically.
+# tests/validate_attention_weights.py (block EQUIVALENCE) checks that equality numerically.
 #
 # WHERE THE INJECTED VALUES COME FROM. Not from the built-in gaussian/uniform/extreme
 # branches -- all three leave (0,1), and on a cell with mean ~1e-3 gaussian draws
@@ -39,7 +39,7 @@
 #
 # CAUTION -- THE SATURATED FRACTION IS NOT ACTUALLY REPORTED. The sampler counts clamped
 # draws (sample.n_drawn / n_clamped, model.py:336-347) and model.py's docstring says the
-# scale sweep reports them, but interventional_scale_sweep (train_introspector_joint.py
+# scale sweep reports them, but interventional_scale_sweep (trainers/train_introspector_joint.py
 # :1240) never reads those counters: the CSV is only
 # scale,head_corr,ceiling_corr,inj_std,best_alpha. So at a large scale this file cannot
 # distinguish "the model read the value" from "the model learned the clamp". The one
@@ -137,7 +137,7 @@ SAMPLER="{\"type\":\"attention_layer_sampler\",\"signal_type\":\"attention_weigh
 
 mkdir -p experiment_configs/$EXP_GROUP
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL_TAG}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL_TAG}" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples $TRAIN_SAMPLES \
@@ -167,7 +167,7 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
   echo
   echo "=== [$CELL_TAG $REGIME W=$W sample $SAMPLE] $EXP_NAME ==="
 
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-1B \
       --train-dataset allenai/c4 --train-dataset-split "train" \
@@ -192,11 +192,11 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
       --output "$CONFIG" \
       $OVERWRITE
 
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
   if [ "$SAMPLE" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       --scale-sweep "$SCALE_SWEEP" \
@@ -205,7 +205,7 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
       $OOD_FLAG \
       $OVERWRITE
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $KL_FLAG \
@@ -217,7 +217,7 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
   # there for an error bar; the anchored arm only needs a spot check.
   if [ "$REGIME" = "unanchored" ]; then LM_SCORE_N=2; else LM_SCORE_N=1; fi
   if [ "$SAMPLE" -lt "$LM_SCORE_N" ]; then
-    python score_lm_degradation.py --config "$CONFIG"
+    python evals/score_lm_degradation.py --config "$CONFIG"
   fi
 done
 
@@ -225,6 +225,6 @@ echo
 echo "=========================================================="
 echo "STAGE 4 (cell=$CELL_TAG, $REGIME) DONE. Next:"
 echo "  attribution in dose mode (an injected value now exists):"
-echo "  python attribute_attention_weight_readout.py --config <config> --mode dose"
+echo "  python mechanistic_analysis/attribute_attention_weight_readout.py --config <config> --mode dose"
 echo "End date : $(date)"
 echo "=========================================================="

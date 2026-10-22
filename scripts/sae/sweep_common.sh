@@ -56,7 +56,7 @@ make_config() {
     local EXP_NAME="saeJoint_${SIG}_POS${POS}_gateoff_w${WTAG}"
     local CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
     rm -f "$CONFIG"
-    python generate_experiment_config.py \
+    python data_prep/generate_experiment_config.py \
         --experiment-name "$EXP_NAME" \
         --model google/gemma-2-2b \
         --objective detection --detection-balance-pos-frac 0.5 \

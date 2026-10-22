@@ -24,7 +24,7 @@ one.
 SHARDING is 1-based to match SGE's $SGE_TASK_ID, and contiguous rather than strided so
 a partial array leaves a contiguous prefix of the sweep done.
 
-NOT analysis/run_catalog.py, which is the other half of the same story and should be
+NOT plotters/run_catalog.py, which is the other half of the same story and should be
 used instead wherever it fits. That module locates runs by their OUTPUT directories and
 reads the metrics they already produced (corr, drift, KL) into one cross-sweep frame,
 with pandas as its only dependency, so it works on a laptop holding nothing but synced

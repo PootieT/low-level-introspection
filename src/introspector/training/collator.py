@@ -27,7 +27,7 @@ class LoRAGatingCollator(DataCollatorForSeq2Seq):
         self.tokenizer.padding_side = "left" if self.for_prediction else "right"
         # Gate-OFF training builds examples WITHOUT frozen_input_len (see
         # make_preprocess(return_frozen_input_len=disable_adapter_in_input) in
-        # train_sae_detector.py). No key => no gating: emit a plain batch.
+        # trainers/train_sae_detector.py). No key => no gating: emit a plain batch.
         if not features or "frozen_input_len" not in features[0]:
             return super().__call__(features)
         input_lens = [f.pop("frozen_input_len") for f in features]

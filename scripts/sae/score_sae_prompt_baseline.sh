@@ -11,7 +11,7 @@
 #$ -t 1-27
 
 # ============================================================================
-# PROMPTED BASELINE for SAE detection (score_sae_prompt_baseline.py): the UNTRAINED
+# PROMPTED BASELINE for SAE detection (evals/score_sae_prompt_baseline.py): the UNTRAINED
 # gemma-2-2b asked with the trained runs' prompts, over every (feature, position) of
 #   - the layer x position grid   (sweep_features.txt: 4 layers x 4 positions x 3 features = 48)
 #   - the layer-9 reference runs  (5 judged features at position -1)
@@ -38,7 +38,7 @@
 # endogenous test split and the interventional (on/off) test, the no-prompt control,
 # the probe learning curve over active rows, and the steering-scale sweep.
 #
-# Aggregate: python analysis/plot_sae_prompt_baseline.py
+# Aggregate: python plotters/plot_sae_prompt_baseline.py
 # ============================================================================
 
 echo "=========================================================="
@@ -69,7 +69,7 @@ make_l9_config() {
     local LIST; LIST=$(IFS=,; echo "${L9_FEATURES[*]}")
     local CONFIG=experiment_configs/$L9_GROUP/saeJoint_${SIG}_POS-1_gateoff_w09.json
     rm -f "$CONFIG"
-    python generate_experiment_config.py \
+    python data_prep/generate_experiment_config.py \
         --experiment-name "saeJoint_${SIG}_POS-1_gateoff_w09" \
         --model google/gemma-2-2b \
         --objective detection --detection-balance-pos-frac 0.5 \
@@ -116,7 +116,7 @@ if [ "$STAGE" = "cache" ]; then
     else
         echo "task beyond the $((n_cells + 1)) caches; nothing to do"; exit 0
     fi
-    python cache_signals.py --config "$CONFIG"
+    python data_prep/cache_signals.py --config "$CONFIG"
     echo "Done: $(date)"; exit 0
 fi
 
@@ -128,7 +128,7 @@ done
 LABEL_FLAGS=""
 if [ "$PROMPT" = "label" ]; then LABEL_FLAGS="--labels-file $LABELS"; fi
 echo "prompt=$PROMPT  runs=${#CONFIGS[@]}"
-python score_sae_prompt_baseline.py --configs "${CONFIGS[@]}" \
+python evals/score_sae_prompt_baseline.py --configs "${CONFIGS[@]}" \
     --prompt "$PROMPT" $LABEL_FLAGS \
     --baseline-root outputs/runs/sae_prompt_baseline \
     --k-values 0,1,2,4,8,16 --no-prompt-control --skip-existing

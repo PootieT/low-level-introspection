@@ -162,7 +162,7 @@ def dataset_identity(config) -> dict[str, Any]:
     with different identities must not. Deliberately excludes experiment_name,
     output_dir, and every training hyperparameter.
 
-    NOTE: also excludes the tokenization convention, which cache_signals.py fixes
+    NOTE: also excludes the tokenization convention, which data_prep/cache_signals.py fixes
     (add_special_tokens=True, i.e. BOS). If that ever becomes configurable it MUST
     be added here, or old and new caches will collide.
     """

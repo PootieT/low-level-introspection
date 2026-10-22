@@ -4,7 +4,7 @@ Classify attention heads by how they take part in moving the introspected value.
 WHY THIS EXISTS
 ---------------
 Ranking heads by their dose-response slope conflates heads that do very different
-things. Two properties are measured separately by trace_mover_head.py, and a head's
+things. Two properties are measured separately by mechanistic_analysis/trace_mover_head.py, and a head's
 role is the combination:
 
   attention sensitivity   does the head's attention to the introspected token t MOVE
@@ -39,8 +39,8 @@ attention, value fetched from t through the OV circuit. It is the only kind of h
 that can carry the signal at natural magnitudes, where a threshold never fires.
 
 This module is the ONE place those definitions live. The Stage B aggregator
-(analysis/plot_head_taxonomy.py) and the Stage C ablation grouping
-(score_head_ablation.py) both call classify_heads, so a head cannot be a "transporter"
+(plotters/plot_head_taxonomy.py) and the Stage C ablation grouping
+(mechanistic_analysis/score_head_ablation.py) both call classify_heads, so a head cannot be a "transporter"
 in one figure and a "re_reader" in the other.
 
 THRESHOLDS are arguments, not constants buried in code, and every one is reported

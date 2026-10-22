@@ -15,7 +15,7 @@
 # Re-runs the collaborator's layer-9 selection on SCC (scripts/sae/README.md section 3),
 # with two additions for this experiment:
 #
-#   1. Gate 0 (validate_sae_hook.py), then density stats over 10M C4 tokens at 128-token
+#   1. Gate 0 (tests/validate_sae_hook.py), then density stats over 10M C4 tokens at 128-token
 #      length -- the SAME band as the layer-9 selection (density in [1e-3, 1e-2]) -- but
 #      pos_density measured at the last token of a 32-token WINDOW (--pos-window 32),
 #      i.e. where the training caches read out. 10M rather than 2M tokens: the
@@ -54,7 +54,7 @@ POOL=$OUT_DIR/pool_layer${LAYER}.json
 mkdir -p log $OUT_DIR
 
 if [ "$STAGE" = "all" ] || [ "$STAGE" = "select" ]; then
-    python validate_sae_hook.py --model google/gemma-2-2b \
+    python tests/validate_sae_hook.py --model google/gemma-2-2b \
         --sae-release gemma-scope-2b-pt-res-canonical --layer $LAYER --width 16k --site res \
         | tee log/validate_sae_hook_res${LAYER}.txt
     if ! grep -qE "^[[:space:]]*PASS \(smell test\)" log/validate_sae_hook_res${LAYER}.txt; then
@@ -63,7 +63,7 @@ if [ "$STAGE" = "all" ] || [ "$STAGE" = "select" ]; then
     if [ -f "$STATS" ]; then
         echo "stats exist: $STATS"
     else
-        python select_sae_features.py \
+        python data_prep/select_sae_features.py \
             --model google/gemma-2-2b \
             --sae-release gemma-scope-2b-pt-res-canonical --layer $LAYER --width 16k --site res \
             --n-tokens 10000000 --max-seq-length 128 \
@@ -75,7 +75,7 @@ if [ "$STAGE" = "all" ] || [ "$STAGE" = "select" ]; then
     if [ -f "$CANDS" ]; then
         echo "candidates exist: $CANDS"
     else
-        python build_sae_featgen_pool.py candidates \
+        python data_prep/build_sae_featgen_pool.py candidates \
             --stats "$STATS" --layer $LAYER --include $JUDGED \
             --n-train-texts 150000 --min-positives 50 --n-candidates 400 --seed 0 \
             --out "$CANDS"
@@ -86,11 +86,11 @@ if [ "$STAGE" = "all" ] || [ "$STAGE" = "label" ]; then
     if [ -f "$ANNOT" ]; then
         echo "annotations exist: $ANNOT"
     else
-        python annotate_sae_features_neuronpedia.py \
+        python data_prep/annotate_sae_features_neuronpedia.py \
             --stats "$CANDS" --model gemma-2-2b --layer $LAYER --width 16k --site res \
             --out "$ANNOT"
     fi
-    python build_sae_featgen_pool.py build \
+    python data_prep/build_sae_featgen_pool.py build \
         --annotated "$ANNOT" --layer $LAYER --include $JUDGED \
         --pool-size 200 --sim-threshold 0.7 --seed 0 \
         --out "$POOL"

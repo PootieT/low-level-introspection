@@ -43,7 +43,7 @@ SIG=${FEATS[$K]}
 CONFIG=$(make_config "$SIG" "$POS" "$W")
 echo "=== F$((K+1)) $SIG  layer=$LAYER pos=$POS W(endo)=$W -> $CONFIG ==="
 
-python cache_signals.py --config "$CONFIG"          # no-op: built by cache_sae_sweep.sh
-python train_sae_detector_joint.py --config "$CONFIG" --joint-loss-weight $W \
+python data_prep/cache_signals.py --config "$CONFIG"          # no-op: built by cache_sae_sweep.sh
+python trainers/train_sae_detector_joint.py --config "$CONFIG" --joint-loss-weight $W \
     --kl-anchor-target $KL_TARGET --force-drift-eval
 echo "Done: $(date)"

@@ -48,7 +48,7 @@ OUT=data/sae_stats/gemma2-2b_res${LAYER}_pos${POS}_16k.parquet
 
 # Gate 0 once per layer (only on the selection pass): is the SAE on the right residual?
 if [ "$POS" = "-1" ]; then
-    python validate_sae_hook.py --model google/gemma-2-2b \
+    python tests/validate_sae_hook.py --model google/gemma-2-2b \
         --sae-release gemma-scope-2b-pt-res-canonical --layer $LAYER --width 16k --site res \
         | tee log/validate_sae_hook_res${LAYER}.txt
     if ! grep -qE "^[[:space:]]*PASS \(smell test\)" log/validate_sae_hook_res${LAYER}.txt; then   # verdict line only, not the printed contexts
@@ -60,7 +60,7 @@ if [ -f "$OUT" ]; then
     echo "stats already exist for layer $LAYER pos $POS ($OUT); skipping."
 else
     echo "computing density stats for layer $LAYER pos $POS -> $OUT"
-    python select_sae_features.py \
+    python data_prep/select_sae_features.py \
         --model google/gemma-2-2b \
         --sae-release gemma-scope-2b-pt-res-canonical \
         --layer $LAYER --width 16k --site res \

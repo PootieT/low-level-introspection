@@ -19,10 +19,10 @@
 # cd /projectnb/llamagrp/peter/low-level-introspection
 # qsub scripts/neuron/train_single_mlp_introspector_joint_sweep_layer_token_llama323b_hyper_tuned.sh
 # # once runs finish (the SFT arm at the tuned LR comes later and joins the same table):
-# python analysis/compare_sft_vs_joint.py --model-suffix _llama323b_hyper_tuned
+# python plotters/compare_sft_vs_joint.py --model-suffix _llama323b_hyper_tuned
 # <<< SUBMIT
 #
-# WHY. The LR sweep (train_single_mlp_introspector_joint_lr_sweep.sh, analysis/
+# WHY. The LR sweep (train_single_mlp_introspector_joint_lr_sweep.sh, plotters/
 # plot_lr_sweep.py) found the 1B learning rate does not transfer: under the KL 0.1
 # anchor, 1e-4 is at or near the best interventional corr in every swept cell of both
 # 3B and 8B, and 2e-4 collapses training at 8B. So this re-runs the grid at 1e-4.
@@ -37,7 +37,7 @@
 #   - LR 1e-4 (was 5e-5)
 #   - a new run group, mlp_joint_grid_layer_token_llama323b_hyper_tuned. The run names do
 #     not carry the LR, so in the old group every run would be skipped as already
-#     done. analysis/compare_sft_vs_joint.py knows 'llama323b_hyper_tuned' as its own grid
+#     done. plotters/compare_sft_vs_joint.py knows 'llama323b_hyper_tuned' as its own grid
 #   - OVERWRITE is empty, so resubmitting skips finished runs instead of retraining
 #
 # CAVEAT from the sweep: at 8B L4 pos-1 one of the two tuning neurons collapsed at 1e-4
@@ -107,7 +107,7 @@ echo "cell=$CELL_TAG regime=$KL_TAG lr=$LR"
 
 ## ---- resolve this layer's neuron set ONCE (identical at every position) ----
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL_TAG}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL_TAG}" \
     --model meta-llama/Llama-3.2-3B \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples 300000 \
@@ -141,7 +141,7 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
 
   # every sample passes the SAME neuron list, so all 5 share one cached dataset;
   # --signal-filter is not part of the cache identity
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-3B \
       --train-dataset allenai/c4 \
@@ -180,16 +180,16 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
       $OVERWRITE
 
   # builds the cell's dataset on first use (or finds the existing one), no-ops afterwards
-  python cache_signals.py --config "$CONFIG"
+  python data_prep/cache_signals.py --config "$CONFIG"
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $KL_FLAG \
       $OOD_FLAG \
       $OVERWRITE
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $KL_FLAG \
@@ -200,11 +200,11 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
   # LM cost. Both scorers skip when their output exists, so resubmitting a partially
   # finished task is cheap.
   if [ "$SAMPLE" -lt "$LM_SCORE_N" ]; then
-    python score_lm_degradation.py --config "$CONFIG"
+    python evals/score_lm_degradation.py --config "$CONFIG"
   fi
   # benchmarks are far more expensive and vary with the training config, not the
   # neuron -> one per cell
   if [ "$SAMPLE" -eq 0 ]; then
-    python score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200
+    python evals/score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200
   fi
 done

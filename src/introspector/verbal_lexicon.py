@@ -1,6 +1,6 @@
 """
 Reading an UNTRAINED model's written answer to the SAE detection prompt as active /
-inactive / neither (score_sae_prompt_baseline.py, verbal@k and the logit readouts).
+inactive / neither (evals/score_sae_prompt_baseline.py, verbal@k and the logit readouts).
 
 The untrained model never writes "active"/"inactive" after these prompts, so a fixed
 paraphrase list stands in for the trained runs' two answer words. The lists were frozen

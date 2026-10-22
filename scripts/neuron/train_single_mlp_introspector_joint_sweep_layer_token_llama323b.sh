@@ -121,7 +121,7 @@ echo "cell=$CELL_TAG regime=$REGIME"
 
 ## ---- resolve this layer's neuron set ONCE (identical at every position/regime) ----
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL_TAG}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL_TAG}" \
     --model meta-llama/Llama-3.2-3B \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples 300000 \
@@ -155,7 +155,7 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
 
   # every sample passes the SAME neuron list, so all 5 share one cached dataset (and
   # both regimes share it too); --signal-filter is not part of the cache identity
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-3B \
       --train-dataset allenai/c4 \
@@ -194,16 +194,16 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
 
   # builds the cell's 5-neuron dataset on first use, no-ops afterwards (shared by
   # both regimes, so the second array task for this cell never re-caches)
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $KL_FLAG \
       $OOD_FLAG \
       $OVERWRITE
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $KL_FLAG \
@@ -214,11 +214,11 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
   # LM cost. Both scorers skip when their output exists, so resubmitting a partially
   # finished task is cheap.
   if [ "$SAMPLE" -lt "$LM_SCORE_N" ]; then
-    python score_lm_degradation.py --config "$CONFIG"
+    python evals/score_lm_degradation.py --config "$CONFIG"
   fi
   # benchmarks are far more expensive and vary with the training config, not the
   # neuron -> one per cell
   if [ "$SAMPLE" -eq 0 ]; then
-    python score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200
+    python evals/score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200
   fi
 done

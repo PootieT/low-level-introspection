@@ -30,7 +30,7 @@ if [ ! -f "$ANN" ]; then
     exit 1
 fi
 
-python generate_sae_steering_samples.py \
+python data_prep/generate_sae_steering_samples.py \
     --annotated "$ANN" \
     --model google/gemma-2-2b \
     --sae-release gemma-scope-2b-pt-res-canonical \

@@ -1,6 +1,6 @@
 """
 Attention-head knockout machinery shared by the ablation analyses
-(score_head_ablation.py, score_head_knockout.py).
+(mechanistic_analysis/score_head_ablation.py, mechanistic_analysis/score_head_knockout.py).
 
   HeadAblator     forward_pre hooks on every o_proj that overwrite selected heads'
                   slices with a per-position-bucket mean (or zero), optionally only
@@ -286,8 +286,8 @@ def successful_train_examples(run, args):
     """
     from datasets import load_from_disk
     from src.introspector.dataset_utils import apply_signal_filter
-    from train_introspector import drop_invalid_positions
-    from trace_introspection_circuit import endogenous_predictions
+    from trainers.train_introspector import drop_invalid_positions
+    from mechanistic_analysis.trace_introspection_circuit import endogenous_predictions
     raw = apply_signal_filter(load_from_disk(str(run.config.dataset_cache_dir / "train")),
                               run.config.signal_filter, "train(mean cache)")
     if run.is_multi_locale:

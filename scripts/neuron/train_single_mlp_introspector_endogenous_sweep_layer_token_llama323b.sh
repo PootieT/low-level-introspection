@@ -19,13 +19,13 @@
 # ONE array task = one (layer, position) cell; the 10 neurons run inside it, so a
 # cell's dataset is built once and reused 10 times.
 #
-# W=1.0 => pure endogenous. train_introspector_joint.py now SKIPS the forward whose
+# W=1.0 => pure endogenous. trainers/train_introspector_joint.py now SKIPS the forward whose
 # weight is zero, so this costs exactly what a single-objective trainer costs, and
 # the interventional test still runs afterwards -- where, with no interventional
 # training, it measures CONTEXT BYPASS: how much of the endogenous score survives
 # when the reported value is replaced by an injected one. That number is the w=1
 # endpoint of the pareto and is why this goes through the joint script rather than
-# train_introspector_with_intervention.py --no-intervention.
+# trainers/train_introspector_with_intervention.py --no-intervention.
 #
 # NEURON SELECTION. The old sweep's `"seed":21` was never read -- resolution.py drew
 # from the global RNG -- so every config generation picked a DIFFERENT neuron, and
@@ -112,7 +112,7 @@ SAMPLER="{\"type\":\"uniform_layer_sampler\",\"signal_type\":\"mlp\",\"layers\":
 # generated, not run: it exists so resolution.py stays the single source of truth for
 # which neurons a (seed, layer) maps to, instead of the selection being duplicated here
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL}" \
     --model meta-llama/Llama-3.2-3B \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples 300000 \
@@ -146,7 +146,7 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
 
   # every sample passes the SAME 10-signal list, so all 10 resolve to one cached
   # dataset; --signal-filter is what differs and is not part of the cache identity
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-3B \
       --train-dataset allenai/c4 \
@@ -184,20 +184,20 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
       $OVERWRITE
 
   # builds the cell's 10-neuron dataset on SAMPLE=0, no-ops for the other 9
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
   # alignment regression check once per cell rather than on all 640 runs (it is a
   # property of the data pipeline, so one run per dataset is enough)
   if [ "$SAMPLE" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $DRIFT \
       $OOD_FLAG \
       $OVERWRITE
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     $DRIFT \

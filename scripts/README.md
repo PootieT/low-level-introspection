@@ -9,7 +9,7 @@ reuse — migrate a script into this directory rather than running it in place.
 
 ## Conventions for scripts in this directory
 
-- **No `--dataset-name`.** `generate_experiment_config.py` derives the cache key from
+- **No `--dataset-name`.** `data_prep/generate_experiment_config.py` derives the cache key from
   the fields that determine the data plus an identity hash, so runs differing only in
   hyperparameters share one dataset and runs differing in content can never collide.
   Pass an explicit name only to reuse a cache built before this existed.
@@ -38,24 +38,24 @@ reuse — migrate a script into this directory rather than running it in place.
 | `neuron/train_single_mlp_introspector_endogenous_sweep_layer_token.sh` | endogenous only (`W=1.0`): 8 layers x 8 positions x 5 neurons x {gate on, gate off}; the SFT baseline the joint grid is compared against |
 | `neuron/train_single_mlp_introspector_joint_weight_sweep.sh` | joint-loss weight `W` at 3 (layer, position, KL-budget) cells x 5 neurons = 90 runs; fixes `W` for the main grid and gives the endogenous-vs-interventional pareto with error bars |
 | `neuron/train_single_mlp_introspector_joint_sweep_layer_token.sh` | MAIN GRID: 8 layers x 8 positions x 5 neurons in two cost regimes (KL budget 0.1, and unanchored for the ceiling + measured cost) = 640 runs |
-| `neuron/score_prompt_baseline_layer_token.sh` | PROMPTED BASELINE over the main grid (320 runs, 64 tasks, no training): the untrained model asked with the grid's prompts, ridge probes on its final hidden state pooled over k=0..16 greedily generated tokens; endo + joint probes, verbal readout, no-prompt control, OOD. `MODE=lc` is the probe learning-curve pilot. Aggregate with `analysis/plot_prompt_baseline.py` |
+| `neuron/score_prompt_baseline_layer_token.sh` | PROMPTED BASELINE over the main grid (320 runs, 64 tasks, no training): the untrained model asked with the grid's prompts, ridge probes on its final hidden state pooled over k=0..16 greedily generated tokens; endo + joint probes, verbal readout, no-prompt control, OOD. `MODE=lc` is the probe learning-curve pilot. Aggregate with `plotters/plot_prompt_baseline.py` |
 | `sae/precompute_sae_feature_stats.sh` | per-layer SAE feature density stats (one task per layer, skips existing); the sweep's feature picker needs these to avoid dead/punctuation features |
 | `sae/train_single_sae_introspector_sweep_layer_position.sh` | SAE DETECTION grid: 8 layers x 8 positions x 5 features x {gate on, gate off} = 128 cells; the SAE analogue of the endogenous neuron sweep |
 | `sae/train_sae_intervention_pilot.sh` | interventional SAE detection training on 3 features x 3 positions: does steering on/off during training break the bypass before the full grid is worth running |
 | `sae/build_featgen_pool_layer9.sh` | the 200-feature layer-9 POOL for feature generalization: density band + >=50 positives at the 32-token readout, Neuronpedia labels, near-duplicate labels removed, judged features first |
-| `sae/cache_sae_feature_generalization.sh` + `sae/train_sae_feature_generalization.sh` (table in `sae/featgen_common.sh`) | SAE FEATURE GENERALIZATION: N in {1,3,10,30,100} layer-9 features at 300k total rows, label-prompt arm (tasks 1-5) then index-prompt control (6-10), plus the label arm at 100k rows per feature for N=10/30/100 (11-13); scored on all 200 pool features (seen / held out) + a steer x ask distractor matrix. Aggregate with `analysis/plot_sae_feature_generalization.py`; see `sae/README.md` section 8 |
-| `sae/score_sae_prompt_baseline.sh` | SAE PROMPTED BASELINE: the untrained gemma-2-2b over the grid's 48 (feature, position) runs + the 5 layer-9 runs, index and label prompts (`PROMPT=`); verbal@k (paraphrase-matched words), logit, probe@k with val-chosen thresholds, no-prompt control, learning curve, steering-scale sweep. `STAGE=cache` builds the 17 caches first. Aggregate with `analysis/plot_sae_prompt_baseline.py`; see `sae/README.md` section 9 |
+| `sae/cache_sae_feature_generalization.sh` + `sae/train_sae_feature_generalization.sh` (table in `sae/featgen_common.sh`) | SAE FEATURE GENERALIZATION: N in {1,3,10,30,100} layer-9 features at 300k total rows, label-prompt arm (tasks 1-5) then index-prompt control (6-10), plus the label arm at 100k rows per feature for N=10/30/100 (11-13); scored on all 200 pool features (seen / held out) + a steer x ask distractor matrix. Aggregate with `plotters/plot_sae_feature_generalization.py`; see `sae/README.md` section 8 |
+| `sae/score_sae_prompt_baseline.sh` | SAE PROMPTED BASELINE: the untrained gemma-2-2b over the grid's 48 (feature, position) runs + the 5 layer-9 runs, index and label prompts (`PROMPT=`); verbal@k (paraphrase-matched words), logit, probe@k with val-chosen thresholds, no-prompt control, learning curve, steering-scale sweep. `STAGE=cache` builds the 17 caches first. Aggregate with `plotters/plot_sae_prompt_baseline.py`; see `sae/README.md` section 9 |
 | `attention/train_single_attn_logit_introspector_endogenous_sweep_layer_srctoken.sh` | ATTENTION LOGIT grid: 8 layers x 10 source offsets x 8 heads x {gate on, off} = 1280 runs, destination pinned to the last token. `HEAD_SELECT=random` (default) samples 8 heads per layer; `HEAD_SELECT=fixed` pins (0 4 8 12 16 20 24 28) -- the same file is both experiments |
 | `attention/pilot/pilot_attn_logit_one_cell.sh` | **run this first.** One cell of the above at 3K samples / 2 heads, with a printed PASS/FAIL verdict on cache alignment, the injection-scale saturation table, and a wall-time extrapolation for sizing `h_rt` |
 | `attention_weight/1_scan.sh` | **run this first for `P`.** Measures the post-softmax weight over the WHOLE 16 layer x 32 head x 10 offset grid (one forward per batch) and recommends three cells -- low / mid / upper layer -- to train on. Writes nothing to `data/` |
-| `attention_weight/pilot/pilot_attn_weight_one_cell.sh` | the `P` pilot: one picked cell end to end, with verdicts on alignment, cached-target range, row-sum preservation, injection domain and saturation, plus `validate_attention_weights.py` |
+| `attention_weight/pilot/pilot_attn_weight_one_cell.sh` | the `P` pilot: one picked cell end to end, with verdicts on alignment, cached-target range, row-sum preservation, injection domain and saturation, plus `tests/validate_attention_weights.py` |
 | `attention_weight/2_train_attn_weight_endogenous_picked_cells.sh` | ATTENTION WEIGHT, endogenous: 3 picked cells x 3 arms (gate off + KL 0.1, gate off unanchored, gate on) x 5 heads. `-t 1-3` |
 | `attention_weight/3_train_attn_weight_joint_weight_sweep.sh` | joint-loss weight `W` at the 3 picked cells x 6 weights x 5 heads = 90 runs; the `P` analogue of the neuron weight sweep, and what fixes `W` for stage 4. `-t 1-18` |
 | `attention_weight/4_train_attn_weight_interventional_picked_cells.sh` | interventional training at the chosen `W`, 3 cells x {KL 0.1, unanchored}. `-t 1-6` |
 | `attention_weight/L7H4M1/{1,2,4}_*.sh` | L7 h4 @-1 only, W in {0, .01, .03, .1, .3}, one head, Stage 3 settings otherwise. 1 = sigmoid head, 2 = training injection U(0,1) in probability space (`prob_uniform`), 4 = 1 + 2 + empirical eval. Shared body in `_common.sh`. `-t 1-5`; `SMOKE=1` for a 2000-row check |
 | `attention_weight/L7H4M1/3_empirical_logit_eval.sh` | no training: re-evaluates Stage 3's L7 h4 checkpoints with injection drawn from the cell's own log-odds histogram (`empirical_logit`). One job |
 | `attention_weight/7-0_cache_dst_src_grid_300K.sh` | builds the nine per-DESTINATION 300K/30K caches for 7-1 (3 pinned heads x every reachable source offset each) by running 7-1 with `CACHE_ONLY=1`. `-t 1-9` |
-| `attention_weight/7-1_train_dst_src_grid_endogenous_300K.sh` | (destination, source) PAIR GRID, endogenous, gate off unanchored: every `src <= dst` pair over absolute offsets {0 -1 -3 -7 -11 -15 -19 -23 -27 -31} (0 = last token, -31 = BOS) minus the constant (-31,-31) = 54 pairs x 3 pinned heads (L2 h20, L7 h9, L11 h25). Absolute dst `D` is token selector `D-1`, src `S` is `@(S-D)`. Holds on 7-0. `-t 1-54`; plot with `analysis/plot_attention_dst_src_grid.py` |
+| `attention_weight/7-1_train_dst_src_grid_endogenous_300K.sh` | (destination, source) PAIR GRID, endogenous, gate off unanchored: every `src <= dst` pair over absolute offsets {0 -1 -3 -7 -11 -15 -19 -23 -27 -31} (0 = last token, -31 = BOS) minus the constant (-31,-31) = 54 pairs x 3 pinned heads (L2 h20, L7 h9, L11 h25). Absolute dst `D` is token selector `D-1`, src `S` is `@(S-D)`. Holds on 7-0. `-t 1-54`; plot with `plotters/plot_attention_dst_src_grid.py` |
 
 Others are migrated as the experiment list for the paper firms up.
 
@@ -72,13 +72,13 @@ rate. The same conventions above apply, plus:
   filter, so training one feature while steering another cannot happen silently.
 - **`--force-drift-eval`** runs `measure_sae_alignment`: recomputes the feature at the
   cached position with adapters off and reports corr per offset. Want best offset
-  `+0`, corr ~1.0, `alignment OK`. `train_sae_detector_intervention.py` runs it BEFORE
+  `+0`, corr ~1.0, `alignment OK`. `trainers/train_sae_detector_intervention.py` runs it BEFORE
   training and aborts on failure, because steering a misaligned position invalidates
   the whole run rather than just its diagnostics.
 - **`--ood-eval`** uses the detection branch (`evaluate_ood_detection`), reporting AP /
   paired_directional_acc per corpus. A corpus where the feature never fires gives an
   undefined AP, not a bad one — filter on `base_rate_positive`.
-- **`score_lm_degradation.py` / `score_lighteval_benchmarks.py`** are signal-agnostic
+- **`evals/score_lm_degradation.py` / `evals/score_lighteval_benchmarks.py`** are signal-agnostic
   and apply unchanged, but only to **gate-off** checkpoints.
 
 ## Attention-specific notes
@@ -94,7 +94,7 @@ post-softmax weight. The same conventions as above apply, plus:
   offset is meant to be BOS, and `sample_token_position` CLAMPS a destination that a
   short document cannot support -- so without a floor, offset -31 silently resolves to
   position 0 on a short document and to an ordinary token on a long one, and the
-  attention-sink measurement is right only by accident. `cache_signals.py` refuses an
+  attention-sink measurement is right only by accident. `data_prep/cache_signals.py` refuses an
   attention config whose offsets the floor cannot honour. Note the neuron sweeps set no
   floor, so the two families do not draw from an identical document population.
 - **`--signal-filter A<layer>.<head>@<src>` must include the offset.** A cell caches 8
@@ -122,14 +122,14 @@ post-softmax weight. The same conventions as above apply, plus:
   embeddings and RoPE alone, hence determined by the two token strings the prompt already
   names), and the BOS offset is a separate regime whose small variance can make corr
   meaningless -- check the per-signal `std` in `dataset_signal_stats.json`.
-  `analysis/plot_attention_srctoken_sweep.py` marks both.
+  `plotters/plot_attention_srctoken_sweep.py` marks both.
 - **Prompt ambiguity is measured, not assumed.** The prompt names the source token by
   string only, so a token repeated in the 32-token context does not identify a position.
   `cache_signals` records `src_token_unique_rate` in the cache metadata; split on it
   rather than assuming the cost is zero.
 - The neuron analysis scripts parse `N<layer>.<index>` out of run names and skip
   non-matching directories **without warning**, so they ignore attention runs. Use
-  `analysis/plot_attention_srctoken_sweep.py`, which owns its own pattern; do not widen
+  `plotters/plot_attention_srctoken_sweep.py`, which owns its own pattern; do not widen
   the neuron regexes in place.
 
 ## Attention-weight (`P`) specifics, on top of the above
@@ -157,7 +157,7 @@ applies; these are the places where being a probability changes something.
   `AttentionWeightPort` scales the rest by `(1-t)/(1-p_j)`, which is provably identical
   to shifting that cell's attention logit by `logit(t) - logit(p_j)` -- so `A` and `P`
   intervene in the same way and their numbers are comparable.
-  `validate_attention_weights.py` checks that equality numerically; run it before
+  `tests/validate_attention_weights.py` checks that equality numerically; run it before
   trusting any interventional `P` result.
 - **Injected values are drawn in LOG-ODDS space.** All three built-in distributions leave
   `(0,1)`: `gaussian` on a mean-1e-3 cell draws negatives about half the time, and
@@ -174,7 +174,7 @@ applies; these are the places where being a probability changes something.
 - **`low_variance` is judged per signal code.** `A` uses an absolute std threshold (its
   std is ~1.6); `P` uses the coefficient of variation plus a dead-cell floor on the mean,
   because a weight's std is ~1e-4 and the absolute rule would flag every cell.
-- **Pick cells from the scan, do not sample them.** `scan_attention_weight_spread.py`
+- **Pick cells from the scan, do not sample them.** `mechanistic_analysis/scan_attention_weight_spread.py`
   ranks all 5120 cells by spread. Measured on C4 at length 32: the BOS offset carries a
   mean weight of ~0.65 against 0.005-0.07 elsewhere, and ~5% of cells are dead
   (`p95 < 1e-3`). Both are reasons a randomly chosen cell is usually not worth training.

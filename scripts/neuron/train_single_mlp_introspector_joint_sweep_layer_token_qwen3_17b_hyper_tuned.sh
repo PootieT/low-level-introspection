@@ -19,7 +19,7 @@
 # cd /projectnb/llamagrp/peter/low-level-introspection
 # qsub scripts/neuron/train_single_mlp_introspector_joint_sweep_layer_token_qwen3_17b_hyper_tuned.sh
 # # once runs finish (the SFT arm at the tuned LR comes later and joins the same table):
-# python analysis/compare_sft_vs_joint.py --model-suffix _qwen3_17b_hyper_tuned
+# python plotters/compare_sft_vs_joint.py --model-suffix _qwen3_17b_hyper_tuned
 # <<< SUBMIT
 #
 # The same recipe as the Llama *_hyper_tuned grids (there is no earlier Qwen3-1.7B-Base grid):
@@ -29,11 +29,10 @@
 #   Samples 0-4 of each cell's 10 neurons; the LR sweep tuned on 5-6, never used here.
 #   KL 0.1, w=0.01, gate off, scale 10, LoRA r16, effective batch 32 (32 x 1), OOD eval
 #   on every run, LM degradation on one neuron per cell, lighteval on sample 0.
-#   LR 1e-4, on a near-tie. The three cells peak at different LRs (L11 pos-8 5e-5, L4
-#   pos-1 1e-4, L25 pos-28 2e-4), so the choice is by the average over cells: 5e-5 0.70 vs
-#   1e-4 0.60 -- but 7 of the sweep's 36 runs were missing (5e-5 had 4 of 6), and on the
-#   neurons present at both LRs it is 0.63 vs 0.56 with the neurons split 2-2. Within
-#   noise, so 1e-4 is taken to keep ONE LR across Qwen3-0.6B, Llama-3B and Llama-8B.
+#   LR 1e-4. The three cells peak at different LRs (L11 pos-8 5e-5, L4 pos-1 1e-4, L25
+#   pos-28 2e-4), so the choice is by interventional corr averaged over cells, all 36
+#   sweep runs in: 5e-5 0.58 | 1e-4 0.61 | 2e-4 0.25 -- a narrow win for 1e-4. (On the
+#   first, partial rsync -- 29 of 36 runs -- 5e-5 led 0.70 to 0.60.)
 #
 # QWEN-SPECIFIC. Base checkpoint (-Base suffix), matching the base Llama models. Qwen
 # prepends no BOS; cache and training tokenize identically, and a Qwen3 smoke test
@@ -104,7 +103,7 @@ echo "cell=$CELL_TAG regime=$KL_TAG lr=$LR"
 
 ## ---- resolve this layer's neuron set ONCE (identical at every position) ----
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL_TAG}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL_TAG}" \
     --model Qwen/Qwen3-1.7B-Base \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples 300000 \
@@ -138,7 +137,7 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
 
   # every sample passes the SAME neuron list, so all 5 share one cached dataset;
   # --signal-filter is not part of the cache identity
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model Qwen/Qwen3-1.7B-Base \
       --train-dataset allenai/c4 \
@@ -177,16 +176,16 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
       $OVERWRITE
 
   # builds the cell's dataset on first use (or finds the existing one), no-ops afterwards
-  python cache_signals.py --config "$CONFIG"
+  python data_prep/cache_signals.py --config "$CONFIG"
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $KL_FLAG \
       $OOD_FLAG \
       $OVERWRITE
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $KL_FLAG \
@@ -197,12 +196,12 @@ for SAMPLE in $(seq 0 $((N_NEURONS_TRAIN - 1))); do
   # LM cost. Both scorers skip when their output exists, so resubmitting a partially
   # finished task is cheap.
   if [ "$SAMPLE" -lt "$LM_SCORE_N" ]; then
-    python score_lm_degradation.py --config "$CONFIG"
+    python evals/score_lm_degradation.py --config "$CONFIG"
   fi
   # benchmarks are far more expensive and vary with the training config, not the
   # neuron -> one per cell
   if [ "$SAMPLE" -eq 0 ]; then
-    python score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200 \
+    python evals/score_lighteval_benchmarks.py --config "$CONFIG" --max-samples 200 \
       || echo "WARNING: lighteval failed for $EXP_NAME (unverified on Qwen); continuing"
   fi
 done

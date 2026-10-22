@@ -13,7 +13,7 @@
 # ============================================================================
 # Single-head knockout over the MAIN GRID's anchored arm (KL budget 0.1):
 # 8 layers x 8 positions x 5 neurons = 320 runs, sharded over 64 array tasks
-# (~5 runs each). Sharding is done by score_head_knockout.py itself from
+# (~5 runs each). Sharding is done by mechanistic_analysis/score_head_knockout.py itself from
 # $SGE_TASK_ID / $SGE_TASK_LAST (src/introspector/run_discovery.shard), over the
 # runs sorted by name -- so the task count above is the only knob, and changing it
 # re-partitions cleanly.
@@ -28,7 +28,7 @@
 # timeouts only does the unfinished runs.
 #
 # Aggregate afterwards (CPU, seconds):
-#   python analysis/plot_head_knockout.py --group mlp_joint_grid_layer_token --kl kl0.1
+#   python plotters/plot_head_knockout.py --group mlp_joint_grid_layer_token --kl kl0.1
 # ============================================================================
 
 echo "=========================================================="
@@ -46,7 +46,7 @@ export HF_HOME=/projectnb/ivc-ml/SharedHuggingFaceCache
 
 set -e
 
-python score_head_knockout.py \
+python mechanistic_analysis/score_head_knockout.py \
     --group mlp_joint_grid_layer_token \
     --run-glob 'joint_*_kl0.1_*' \
     --skip-existing

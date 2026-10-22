@@ -129,7 +129,7 @@ def test_negative_keep_only_enters_the_cache_identity_when_set():
 
 
 def test_greedy_dedupe_drops_paraphrases_but_keeps_forced():
-    from build_sae_featgen_pool import greedy_dedupe
+    from data_prep.build_sae_featgen_pool import greedy_dedupe
     e = {1: np.array([1.0, 0.0]), 2: np.array([0.99, 0.141]), 3: np.array([0.0, 1.0]),
          4: np.array([0.0, 1.0])}
     labels = {1: "dogs", 2: "canines", 3: "numbers", 4: "Numbers!"}
@@ -140,7 +140,7 @@ def test_greedy_dedupe_drops_paraphrases_but_keeps_forced():
 
 
 def test_multi_sampler_draws_from_each_features_own_range():
-    from train_sae_detector_joint import MultiOnOffSampler
+    from trainers.train_sae_detector_joint import MultiOnOffSampler
     s = MultiOnOffSampler({1: np.array([1.0, 2.0]), 2: np.array([10.0, 20.0])},
                           distribution="extreme", extreme_scale=1.0, seed=0)
     for f, (lo, hi) in ((1, (1, 2)), (2, (10, 20))):
@@ -150,7 +150,7 @@ def test_multi_sampler_draws_from_each_features_own_range():
 
 
 def test_natural_precision_matches_full_population():
-    from score_sae_feature_generalization import natural_precision
+    from evals.score_sae_feature_generalization import natural_precision
     # 100 actives (TPR .8), 900 inactives in the population, FPR .1; eval set kept 90 inactives
     m = {"tpr": 0.8, "ina_pred_active": 9, "ina_pred_inactive": 81, "ina_pred_neither": 0}
     assert natural_precision(m, base_rate=0.1) == pytest.approx(80 / (80 + 90))

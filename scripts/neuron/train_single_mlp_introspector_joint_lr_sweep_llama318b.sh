@@ -46,7 +46,7 @@
 # the criterion that chose 5e-5 at 1B. If 8B's best is 5e-5 or within noise of it, the
 # transfer held and the grid stands. If another LR closes most of the L12 gap, re-run
 # the 8B grid at that LR before drawing any conclusion about scale.
-# analysis/plot_lr_sweep.py applies it.
+# plotters/plot_lr_sweep.py applies it.
 #
 # TASK LAYOUT  60 = 3 cells x 2 regimes x 2 neurons x 5 LRs, LR innermost, so any
 # contiguous block of 5 tasks is one complete LR curve. The most informative cell is
@@ -144,7 +144,7 @@ echo "task=$SGE_TASK_ID cell=$CELL_TAG regime=$REGIME sample=$SAMPLE lr=$LR"
 # ---- the cell's 10-neuron list (identical to the grid's: same sampler and seed) ------
 SAMPLER="{\"type\":\"uniform_layer_sampler\",\"signal_type\":\"mlp\",\"layers\":[${LAYER}],\"signals_per_layer\":${N_NEURONS_CACHE},\"seed\":${SEED}}"
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL_TAG}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL_TAG}" \
     --model $MODEL \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples 300000 \
@@ -179,7 +179,7 @@ CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
 
 # The full neuron list is passed so the cache identity matches the grid's cell cache;
 # --signal-filter is what restricts training to this one neuron.
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "$EXP_NAME" \
     --model $MODEL \
     --train-dataset allenai/c4 \
@@ -218,11 +218,11 @@ python generate_experiment_config.py \
     $OVERWRITE
 
 # No-op: the grid already built this cell's cache. No $OVERWRITE here, ever.
-python cache_signals.py --config "$CONFIG"
+python data_prep/cache_signals.py --config "$CONFIG"
 
 # In-domain evals only (no OOD, no benchmarks): the decision needs interventional corr,
 # and the eval now also writes Spearman / Kendall / monotone R^2 alongside Pearson.
-python train_introspector_joint.py \
+python trainers/train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     $KL_FLAG \
@@ -231,5 +231,5 @@ python train_introspector_joint.py \
 # LM cost on one neuron per (cell, regime, LR): in the unanchored regime KL is free to
 # move with LR, and how far it moves is part of the answer. Skips if already scored.
 if [ "$SAMPLE" -eq "${TUNE_SAMPLES[0]}" ]; then
-  python score_lm_degradation.py --config "$CONFIG"
+  python evals/score_lm_degradation.py --config "$CONFIG"
 fi

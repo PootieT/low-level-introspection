@@ -45,8 +45,8 @@
 # qsub -N lrsft_qwen3_14b -hold_jid lrcache_qwen3_14b -l gpu_memory=80G -l h_rt=24:00:00 -v SWEEP_MODEL=qwen3_14b,REGIME_LIST=sft_gateoff $(tcopy 36)
 #
 # # 4. Once runs finish: the 1B reference table, then per-model and cross-model plots
-# python analysis/compare_model_scaling.py
-# python analysis/plot_lr_sweep.py --model qwen3_06b,qwen3_17b,llama323b,qwen3_4b,llama318b,qwen3_8b,qwen3_14b
+# python plotters/compare_model_scaling.py
+# python plotters/plot_lr_sweep.py --model qwen3_06b,qwen3_17b,llama323b,qwen3_4b,llama318b,qwen3_8b,qwen3_14b
 # <<< SUBMIT
 #
 # The model-generic version of train_single_mlp_introspector_joint_lr_sweep_llama318b.sh
@@ -110,7 +110,7 @@
 #                endogenous score is context bypass and interventional corr is ~0 (not
 #                swept: only sft_gateoff is, 2026-10-21; kept so it can be)
 # The SFT arm is swept so the baseline gets the same tuning budget as the method. It is
-# judged by ENDOGENOUS corr (what it is trained on); analysis/plot_lr_sweep.py also
+# judged by ENDOGENOUS corr (what it is trained on); plotters/plot_lr_sweep.py also
 # reports the best interventional corr any LR gives it.
 #
 # TASK LAYOUT  cells x regimes x 2 neurons x LRs, LR innermost (any block of 6
@@ -119,7 +119,7 @@
 # (tcopy above).
 #   SWEEP_MODEL=qwen3_8b REGIME_LIST=kl0.1 DRY_RUN=1 bash <script>      task table
 #   SWEEP_MODEL=qwen3_8b REGIME_LIST=kl0.1 SGE_TASK_ID=7 bash <script>  one task here
-# Read with: python analysis/plot_lr_sweep.py --model <key>   (--model a,b,... compares)
+# Read with: python plotters/plot_lr_sweep.py --model <key>   (--model a,b,... compares)
 # ============================================================================
 
 if [ -n "$SHOW_COMMANDS" ]; then
@@ -260,7 +260,7 @@ echo "model=$SWEEP_MODEL task=$SGE_TASK_ID cell=$CELL_TAG regime=$REGIME sample=
 # ---- the cell's 10-neuron list (identical to a grid's: same sampler and seed) --------
 SAMPLER="{\"type\":\"uniform_layer_sampler\",\"signal_type\":\"mlp\",\"layers\":[${LAYER}],\"signals_per_layer\":${N_NEURONS_CACHE},\"seed\":${SEED}}"
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL_TAG}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL_TAG}" \
     --model $MODEL \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples 300000 \
@@ -295,7 +295,7 @@ CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
 
 # The full neuron list is passed so the cache identity matches a grid's cell cache;
 # --signal-filter is what restricts training to this one neuron.
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "$EXP_NAME" \
     --model $MODEL \
     --train-dataset allenai/c4 \
@@ -335,7 +335,7 @@ python generate_experiment_config.py \
 
 if [ -n "$CACHE_ONLY" ]; then
   # skips if the cache is already complete. No $OVERWRITE here, ever
-  python cache_signals.py --config "$CONFIG"
+  python data_prep/cache_signals.py --config "$CONFIG"
   echo "CACHE_ONLY: cell $CELL_TAG cache ready"
   exit 0
 fi
@@ -355,7 +355,7 @@ fi
 
 # In-domain evals only (no OOD, no benchmarks): the decision needs interventional corr,
 # and the eval also writes Spearman / Kendall / monotone R^2 alongside Pearson.
-python train_introspector_joint.py \
+python trainers/train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     $KL_FLAG \
@@ -364,5 +364,5 @@ python train_introspector_joint.py \
 # LM cost on one neuron per (cell, regime, LR): without the anchor KL is free to
 # move with LR, and how far it moves is part of the answer. Skips if already scored.
 if [ "$SAMPLE" -eq "${TUNE_SAMPLES[0]}" ]; then
-  python score_lm_degradation.py --config "$CONFIG"
+  python evals/score_lm_degradation.py --config "$CONFIG"
 fi

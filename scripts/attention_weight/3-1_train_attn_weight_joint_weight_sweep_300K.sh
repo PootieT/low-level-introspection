@@ -24,7 +24,7 @@
 # CACHES COME FROM 2-0, and this script refuses to build one. The six W arms of a cell are
 # ADJACENT task indices (W innermost), so they run concurrently against ONE cell dataset;
 # had they built it themselves they would race into the same directory, and
-# cache_signals.py skips on `train/` existing alone, so a loser could read a half-written
+# data_prep/cache_signals.py skips on `train/` existing alone, so a loser could read a half-written
 # dataset with no error. (The 60K script's comment claims the opposite ordering protects
 # it; it does not -- that script was safe only because Stage 2 had built the cache first.)
 #
@@ -116,7 +116,7 @@ SAMPLER="{\"type\":\"attention_layer_sampler\",\"signal_type\":\"attention_weigh
 
 mkdir -p experiment_configs/$EXP_GROUP
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL_TAG}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL_TAG}" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples $TRAIN_SAMPLES \
@@ -146,7 +146,7 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
   echo
   echo "=== [$CELL_TAG W=$W sample $SAMPLE] $EXP_NAME ==="
 
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-1B \
       --train-dataset allenai/c4 --train-dataset-split "train" \
@@ -183,11 +183,11 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
     echo "FATAL: no cache at $CACHE_DIR -- qsub scripts/attention_weight/2-0_cache_attn_weight_300K.sh first" >&2
     exit 1
   fi
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
   if [ "$SAMPLE" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       --kl-anchor-target $KL_BUDGET \
@@ -197,8 +197,8 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
       $OVERWRITE
 
   # LM cost as a function of W: a weight that buys reading by damaging the model more is
-  # not free, and that is the third panel of analysis/plot_weight_sweep.py.
-  python score_lm_degradation.py --config "$CONFIG"
+  # not free, and that is the third panel of plotters/plot_weight_sweep.py.
+  python evals/score_lm_degradation.py --config "$CONFIG"
 done
 
 echo

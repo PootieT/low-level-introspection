@@ -14,7 +14,7 @@
 #
 #   qsub scripts/attention_weight/analysis/2_transmission_probe.sh
 #
-# Stage 3 gave interventional corr ~0 at every W. probe_attention_weight_transmission.py
+# Stage 3 gave interventional corr ~0 at every W. mechanistic_analysis/probe_attention_weight_transmission.py
 # measures, without training, how far the injection travels: ||dh|| per layer at dst and
 # at the readout token, and whether logit(t) is linearly decodable from dh / h_interv.
 # Both the adapter-disabled base and the checkpoint are measured, so "the base model
@@ -47,7 +47,7 @@ CONFIGS=(${CONFIGS:-"$CFG_DIR/joint_P2.31@-1_POS-1_gateoff_scale4_kl0.1_w1.0_60K
 for cfg in "${CONFIGS[@]}"; do
   echo
   echo "=== $cfg ==="
-  python probe_attention_weight_transmission.py --config "$cfg"
+  python mechanistic_analysis/probe_attention_weight_transmission.py --config "$cfg"
 done
 
 echo "End date : $(date)"

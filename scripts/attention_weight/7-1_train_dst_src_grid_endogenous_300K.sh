@@ -25,16 +25,16 @@
 #     OFFSETS = {0 -1 -3 -7 -11 -15 -19 -23 -27 -31}     (0 = last token, -31 = BOS)
 # and every causal pair (dst, src) with src <= dst is trained: 10+9+...+1 = 55, minus
 # (-31,-31) = 54. Each pair is trained at the SAME three heads, one per layer band, and
-# the analysis averages over them (analysis/plot_attention_dst_src_grid.py).
+# the analysis averages over them (plotters/plot_attention_dst_src_grid.py).
 #
 # The recipe is 2-1's gate-off unanchored arm (klnone:off) unchanged; read 2-1's header
 # for why each hyperparameter is what it is. Only what differs is described here.
 #
 # OFFSET CONVENTIONS -- the user-facing offsets are NOT what the code takes.
 #   destination: the token selector is end-relative with -1 = LAST token
-#     (cache_signals.py sample_token_position: pos<0 -> seq_len+pos), so absolute offset
+#     (data_prep/cache_signals.py sample_token_position: pos<0 -> seq_len+pos), so absolute offset
 #     D is selector D-1. 0 -> -1, -27 -> -28, -31 -> -32 = position 0 = BOS.
-#   source: src_offset is relative to the DESTINATION (cache_signals.py
+#   source: src_offset is relative to the DESTINATION (data_prep/cache_signals.py
 #     attention_src_positions: src = dst + src_offset), so pair (D, S) is src_offset S-D.
 #   Getting either wrong raises nothing -- it trains a different, plausible cell. The run
 #   name keeps the code's convention (P<L>.<H>@<S-D>_POS<D-1>) so RUN_RE parses it
@@ -62,7 +62,7 @@
 # EVERY source offset the destination can reach (up to 30 signals, one forward per text).
 # Every pair sharing a destination passes the same signal list and differs only in
 # --signal-filter, which is not part of the identity, so they all read one cache. 54 tasks
-# would otherwise race into 9 directories (cache_signals.py skips on `train/` alone), hence
+# would otherwise race into 9 directories (data_prep/cache_signals.py skips on `train/` alone), hence
 # the 2-0/2-1 split again: 7-0 runs THIS script with CACHE_ONLY=1, once per destination.
 #
 # ONE ARRAY TASK PER PAIR, three trainings each (one per head). A 300K training took
@@ -71,7 +71,7 @@
 # Usage
 #   qsub scripts/attention_weight/7-0_cache_dst_src_grid_300K.sh
 #   qsub scripts/attention_weight/7-1_train_dst_src_grid_endogenous_300K.sh   # holds on 7-0
-#   then: python analysis/plot_attention_dst_src_grid.py outputs/runs/attn_weight_dst_src_grid_300K
+#   then: python plotters/plot_attention_dst_src_grid.py outputs/runs/attn_weight_dst_src_grid_300K
 # ============================================================================
 
 echo "=========================================================="
@@ -111,7 +111,7 @@ OUT_ROOT=outputs/runs/$EXP_GROUP
 
 ## ---- the grid ----
 # ABSOLUTE offsets from the last token (0) back to BOS (-31). Must stay in sync with
-# OFFSETS in analysis/plot_attention_dst_src_grid.py, which asserts every run lands on it.
+# OFFSETS in plotters/plot_attention_dst_src_grid.py, which asserts every run lands on it.
 OFFSETS=(0 -1 -3 -7 -11 -15 -19 -23 -27 -31)
 BOS_OFFSET=-31
 # layer:head, one per band (lower / mid / upper). random.Random(7).randrange(32) per layer.
@@ -203,7 +203,7 @@ for SAMPLE in $(seq 0 $((${#HEADS[@]} - 1))); do
 
   # Every pair of this destination passes the SAME signal list so all of them resolve to
   # one cached dataset; --signal-filter is what differs and is not part of the identity.
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-1B \
       --train-dataset allenai/c4 \
@@ -243,13 +243,13 @@ for SAMPLE in $(seq 0 $((${#HEADS[@]} - 1))); do
 
   if [ "$CACHE_ONLY" = "1" ]; then
     # 7-0's path: the only place a destination's 300K dataset is built.
-    python cache_signals.py --config "$CONFIG" $OVERWRITE
+    python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
     echo "CACHE_ONLY: destination $D cached, exiting before training."
     exit 0
   fi
 
   # Training path: the cache must already exist. Building it here would race the other
-  # pairs of this destination into one directory (cache_signals.py skips on `train/`
+  # pairs of this destination into one directory (data_prep/cache_signals.py skips on `train/`
   # alone, so a loser could read a half-written dataset without any error).
   CACHE_DIR=$(python -c "
 from pathlib import Path
@@ -260,14 +260,14 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
     echo "FATAL: no cache at $CACHE_DIR -- qsub scripts/attention_weight/7-0_cache_dst_src_grid_300K.sh first" >&2
     exit 1
   fi
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
   # Cache-alignment check once per pair: every pair is a different (dst, src) position,
   # and a moved destination is exactly where an off-by-one in the selector conversion
   # above would show up -- as best offset != +0 here and nowhere else.
   if [ "$SAMPLE" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       --scale-sweep "$SCALE_SWEEP" \
@@ -275,7 +275,7 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
       $OOD_FLAG \
       $OVERWRITE
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $OOD_FLAG \
@@ -285,13 +285,13 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
   # LM cost: the unanchored arm's achieved KL IS the cost-of-access result, so score two
   # heads for an error bar, as 2-1 does for its klnone gate-off arm.
   if [ "$SAMPLE" -lt 2 ]; then
-    python score_lm_degradation.py --config "$CONFIG"
+    python evals/score_lm_degradation.py --config "$CONFIG"
   fi
 done
 
 echo
 echo "=========================================================="
 echo "STAGE 7 @ ${SAMPLE_TAG} PAIR (dst, src) = ($D, $S) DONE. Once all 54 tasks finish:"
-echo "  python analysis/plot_attention_dst_src_grid.py $OUT_ROOT"
+echo "  python plotters/plot_attention_dst_src_grid.py $OUT_ROOT"
 echo "End date : $(date)"
 echo "=========================================================="

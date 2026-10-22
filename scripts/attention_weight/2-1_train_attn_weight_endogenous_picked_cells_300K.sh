@@ -29,7 +29,7 @@
 # 4-6 h per task in the worst case.
 #
 # THE CACHE COMES FROM 2-0, NOT FROM THIS SCRIPT. Splitting the arms puts three tasks on the
-# same cell dataset, and cache_signals.py skips on `train/` existing, so concurrent tasks
+# same cell dataset, and data_prep/cache_signals.py skips on `train/` existing, so concurrent tasks
 # would race into one directory and could read a half-written cache. 2-0 builds each cell
 # exactly once by running THIS script with CACHE_ONLY=1 (so the generate_experiment_config
 # call, and hence the cache identity, cannot drift between the two), and the training path
@@ -154,7 +154,7 @@ SAMPLER="{\"type\":\"attention_layer_sampler\",\"signal_type\":\"attention_weigh
 # (seed, layer) -> head-set mapping instead of duplicating the selection in shell.
 mkdir -p experiment_configs/$EXP_GROUP
 CELL_CONFIG=experiment_configs/$EXP_GROUP/_cell_${CELL_TAG}.json
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_cell_${CELL_TAG}" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" --train-max-samples $TRAIN_SAMPLES \
@@ -189,7 +189,7 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
 
   # Every sample passes the SAME signal list so all heads resolve to one cached
   # dataset; --signal-filter is what differs and is not part of the cache identity.
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-1B \
       --train-dataset allenai/c4 \
@@ -230,13 +230,13 @@ for SAMPLE in $(seq 0 $((N_HEADS_TRAIN - 1))); do
 
   if [ "$CACHE_ONLY" = "1" ]; then
     # 2-0's path: the only place a 300K cell dataset is built.
-    python cache_signals.py --config "$CONFIG" $OVERWRITE
+    python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
     echo "CACHE_ONLY: cell $CELL_TAG cached, exiting before training."
     exit 0
   fi
 
   # Training path: the cache must already exist. Building it here would race the other
-  # two arms of this cell into one directory (cache_signals.py skips on `train/` alone,
+  # two arms of this cell into one directory (data_prep/cache_signals.py skips on `train/` alone,
   # so a loser could read a half-written dataset without any error).
   CACHE_DIR=$(python -c "
 from pathlib import Path
@@ -247,7 +247,7 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
     echo "FATAL: no cache at $CACHE_DIR -- qsub scripts/attention_weight/2-0_cache_attn_weight_300K.sh first" >&2
     exit 1
   fi
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
   # Cache-alignment check once per (cell, arm): it is a property of the data pipeline,
   # so one run per dataset is enough. For a post-softmax weight this is the only
@@ -255,7 +255,7 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
   # catches is a NORMALIZATION mismatch, which otherwise just looks like a low score.
   if [ "$SAMPLE" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       --scale-sweep "$SCALE_SWEEP" \
@@ -264,7 +264,7 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
       $OOD_FLAG \
       $OVERWRITE
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $KL_FLAG \
@@ -279,7 +279,7 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
   if [ "$GATE" = "off" ]; then
     if [ "$KL_TAG" = "klnone" ]; then LM_SCORE_N=2; else LM_SCORE_N=1; fi
     if [ "$SAMPLE" -lt "$LM_SCORE_N" ]; then
-      python score_lm_degradation.py --config "$CONFIG"
+      python evals/score_lm_degradation.py --config "$CONFIG"
     fi
   fi
 done

@@ -35,10 +35,10 @@
 #
 # ONE ARRAY TASK PER CELL, AND THAT TASK BUILDS THE CELL'S OWN CACHE. The cache holds only
 # the cell's three signals, so no other task reads or writes it. 2-0/7-0 exist because
-# several tasks shared one cache directory and cache_signals.py skips on `train/` existing
+# several tasks shared one cache directory and data_prep/cache_signals.py skips on `train/` existing
 # alone (a loser of the race reads a half-written dataset with no error); with one task
 # per cache there is no race, so there is no separate cache job and no -hold_jid. The
-# first head's cache_signals.py builds it, the next two skip.
+# first head's data_prep/cache_signals.py builds it, the next two skip.
 #
 # COST. A 300K cache of 8 signals took 13 GB on disk, so a 3-signal cell is ~5 GB and the
 # grid ~100 GB. Per task: caching (~2 h, including the DEV_OFFSET=1M streaming skip) plus
@@ -157,7 +157,7 @@ for SAMPLE in 0 1 2; do
   echo
   echo "=== [$CELL_TAG head $SAMPLE] $EXP_NAME ==="
 
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-1B \
       --train-dataset allenai/c4 \
@@ -197,14 +197,14 @@ for SAMPLE in 0 1 2; do
 
   # Builds the cell's cache on the first head, skips on the next two. Safe only because
   # this task is the cache's sole user (see header).
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
   # Cache-alignment check once per cell: it is a property of the cached dataset. For a
   # post-softmax weight it is the only automatic check that the live value equals the
   # cached one; a normalization mismatch otherwise just looks like a low score.
   if [ "$SAMPLE" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       --scale-sweep "$SCALE_SWEEP" \
@@ -212,7 +212,7 @@ for SAMPLE in 0 1 2; do
       $OOD_FLAG \
       $OVERWRITE
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $OOD_FLAG \
@@ -222,7 +222,7 @@ for SAMPLE in 0 1 2; do
   # LM cost: the unanchored arm's achieved KL IS the cost-of-access result, so score two
   # heads for an error bar, as 2-1 and 7-1 do for this arm.
   if [ "$SAMPLE" -lt 2 ]; then
-    python score_lm_degradation.py --config "$CONFIG"
+    python evals/score_lm_degradation.py --config "$CONFIG"
   fi
 done
 

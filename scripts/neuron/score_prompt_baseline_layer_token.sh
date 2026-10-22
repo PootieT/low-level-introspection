@@ -13,7 +13,7 @@
 # ============================================================================
 # PROMPTED-BASELINE over the MAIN GRID: the UNTRAINED Llama-3.2-1B, asked with the
 # grid's own introspection prompts, read out by closed-form ridge probes on its
-# final-layer hidden state (score_prompt_baseline.py). Nothing is trained, so the
+# final-layer hidden state (evals/score_prompt_baseline.py). Nothing is trained, so the
 # result depends only on the (neuron, position) -- both KL regimes of the grid map to
 # the same output dir, and only the kl0.1 configs are enumerated.
 #
@@ -33,7 +33,7 @@
 #     qsub -v MODE=lc -t 1-3 scripts/neuron/score_prompt_baseline_layer_token.sh
 #
 # Aggregate afterwards (CPU, seconds):
-#   python analysis/plot_prompt_baseline.py
+#   python plotters/plot_prompt_baseline.py
 # ============================================================================
 
 echo "=========================================================="
@@ -63,7 +63,7 @@ if [ "$MODE" = "lc" ]; then
   )
   CFG=${LC_CONFIGS[$((SGE_TASK_ID - 1))]}
   # --task-index/--n-tasks 1: one explicit config, so no sharding of a 1-run list
-  python score_prompt_baseline.py \
+  python evals/score_prompt_baseline.py \
       --config experiment_configs/$GROUP/$CFG.json \
       --baseline-root outputs/runs/mlp_prompt_baseline_learning_curve \
       --max-train-examples 300000 \
@@ -73,7 +73,7 @@ if [ "$MODE" = "lc" ]; then
       --task-index 1 --n-tasks 1 \
       --skip-existing
 else
-  python score_prompt_baseline.py \
+  python evals/score_prompt_baseline.py \
       --group $GROUP \
       --run-glob 'joint_*_kl0.1_*' \
       --baseline-root outputs/runs/mlp_prompt_baseline_layer_token \

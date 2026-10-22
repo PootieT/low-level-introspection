@@ -192,7 +192,7 @@ echo "task=$SGE_TASK_ID cell=$CELL neuron=$SIG -> $EXP_NAME"
 # --max-seq-length is the TRAIN length; the eval lengths are handled by --length-eval,
 # which derives its own configs (and its own max_seq_length, since this run's is sized
 # for TRAIN_LEN and would truncate every longer eval document).
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "$EXP_NAME" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 \
@@ -234,12 +234,12 @@ python generate_experiment_config.py \
 # no-op once another task in the same cell has built it (the 5 neurons of a cell
 # resolve to one canonical dataset name). min_seq_length is part of the cache
 # identity, so these will NOT collide with the earlier unfiltered caches.
-python cache_signals.py --config "$CONFIG" $OVERWRITE
+python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
 ## train, then run the full (eval length x distance bin) grid
 # --force-drift-eval keeps the cache-alignment regression check running
 # (want: best offset +0, corr ~0.9999, "alignment OK")
-python train_introspector_joint.py \
+python trainers/train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     --force-drift-eval \
@@ -248,13 +248,13 @@ python train_introspector_joint.py \
     $OVERWRITE
 
 # Re-run ONLY the length eval on an existing checkpoint (no retraining):
-# python train_introspector_joint.py \
+# python trainers/train_introspector_joint.py \
 # --config "$CONFIG" \
 # --joint-loss-weight $W \
 # --length-only \
 # --eval-lengths $EVAL_LENGTHS
 
-python train_introspector_joint.py \
+python trainers/train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     --length-only \

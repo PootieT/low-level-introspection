@@ -51,7 +51,7 @@ source scripts/sae/featgen_common.sh
 # that are still running read it at eval time, and make_pool_config rewrites it.
 if [ -z "$STAGE_GROUPS" ] || [ ! -f "$POOL_CONFIG" ]; then make_pool_config; fi
 echo "=== pool cache: $POOL_CONFIG -> $(cache_dir_of "$POOL_CONFIG") ==="
-python cache_signals.py --config "$POOL_CONFIG"
+python data_prep/cache_signals.py --config "$POOL_CONFIG"
 
 # one run cache per distinct (features cached, inactive keep rate) -- the cache's
 # identity: both arms at one N share one, and so do the data100k rows at every N.
@@ -67,6 +67,6 @@ for row in "${RUNS[@]}"; do
     DONE="$DONE$key "
     CONFIG=$(make_run_config "$name" "$arm" "$n" "$total" "$cache_feats")
     echo "=== run cache $key (row $name): $CONFIG -> $(cache_dir_of "$CONFIG") ==="
-    python cache_signals.py --config "$CONFIG"
+    python data_prep/cache_signals.py --config "$CONFIG"
 done
 echo "Done: $(date)"

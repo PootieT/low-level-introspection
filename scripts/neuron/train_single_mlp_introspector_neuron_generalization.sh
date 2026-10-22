@@ -228,7 +228,7 @@ echo "row: name=$NAME group=$R_GROUP neurons=$N_NEURONS offset=$OFFSET rows/n=$R
 SAMPLER="{\"type\":\"uniform_layer_sampler\",\"signal_type\":\"mlp\",\"layers\":[${LAYER}],\"signals_per_layer\":${N_CACHE},\"seed\":${SEED}}"
 POOL_CONFIG=experiment_configs/$EXP_GROUP/_pool_L${LAYER}_POS${TOKEN_POS}.json
 
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "_pool_L${LAYER}_POS${TOKEN_POS}" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" \
@@ -257,7 +257,7 @@ cfg = json.load(open('$POOL_CONFIG'))
 print(' '.join(f\"N{s['layer']}.{s['index']}\" for s in cfg['train_signals']))
 "))
 
-python cache_signals.py --config "$POOL_CONFIG" $OVERWRITE
+python data_prep/cache_signals.py --config "$POOL_CONFIG" $OVERWRITE
 
 # ---- step 2: this row's run ------------------------------------------------
 # Slice [OFFSET, OFFSET+N_NEURONS) of the pool. offset=0 gives the nested prefixes the
@@ -270,7 +270,7 @@ TRAIN_NEURONS=$(IFS=,; echo "${ALL_NEURONS[*]:$OFFSET:$N_NEURONS}")
 
 # This run's OWN cache holds exactly its neurons over N_TEXTS texts. The held-out
 # neurons come from the pool cache at eval time (--neuron-gen-pool-config).
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "$EXP_NAME" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 --train-dataset-split "train" \
@@ -318,9 +318,9 @@ json.dump({"name": "$NAME", "group": "$R_GROUP", "neurons": $N_NEURONS, "offset"
 PY
 
 ### cache this run's OWN dataset (no-op when a row with the same content built it)
-python cache_signals.py --config "$CONFIG" $OVERWRITE
+python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
-python train_introspector_joint.py \
+python trainers/train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     --force-drift-eval \
@@ -329,5 +329,5 @@ python train_introspector_joint.py \
     $OVERWRITE
 
 # Re-run ONLY the neuron-generalization eval on an existing checkpoint:
-#   python train_introspector_joint.py --config "$CONFIG" --joint-loss-weight $W \
+#   python trainers/train_introspector_joint.py --config "$CONFIG" --joint-loss-weight $W \
 #       --neuron-gen-only --neuron-gen-pool-config "$POOL_CONFIG"

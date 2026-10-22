@@ -52,7 +52,7 @@
 # cache identity depends on neither the readout nor the injection distribution), and a
 # missing cache is FATAL rather than built.
 #
-# RUN NAMES HAVE NO EXTRA TOKEN: RUN_RE in analysis/plot_attention_srctoken_sweep.py
+# RUN NAMES HAVE NO EXTRA TOKEN: RUN_RE in plotters/plot_attention_srctoken_sweep.py
 # expects `_gate.._kl.._w..` adjacent (see 2's header). The readout and the injection
 # distribution are checked from the configs by the analysis notebook instead.
 #
@@ -181,7 +181,7 @@ for SAMPLE in 0 1 2; do
   echo
   echo "=== [$CELL_TAG W=$W head $SAMPLE] $EXP_NAME ==="
 
-  python generate_experiment_config.py \
+  python data_prep/generate_experiment_config.py \
       --experiment-name "$EXP_NAME" \
       --model meta-llama/Llama-3.2-1B \
       --train-dataset allenai/c4 \
@@ -233,13 +233,13 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
     echo "FATAL: no cache at $CACHE_DIR -- qsub scripts/attention_weight/paper/1_grid_endogenous.sh first" >&2
     exit 1
   fi
-  python cache_signals.py --config "$CONFIG" $OVERWRITE
+  python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
   # Cache-alignment check once per (cell, W): cheap, and it is what tells a normalization
   # mismatch apart from a low score.
   if [ "$SAMPLE" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       --interv-eval-distributions "$INTERV_EVALS" \
@@ -249,7 +249,7 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
       $OOD_FLAG \
       $OVERWRITE
 
-  python train_introspector_joint.py \
+  python trainers/train_introspector_joint.py \
       --config "$CONFIG" \
       --joint-loss-weight $W \
       $OOD_FLAG \
@@ -260,7 +260,7 @@ print(ExperimentConfig.model_validate_json(Path('$CONFIG').read_text()).dataset_
   # LM cost as a function of W. Unanchored, so this is what each W actually costs the
   # model -- score every head for the error bar, as 2 does.
   if [ "${SMOKE:-0}" != "1" ]; then
-    python score_lm_degradation.py --config "$CONFIG"
+    python evals/score_lm_degradation.py --config "$CONFIG"
   fi
 done
 

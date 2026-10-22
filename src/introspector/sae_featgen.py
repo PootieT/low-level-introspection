@@ -2,9 +2,9 @@
 Shared pieces of the SAE FEATURE-GENERALIZATION experiment: one introspector trained
 on N SAE features at once, evaluated on features it never trained on.
 
-Used by train_sae_detector_joint.py (multi-feature path), score_sae_feature_
-generalization.py (the seen/unseen + distractor eval), build_sae_featgen_pool.py
-(the 200-feature pool) and analysis/plot_sae_feature_generalization.py.
+Used by trainers/train_sae_detector_joint.py (multi-feature path), score_sae_feature_
+generalization.py (the seen/unseen + distractor eval), data_prep/build_sae_featgen_pool.py
+(the 200-feature pool) and plotters/plot_sae_feature_generalization.py.
 
 ROW BUDGET (balance_rows_per_feature). Every run trains on the same TOTAL number of
 rows, split equally over its N features (total // N each), and each feature's share
@@ -71,7 +71,7 @@ def balance_rows_per_feature(ds, features: list[int], total_rows: int, pos_frac:
         if len(pos) == 0:
             raise SystemExit(f"feature index {f} has no active rows in the train cache; it "
                              f"cannot be balanced (nor steered: no 'on' magnitude). Drop it "
-                             f"from the pool -- build_sae_featgen_pool.py's positives floor "
+                             f"from the pool -- data_prep/build_sae_featgen_pool.py's positives floor "
                              f"exists to prevent this.")
         n_pos_want = int(round(quota * pos_frac))
         n_neg_want = quota - n_pos_want
@@ -102,7 +102,7 @@ def balance_rows_per_feature(ds, features: list[int], total_rows: int, pos_frac:
 
 
 def load_pool(path: str | Path) -> dict:
-    """The pool file build_sae_featgen_pool.py writes. `features` is in pool order
+    """The pool file data_prep/build_sae_featgen_pool.py writes. `features` is in pool order
     (a run with N features trains the first N); `labels` covers all of them;
     `label_similarity[i][j]` is the cosine between the labels of features[i] and [j]."""
     pool = json.loads(Path(path).read_text())

@@ -39,7 +39,7 @@
 #
 # OFF-GRID TRAINING PAIRS. The injection pool holds the eval grid only (all pairs up to
 # m = 32, a log grid above), but at W < 1 each training row is injected at its own random
-# pair, which at n = 64/128 is mostly off the grid. train_introspector_joint.py gives
+# pair, which at n = 64/128 is mostly off the grid. trainers/train_introspector_joint.py gives
 # those cells ranges from the run's own train+dev rows (grid cells keep the pool's, and
 # it asserts every test cell is a pool cell). prob_uniform reads no per-cell statistic,
 # so the source of those ranges does not change a single training draw.
@@ -61,7 +61,7 @@
 # Usage
 #   qsub scripts/attention_weight/paper/3-1-0_cache_multipairs_lengen.sh   # if not run yet
 #   qsub scripts/attention_weight/paper/4-2-1_multipairs_lengen_interventional_logistic_norm_dev_prob_uniform.sh
-#   python analysis/plot_multipairs_lengen.py --exp-group attn_weight_paper421_multipairs_lengen_interv_w0.3_logistic_ndev_punif_300K
+#   python plotters/plot_multipairs_lengen.py --exp-group attn_weight_paper421_multipairs_lengen_interv_w0.3_logistic_ndev_punif_300K
 # ============================================================================
 
 echo "=========================================================="
@@ -176,7 +176,7 @@ for MARK in pool.done n${N}.done; do
   fi
 done
 
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "$EXP_NAME" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 \
@@ -233,7 +233,7 @@ if [ -n "$EVAL_LENGTHS_CSV" ]; then LENGTH_FLAGS="--length-eval --eval-lengths $
 # Cache-alignment check once per n: it is a property of the cached dataset.
 if [ "$HEAD_IDX" -eq 0 ]; then DRIFT="--force-drift-eval"; else DRIFT=""; fi
 
-python train_introspector_joint.py \
+python trainers/train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     --scale-sweep "" \
@@ -245,7 +245,7 @@ python train_introspector_joint.py \
 
 # LM cost of the unanchored arm, two heads for an error bar (as 3-1)
 if [ "$HEAD_IDX" -lt 2 ] && [ "${SMOKE:-0}" != "1" ]; then
-  python score_lm_degradation.py --config "$CONFIG"
+  python evals/score_lm_degradation.py --config "$CONFIG"
 fi
 
 echo

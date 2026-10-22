@@ -53,7 +53,7 @@ THE REGIMES
 NOT INCLUDED: a no-injection "endogenous" regime. Attribution there cannot be a
 dose-response at all (nothing is varied), and needs a different estimator -- either
 correlational against the natural activation, which the context bypass confounds, or
-a gradient, which score_gradient_attribution.py already provides. `local` is the
+a gradient, which mechanistic_analysis/score_gradient_attribution.py already provides. `local` is the
 endogenous-OPERATING-POINT measurement that stays causal.
 """
 from __future__ import annotations

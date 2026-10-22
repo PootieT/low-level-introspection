@@ -17,7 +17,7 @@
 #
 # The comparison partner is train_single_mlp_introspector_length_generalization.sh
 # (group mlp_lengen, W=0.01). This script changes ONE thing: W=1.0, i.e. the endogenous
-# (SFT) term only -- train_introspector_joint.py then skips the interventional forward
+# (SFT) term only -- trainers/train_introspector_joint.py then skips the interventional forward
 # entirely. Everything else is held identical so the difference is the objective:
 # same 5 L4 neurons, same data (min length 128, 300K train, 30K test), same LoRA/LR/BS,
 # same unconstrained KL, same prompt, same eval lengths. The interventional eval still
@@ -33,7 +33,7 @@
 # SEPARATE GROUP (mlp_lengen_sft): plot_length_generalization.py reads a group by name
 # pattern and does not parse W, so mixing both objectives into mlp_lengen would average
 # them together in every existing figure. Compare the two with
-#   python analysis/plot_length_generalization.py --compare mlp_lengen:Joint mlp_lengen_sft:SFT
+#   python plotters/plot_length_generalization.py --compare mlp_lengen:Joint mlp_lengen_sft:SFT
 #
 # DATA CACHES are shared with the joint arm: the cache key is derived from the data
 # fields, not the experiment group or W, so these runs reuse the joint arm's caches and
@@ -101,7 +101,7 @@ EXP_NAME="lengen_N${SIG}_len${TRAIN_LEN}_win${WINDOW}_gate${GATE}_${KL_TAG}_w${W
 CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
 echo "task=$SGE_TASK_ID cell=$CELL neuron=$SIG -> $EXP_NAME"
 
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "$EXP_NAME" \
     --model meta-llama/Llama-3.2-1B \
     --train-dataset allenai/c4 \
@@ -140,9 +140,9 @@ python generate_experiment_config.py \
     $OVERWRITE
 
 # no-op: the joint arm already built this cell's cache
-python cache_signals.py --config "$CONFIG" $OVERWRITE
+python data_prep/cache_signals.py --config "$CONFIG" $OVERWRITE
 
-python train_introspector_joint.py \
+python trainers/train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     --force-drift-eval \
@@ -153,7 +153,7 @@ python train_introspector_joint.py \
 # the long-range evals the joint arm also has (eval lengths up to 64x the shortest
 # training length), so every ratio on the joint arm's relative_generalization plot
 # has an SFT counterpart
-python train_introspector_joint.py \
+python trainers/train_introspector_joint.py \
     --config "$CONFIG" \
     --joint-loss-weight $W \
     --length-only \

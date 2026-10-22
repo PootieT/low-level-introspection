@@ -59,7 +59,7 @@ EXP_NAME="saeInterv_${SIG}_POS${TOKEN_POS}_scale${SCALE}_300K"
 CONFIG=experiment_configs/$EXP_GROUP/$EXP_NAME.json
 echo "=== $EXP_NAME  (sig=$SIG pos=$TOKEN_POS) ==="
 
-python generate_experiment_config.py \
+python data_prep/generate_experiment_config.py \
     --experiment-name "$EXP_NAME" \
     --model google/gemma-2-2b \
     --objective detection \
@@ -96,10 +96,10 @@ python generate_experiment_config.py \
     --output-dir outputs/runs/$EXP_GROUP \
     --output "$CONFIG"
 
-python cache_signals.py --config "$CONFIG"
+python data_prep/cache_signals.py --config "$CONFIG"
 
 # --force-drift-eval FAILS FAST here: steering is applied during training, so a
 # misaligned position would invalidate the whole run rather than just its diagnostics
-python train_sae_detector_intervention.py \
+python trainers/train_sae_detector_intervention.py \
     --config "$CONFIG" \
     --force-drift-eval
