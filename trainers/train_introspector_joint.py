@@ -702,8 +702,8 @@ def eval_endogenous_test(model, dataset, collator, config, output_dir, suffix="_
 # The same pass also settles a cache/training ALIGNMENT question. data_prep/cache_signals.py
 # tokenizes with add_special_tokens defaulting to True (BOS at index 0), while
 # preprocess_example tokenizes with add_special_tokens=False, so a cached
-# token_position p may correspond to training position p-1 -- exactly the -1 that
-# mechanistic_analysis/intervene_introspector.py applies ("offset of -1 is label shift I think") and
+# token_position p may correspond to training position p-1 -- exactly the -1 that the
+# old post-hoc intervention script applied ("offset of -1 is label shift I think") and
 # that IntrospectionRegressionModel.forward does NOT. Running the model with
 # adapters DISABLED reproduces the model that built the cache, so the offset whose
 # captured activation correlates ~1.0 with the cached column is the true

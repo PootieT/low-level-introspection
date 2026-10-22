@@ -1,12 +1,15 @@
-"""tests/validate_*.py: the model-backed sanity checks (attention-logit and attention-weight
-ports, the SAE hook site) are scripts, not pytest tests -- they need the real model and
-SAE weights. Here they only have to load and parse their arguments.
+"""The model-backed sanity checks in tests/ (attention-logit and attention-weight ports, the
+SAE hook site, cache alignment) are scripts, not pytest tests -- they need the real model
+and SAE weights. Here they only have to load and parse their arguments.
 """
 import pytest
 
 from script_smoke import REPO_ROOT, run_smoke, smoke_failure
 
-VALIDATORS = sorted((REPO_ROOT / "tests").glob("validate_*.py"))
+# every script in tests/ that pytest itself does not run
+VALIDATORS = sorted(p for p in (REPO_ROOT / "tests").glob("*.py")
+                    if not p.name.startswith("test_")
+                    and p.name not in ("conftest.py", "script_smoke.py"))
 
 
 @pytest.fixture(scope="module")

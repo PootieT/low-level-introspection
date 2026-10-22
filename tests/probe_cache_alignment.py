@@ -44,7 +44,7 @@ you saw there (~0.80). If it does not, distrust this script before believing it.
 
 Example
 -------
-python mechanistic_analysis/probe_cache_alignment.py \
+python tests/probe_cache_alignment.py \
     --config experiment_configs/<group>/<run>.json --n-examples 1024 --also-fp32
 """
 from __future__ import annotations

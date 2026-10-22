@@ -127,7 +127,7 @@ def preprocess_example(
     #   FIDELITY  BOS is Llama's attention sink; dropping it perturbs every downstream
     #             activation, so even at the right position the live neuron correlated
     #             only ~0.81 with the cached target instead of ~1.0.
-    # Verified by mechanistic_analysis/probe_cache_alignment.py: (bos=True, offset=0) gives token-match 1.000
+    # Verified by tests/probe_cache_alignment.py: (bos=True, offset=0) gives token-match 1.000
     # and corr 0.9999 vs the cache; every other convention fails one or both. All three
     # calls must stay consistent -- frozen_input_len and prompt_len both shift by the
     # same one token, so the gate mask and label masking keep their boundaries.

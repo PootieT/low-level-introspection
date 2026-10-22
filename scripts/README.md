@@ -1,11 +1,6 @@
 # scripts/
 
-Post-fix launch scripts. Anything under `scripts_old_with_off_by_one_bug/` produced
-runs where the intervention hook injected into the token AFTER the one the prompt
-named, and where the live neuron matched the cached endogenous target at only ~0.81
-(training tokenized without BOS; the cache tokenized with it). **Numbers from those
-runs are not comparable to numbers from here.** They are kept for provenance, not for
-reuse — migrate a script into this directory rather than running it in place.
+This directory contains shell scripts that kick of experiments (mostly in the BU SLURM-based cluster).
 
 ## Conventions for scripts in this directory
 

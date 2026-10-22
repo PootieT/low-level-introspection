@@ -835,7 +835,7 @@ def write_dataset_metadata(config: ExperimentConfig, output_dir: Path, model,
     TOKENIZATION is the field that matters most: activations were captured from
     tokenizer(..., add_special_tokens=True), i.e. WITH a leading BOS, right-padded.
     Anything consuming token_position must tokenize the same way -- see
-    preprocess_example, which now does, and mechanistic_analysis/probe_cache_alignment.py, which checks it.
+    preprocess_example, which now does, and tests/probe_cache_alignment.py, which checks it.
     """
     try:
         dtype = str(next(model._model.parameters()).dtype)
