@@ -708,8 +708,12 @@ def plot_relative_generalization_compare(pooled_by: dict, out_dir, eval_type="en
     return res
 
 
-def main_compare(specs, eval_types=("endogenous",)):
-    """`specs`: ['group:Label', ...]. Writes to outputs/plots/lengen_objective_compare/."""
+def main_compare(specs, eval_types=("endogenous", "interventional")):
+    """`specs`: ['group:Label', ...]. Writes to outputs/plots/lengen_objective_compare/.
+
+    The interventional comparison is a different question from the endogenous one: an SFT
+    (W=1) readout never trains on injected values, so its interventional curve is the
+    bypass reference the joint objective should beat, not a competing score."""
     pooled_by = {}
     for spec in specs:
         group, _, label = spec.partition(":")
@@ -717,13 +721,17 @@ def main_compare(specs, eval_types=("endogenous",)):
         # run directories are synced less often than the plots: when the group's last
         # full re-plot covers more runs than the directories present, use that instead
         cached = Path(f"{ROOT}/outputs/plots/{group}/length_generalization_pooled.csv")
-        if cached.exists():
-            c = pd.read_csv(cached)
-            n_dir = pooled["run"].nunique() if not pooled.empty else 0
-            if c["run"].nunique() > n_dir:
-                print(f"[lengen] {group}: {n_dir} run dir(s) present, {cached.name} has "
-                      f"{c['run'].nunique()} runs -- using {cached.name}")
-                pooled = c
+        c = pd.read_csv(cached) if cached.exists() else None
+        n_dir = pooled["run"].nunique() if not pooled.empty else 0
+        if c is not None and c["run"].nunique() > n_dir:
+            print(f"[lengen] {group}: {n_dir} run dir(s) present, {cached.name} has "
+                  f"{c['run'].nunique()} runs -- using {cached.name}")
+            pooled = c
+        elif not pooled.empty:
+            # keep a full-sweep copy next to the group's other plots, so the comparison
+            # can be redrawn from outputs/plots/ alone once the run dirs are gone
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            pooled.to_csv(cached, index=False)
         if pooled.empty:
             sys.exit(f"{group}: no pooled length-generalization results")
         pooled_by[label or group] = pooled
