@@ -29,13 +29,12 @@
 #   Samples 0-4 of each cell's 10 neurons; the LR sweep tuned on 5-6, never used here.
 #   KL 0.1, w=0.01, gate off, scale 10, LoRA r16, effective batch 32 (16 x 2), OOD eval
 #   on every run, LM degradation on one neuron per cell, lighteval on sample 0.
-#   LR 2e-4 -- the first model here whose optimum is above 1e-4. Interventional corr
-#   averaged over the sweep's three cells (KL 0.1): 5e-5 0.43 | 1e-4 0.65 | 2e-4 0.74 |
-#   5e-4 0.01 (collapse). 5 of 36 sweep runs were missing (L32 neuron 7409 has none at
-#   1e-4 or above), so on the 5 neurons present at both: 1e-4 0.61 vs 2e-4 0.71, 3 of 5
-#   preferring 2e-4. The gain is in the two weak neurons (+0.26, +0.36) at a cost of
-#   -0.16 on one strong one; endogenous corr is the same at both (0.86). 2e-4 is one
-#   step below the 5e-4 collapse, so expect some failed neurons.
+#   LR 1e-4, shared with the SFT grid. Joint alone peaks at 2e-4 (cell average 0.64 vs
+#   0.58 at 1e-4, neurons split 3-3), but SFT drops 0.13 there (endogenous 0.88 at 1e-4,
+#   0.75 at 2e-4), while joint gives up only 0.07 at 1e-4.
+#   One LR for both arms: wherever both were swept, the joint (interventional) and SFT
+#   (endogenous) optima matched or nearly so; the shared LR minimises the larger of the
+#   two arms' shortfalls from their own best (sweep cell averages).
 #
 # QWEN-SPECIFIC. Base checkpoint (-Base suffix), matching the base Llama models. Qwen
 # prepends no BOS; cache and training tokenize identically, and a Qwen3 smoke test
@@ -84,7 +83,7 @@ SEED=21
 N_NEURONS_CACHE=10
 N_NEURONS_TRAIN=5
 SCALE=10
-LR=2e-4
+LR=1e-4
 LORA_R=16
 LORA_ALPHA=$((LORA_R * 2))
 LORA_DO=0.0

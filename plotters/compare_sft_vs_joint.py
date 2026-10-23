@@ -130,6 +130,12 @@ MODELS = {
     "qwen3_4b_hyper_tuned": dict(layers=[5, 14, 23, 32],
                                  positions=[-1, -8, -20, -28],
                                  pool=9728, n_layers=36),
+    "qwen3_8b_hyper_tuned": dict(layers=[5, 14, 23, 32],
+                                 positions=[-1, -8, -20, -28],
+                                 pool=12288, n_layers=36),
+    "qwen3_14b_hyper_tuned": dict(layers=[5, 15, 25, 35],
+                                  positions=[-1, -8, -20, -28],
+                                  pool=17408, n_layers=40),
 }
 DEFAULT_MODEL = "llama321b"
 N_TRAINED = 5
