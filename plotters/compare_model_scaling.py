@@ -125,6 +125,9 @@ def load_all(models=None, common_positions=None, arms=None) -> pd.DataFrame:
     for name, (suffix, n_layers, params) in models.items():
         for joint, stem in JOINT_ARMS.items():
             for gate in GATES:
+                # a set that compares only some arms neither needs nor misses the others
+                if arms is not None and not {joint, f"sft_{gate}"} <= set(arms):
+                    continue
                 f = ROOT / f"outputs/plots/sft_vs_joint{suffix}" / f"paired_runs_{stem}_{gate}.csv"
                 if not f.exists():
                     missing.append(str(f.relative_to(ROOT)))
@@ -173,7 +176,7 @@ def coverage(df: pd.DataFrame) -> pd.DataFrame:
     cov = (df[df["metric"] == "corr"]
            .groupby(["model", "arm", "readout"])
            .agg(n=("value", "size"), depths=("depth", lambda s: sorted(s.unique())),
-                matched_depths=("depth_bin", lambda s: sorted(s.dropna().unique())))
+                matched_depths=("depth_bin", lambda s: sorted(float(x) for x in s.dropna().unique())))
            .reset_index())
     return cov
 
@@ -186,11 +189,15 @@ def _agg(df, by):
 
 
 def _size_ticks(ax, params):
-    """Tick each model size once; sizes within 10% of a ticked one (8.03 vs 8.19) share it."""
-    ticks = []
-    for p in sorted(params):
-        if not ticks or p / ticks[-1] > 1.1:
-            ticks.append(p)
+    """Round size ticks on the log axis. With three models each size gets its own tick;
+    with more, sizes crowd (1.24 / 1.72, 3.21 / 4.02, 8.03 / 8.19), so round ticks are
+    used and the points carry the model names instead."""
+    params = sorted(params)
+    if len(params) <= 3:
+        ticks = params
+    else:
+        ticks = [t for t in (0.5, 1, 2, 4, 8, 16, 32, 70)
+                 if params[0] / 1.3 <= t <= params[-1] * 1.3]
     ax.set_xticks(ticks)
     ax.set_xticklabels([f"{t:g}B" for t in ticks])
     ax.minorticks_off()
@@ -402,7 +409,8 @@ def scale_trend(df: pd.DataFrame, out_dir: Path, metric="corr",
                 "boot_lo": np.percentile(bslopes, 2.5), "boot_hi": np.percentile(bslopes, 97.5),
                 "spearman_rho": rho, "spearman_p": rho_p})
             for fam_name, fm in models.groupby("family"):
-                if len(fm) >= 3:
+                # per-family slopes only add information when there is more than one family
+                if models["family"].nunique() > 1 and len(fm) >= 3:
                     idx = fm.index.values
                     ff = _ols(x[idx], fm["family"].values, point[idx])
                     fit_rows.append({"readout": readout, "quantity": q,
@@ -433,14 +441,16 @@ def scale_trend(df: pd.DataFrame, out_dir: Path, metric="corr",
           "95% CI from neuron noise WITHIN models")
     print(fits.round(3).to_string(index=False))
     print(f"\n[trend] per-model means (cells weighted equally; 95% bootstrap CI):")
-    print(per_model.pivot_table(index=["readout", "model"], columns="quantity", values="mean")
-          .reindex(columns=["joint", "sft", "gain"])
-          .sort_index(level=1, key=lambda s: s.map({m: i for i, m in enumerate(MODELS)}))
-          .round(3).to_string())
+    order = {m: i for i, m in enumerate(MODELS)}
+    tbl = (per_model.assign(_o=per_model["model"].map(order))
+           .pivot_table(index=["readout", "_o", "model"], columns="quantity", values="mean")
+           .reindex(columns=["joint", "sft", "gain"]).droplevel("_o"))
+    print(tbl.round(3).to_string())
 
     # figure: one panel per quantity, interventional on top, endogenous below
     quantities = [("gain", f"{joint} - {base}"), ("joint", joint), ("sft", base)]
-    readouts = [r for r in READOUTS if r in set(per_model["readout"])]
+    # interventional first: it is the primary readout of the test
+    readouts = [r for r in ("interventional", "endogenous") if r in set(per_model["readout"])]
     fig, axes = plt.subplots(len(readouts), 3, figsize=(15, 4.6 * len(readouts)),
                              squeeze=False, sharex=True)
     marker = {"Llama": "o", "Qwen3": "s"}

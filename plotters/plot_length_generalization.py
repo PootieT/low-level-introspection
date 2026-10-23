@@ -613,7 +613,8 @@ def plot_relative_generalization(pooled: pd.DataFrame, out_dir):
     return tables
 
 
-def plot_relative_generalization_compare(pooled_by: dict, out_dir, eval_type="endogenous"):
+def plot_relative_generalization_compare(pooled_by: dict, out_dir, eval_type="endogenous",
+                                         rel_ylim=None):
     """Does the training OBJECTIVE change how well a readout generalizes in length?
 
     One column per training length (diagonal cells only, as in
@@ -625,6 +626,10 @@ def plot_relative_generalization_compare(pooled_by: dict, out_dir, eval_type="en
     Error bars are the spread over the 5 neurons. The same neurons are trained under
     every objective, so the difference is also tested PAIRED by neuron (per train length
     and ratio > 1) and written to relative_generalization_compare_<eval_type>.csv.
+
+    `rel_ylim` (percent) fixes the row-1 axis; means beyond it are drawn as triangles on
+    the edge. Needed for interventional: an SFT readout's in-distribution interventional
+    correlation is ~0, so its relative change is noise over ~0 and runs to +-10^4 %.
     """
     from scipy.stats import ttest_rel
     col = {"interventional": "interventional_corr", "endogenous": "endogenous_corr"}[eval_type]
@@ -663,10 +668,18 @@ def plot_relative_generalization_compare(pooled_by: dict, out_dir, eval_type="en
                 # solid = in-distribution (eval at the training length), hollow = longer
                 # than anything seen in training -- as in plot_relative_generalization
                 ind = g["ratio"] == 1
-                ax.plot(g.loc[ind, "ratio"], scale * g.loc[ind, y], "o", ms=8, color=c,
-                        zorder=3)
-                ax.plot(g.loc[~ind, "ratio"], scale * g.loc[~ind, y], "o", ms=8,
-                        mfc="white", mec=c, mew=1.8, zorder=3)
+                v = scale * g[y]
+                lo, hi = rel_ylim if (i == 0 and rel_ylim) else (-np.inf, np.inf)
+                off = (v < lo) | (v > hi)
+                for mask, kw in ((ind, dict(color=c)),
+                                 (~ind, dict(mfc="white", mec=c, mew=1.8))):
+                    on = mask & ~off
+                    ax.plot(g.loc[on, "ratio"], v[on], "o", ms=8, zorder=3, **kw)
+                    for edge, mk, sel in ((hi, "^", mask & (v > hi)),
+                                          (lo, "v", mask & (v < lo))):
+                        if sel.any():
+                            ax.plot(g.loc[sel, "ratio"], [edge] * int(sel.sum()), mk,
+                                    ms=11, zorder=4, clip_on=False, **kw)
         for i in range(2):
             ax = axes[i, j]
             ax.set_xscale("log", base=2)
@@ -674,6 +687,8 @@ def plot_relative_generalization_compare(pooled_by: dict, out_dir, eval_type="en
             ax.tick_params(labelsize=13)
             if i == 0:
                 ax.axhline(0, color="k", lw=0.9, alpha=0.5)
+                if rel_ylim:
+                    ax.set_ylim(*rel_ylim)
                 ax.set_title(f"Train Len {tl}", fontsize=17)
             else:
                 ax.set_xlabel("Eval Length / Train Length", fontsize=15)
@@ -738,7 +753,9 @@ def main_compare(specs, eval_types=("endogenous", "interventional")):
     out_dir = Path(f"{ROOT}/outputs/plots/lengen_objective_compare")
     out_dir.mkdir(parents=True, exist_ok=True)
     for et in eval_types:
-        plot_relative_generalization_compare(pooled_by, out_dir, et)
+        plot_relative_generalization_compare(
+            pooled_by, out_dir, et,
+            rel_ylim=(-100, 100) if et == "interventional" else None)
     print(f"\n[lengen] wrote {out_dir}")
 
 
