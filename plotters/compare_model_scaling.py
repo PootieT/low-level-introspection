@@ -242,6 +242,59 @@ def plot_depth_profile(df: pd.DataFrame, out_dir: Path, metric="corr"):
     plt.close(fig)
 
 
+def plot_position_profile(df: pd.DataFrame, out_dir: Path, metric="corr"):
+    """The depth profile's companion: metric against TOKEN POSITION, one line per model,
+    each point averaged over depths.
+
+    The average runs over the depth-matched layers only (within DEPTH_TOL of the shared
+    depths), so every model averages over the same depths and the lines differ by model,
+    not by which depths each model happened to train. All *_hyper_tuned grids have all
+    four; a model with fewer (the base 3B grid has two) is named in the panel note and
+    printed. Error bars are the SE over the pooled neurons at that position.
+    """
+    d = df[(df["metric"] == metric) & df["depth_bin"].notna()]
+    if d.empty:
+        return
+    arms = [a for a in ARM_ORDER if a in set(d["arm"])]
+    n_bins = d.groupby("model")["depth_bin"].nunique()
+    partial = {m: int(n) for m, n in n_bins.items() if n < len(SHARED_DEPTHS)}
+    if partial:
+        print(f"[scale] position profile: averaged over fewer than {len(SHARED_DEPTHS)} "
+              f"matched depths for {partial}")
+    positions = sorted(d["position"].unique())
+    fig, axes = plt.subplots(len(READOUTS), len(arms),
+                             figsize=(4.3 * len(arms), 3.9 * len(READOUTS)),
+                             squeeze=False, sharex=True, sharey="row")
+    colors = dict(zip(MODELS, sns.color_palette("viridis", len(MODELS))))
+    for r, readout in enumerate(READOUTS):
+        for c, arm in enumerate(arms):
+            ax = axes[r][c]
+            for model in MODELS:
+                q = _agg(d[(d["readout"] == readout) & (d["arm"] == arm)
+                           & (d["model"] == model)], ["position"]).sort_values("position")
+                if q.empty:
+                    continue
+                ax.errorbar(q["position"], q["mean"], yerr=q["se"], marker="o", ms=6,
+                            capsize=3, lw=1.8, color=colors[model], label=model)
+            ax.axhline(0, color="k", lw=0.8, alpha=0.4)
+            ax.set_ylim(-0.1, 1.02)
+            ax.set_xticks(positions)
+            if r == 0:
+                ax.set_title(arm)
+            if r == len(READOUTS) - 1:
+                ax.set_xlabel("token position (-1 = last)")
+            if c == 0:
+                ax.set_ylabel(f"{readout}\n{metric}")
+    axes[0][-1].legend(fontsize=9)
+    note = f"averaged over depths {list(SHARED_DEPTHS)}"
+    if partial:
+        note += "; fewer for " + ", ".join(f"{m} ({n})" for m, n in partial.items())
+    fig.suptitle(note, fontsize=10, y=1.0)
+    fig.tight_layout()
+    fig.savefig(out_dir / f"position_profile_{metric}.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_scaling(df: pd.DataFrame, out_dir: Path, metric="corr", shared_depths_only=True):
     """Metric against parameter count, one line per arm.
 
@@ -544,6 +597,7 @@ def main():
     for metric in [m for m in wanted if m in present]:
         report(df, metric)
         plot_depth_profile(df, args.out_dir, metric)
+        plot_position_profile(df, args.out_dir, metric)
         plot_scaling(df, args.out_dir, metric)
         joint_minus_sft(df, args.out_dir, metric)
         scale_trend(df, args.out_dir, metric)
