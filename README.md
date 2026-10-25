@@ -78,6 +78,141 @@ Run everything from the repo root, as `python <folder>/<script>.py`.
 ## Example Experiments
 Checkout `.sh` files in `scripts/`; `scripts/README.md` lists what each one runs.
 
+Every experiment has the same three steps, run from the repo root on one GPU:
+1. write a config: `data_prep/generate_experiment_config.py`
+2. cache the signal values for that config: `data_prep/cache_signals.py`. This needs the GPU
+   and is skipped if the cache already exists.
+3. train, then evaluate: `trainers/train_introspector_joint.py` (neurons, attention) or
+   `trainers/train_sae_detector_joint.py` (SAE features).
+
+`--joint-loss-weight W` is the weight on the endogenous loss; the interventional loss gets
+`1 - W`. `W=1.0` is the SFT baseline and `W<1` is the joint loss from the paper. Both
+endogenous and interventional test metrics are written to `outputs/runs/<group>/<name>/`
+whatever `W` is.
+
+To train a `Llama-3.2-1B` model to introspect a single neuron `N6.115` (fixed token position), you can do:
+```commandline
+CONFIG=experiment_configs/examples/llama1b_N6.115_pos-1.json
+python data_prep/generate_experiment_config.py \
+    --experiment-name llama1b_N6.115_pos-1 --model meta-llama/Llama-3.2-1B \
+    --train-dataset allenai/c4 --train-dataset-split train --train-max-samples 300000 \
+    --dev-max-samples 200 --dev-offset-from-train 1000000 \
+    --test-dataset allenai/c4 --test-dataset-split validation --test-max-samples 3000 \
+    --hf-data-kwargs '{"config": "en", "streaming": true}' --max-seq-length 32 \
+    --train-signals N6.115 --test-signals N6.115 \
+    --train-token-selector -1 --test-token-selector -1 --precision 3 \
+    --use-regressor --intervention-signal-distribution extreme --intervention-extreme-scale 10 \
+    --train-batch-size 32 --eval-batch-size 128 --num-epochs 1 --learning-rate 5e-5 \
+    --lora-r 16 --lora-alpha 32 --lora-dropout 0.0 --bf16 --save-steps 0 \
+    --cache-dir data --output-dir outputs/runs/examples --output $CONFIG
+python data_prep/cache_signals.py --config $CONFIG
+python trainers/train_introspector_joint.py --config $CONFIG \
+    --joint-loss-weight 0.01 --kl-anchor-target 0.1 --force-drift-eval
+```
+These are the main grid's settings (Section 4). `--kl-anchor-target 0.1` holds the
+language model's KL to its base at 0.1 nats/token; drop it for the unanchored ceiling.
+`--force-drift-eval` checks that the cache lines up with the live model: look for
+`alignment OK`. Add `python evals/score_lm_degradation.py --config $CONFIG` to measure
+the language-model cost.
+
+To train a `Qwen3-8B` model to introspect multiple token positions for neuron `N1.55` and `N12.4201`, you can do:
+```commandline
+CONFIG=experiment_configs/examples/qwen3_8b_N1.55_N12.4201_pos-8to-1.json
+python data_prep/generate_experiment_config.py \
+    --experiment-name qwen3_8b_N1.55_N12.4201_pos-8to-1 --model Qwen/Qwen3-8B-Base \
+    --train-dataset allenai/c4 --train-dataset-split train --train-max-samples 300000 \
+    --dev-max-samples 200 --dev-offset-from-train 1000000 \
+    --test-dataset allenai/c4 --test-dataset-split validation --test-max-samples 3000 \
+    --hf-data-kwargs '{"config": "en", "streaming": true}' \
+    --max-seq-length 32 --min-seq-length 32 \
+    --train-signals N1.55,N12.4201 --test-signals N1.55,N12.4201 \
+    --train-token-selector=-8:-1 --test-token-selector=-8:-1 \
+    --prompt-type prompt_with_token_index --precision 3 \
+    --use-regressor --intervention-signal-distribution extreme --intervention-extreme-scale 10 \
+    --train-batch-size 16 --gradient-accumulation-steps 2 --eval-batch-size 128 \
+    --num-epochs 1 --learning-rate 5e-5 \
+    --lora-r 16 --lora-alpha 32 --lora-dropout 0.0 --bf16 --save-steps 0 \
+    --cache-dir data --output-dir outputs/runs/examples --output $CONFIG
+python data_prep/cache_signals.py --config $CONFIG
+python trainers/train_introspector_joint.py --config $CONFIG \
+    --joint-loss-weight 0.01 --kl-anchor-target 0.1 --force-drift-eval
+```
+One run learns both neurons. Each text gets one position drawn uniformly from the last 8
+tokens, so the prompt has to name it (`prompt_with_token_index`). Write a range selector
+with `=` (`--train-token-selector=-8:-1`), because a value starting with `-` would
+otherwise be read as a flag. `--min-seq-length 32` makes every text exactly 32 tokens, so
+a negative position always means the same token. Qwen's base checkpoints have the `-Base`
+suffix. The LR is the one the Qwen3-8B LR sweep picked, at an effective batch of 32
+(16 x 2). Per-neuron metrics go to `endogenous_test_by_signal_endogenous.csv`.
+
+To train a `Llama-3.2-3B` model to introspection attention head `A7.5`, fixing destination token at `t=-1`, you can do:
+```commandline
+CONFIG=experiment_configs/examples/llama3b_A7.5@-3_pos-1.json
+python data_prep/generate_experiment_config.py \
+    --experiment-name llama3b_A7.5@-3_pos-1 --model meta-llama/Llama-3.2-3B \
+    --train-dataset allenai/c4 --train-dataset-split train --train-max-samples 300000 \
+    --dev-max-samples 200 --dev-offset-from-train 1000000 \
+    --test-dataset allenai/c4 --test-dataset-split validation --test-max-samples 3000 \
+    --hf-data-kwargs '{"config": "en", "streaming": true}' \
+    --max-seq-length 32 --min-seq-length 32 \
+    --train-signals A7.5@-3 --test-signals A7.5@-3 \
+    --train-token-selector -1 --test-token-selector -1 --precision 3 \
+    --use-regressor --intervention-signal-distribution extreme --intervention-extreme-scale 10 \
+    --train-batch-size 32 --eval-batch-size 128 --num-epochs 1 --learning-rate 5e-5 \
+    --warmup-ratio 0.03 --lr-scheduler-type cosine \
+    --lora-r 16 --lora-alpha 32 --lora-dropout 0.0 --bf16 --save-steps 0 \
+    --cache-dir data --output-dir outputs/runs/examples --output $CONFIG
+python data_prep/cache_signals.py --config $CONFIG
+python trainers/train_introspector_joint.py --config $CONFIG \
+    --joint-loss-weight 1.0 --force-drift-eval
+```
+`A7.5@-3` is the pre-softmax attention logit of layer 7, head 5, from the destination
+token (the token selector, here the last token) to the token 3 positions before it. To
+read several source offsets, cache them together
+(`--train-signals A7.5@-1,A7.5@-3,A7.5@-7`) and train one run per offset with
+`--signal-filter A7.5@-3`. `data_prep/cache_signals.py` refuses an attention config whose length
+floor cannot reach every offset; the grids set `--min-seq-length` equal to
+`--max-seq-length`, so every source offset is the same token in every text. This is the attention-logit
+grid's recipe (`scripts/attention/`), which trains endogenously only (`W=1.0`); with a
+3B model it is untested. For the joint loss on attention, the paper uses post-softmax
+weights (`P7.5@-3`) with the readout and injection of
+`scripts/attention_weight/paper/2-2_grid_endogenous_logistic_norm_dev_prob_uniform.sh`.
+Before any `W<1` run on logits, read `scripts/README.md` on choosing
+`--intervention-extreme-scale`.
+
+To train a `Gemma-2-2B` model to introspect SAE features (pre-selected) at fixed token location, you can do:
+```commandline
+FEATURES=S9.1568,S9.4854,S9.4120,S9.978,S9.12408
+for SIG in ${FEATURES//,/ }; do
+  CONFIG=experiment_configs/examples/gemma2b_${SIG}_pos-1.json
+  python data_prep/generate_experiment_config.py \
+      --experiment-name gemma2b_${SIG}_pos-1 --model google/gemma-2-2b \
+      --objective detection --detection-balance-pos-frac 0.5 \
+      --intervention-signal-distribution extreme --intervention-extreme-scale 1 \
+      --train-dataset allenai/c4 --train-dataset-split train --train-max-samples 150000 \
+      --dev-max-samples 2000 --dev-offset-from-train 1000000 \
+      --test-dataset allenai/c4 --test-dataset-split validation --test-max-samples 30000 \
+      --hf-data-kwargs '{"config": "en", "streaming": true}' --max-seq-length 32 \
+      --train-signals $FEATURES --test-signals $FEATURES --signal-filter $SIG \
+      --train-token-selector -1 --test-token-selector -1 --precision 3 \
+      --train-batch-size 32 --eval-batch-size 128 --num-epochs 1 --learning-rate 2e-5 \
+      --warmup-ratio 0.03 --lr-scheduler-type cosine \
+      --lora-r 16 --lora-alpha 32 --lora-dropout 0.0 --bf16 --save-steps 0.25 \
+      --cache-dir data --output-dir outputs/runs/examples --output $CONFIG
+  python data_prep/cache_signals.py --config $CONFIG
+  python trainers/train_sae_detector_joint.py --config $CONFIG \
+      --joint-loss-weight 0.9 --kl-anchor-target 0.1 --force-drift-eval
+done
+```
+`S9.1568` is feature 1568 of the Gemma Scope 16k residual SAE at layer 9. These five are
+the hand-judged layer-9 features (how they were chosen: `scripts/sae/README.md`). SAE
+features are sparse, so the readout is binary detection ("active" / "inactive"), trained
+on a 50/50 balanced set. Interventional training steers the feature on or off. All five
+configs list the same features, so they share one cache, and `--signal-filter` picks
+the feature each run trains on. `W=0.9` is the paper's SAE joint arm and `W=1.0` its SFT
+arm. This needs `sae_lens`, which downloads the SAE weights on first use.
+
+### Experiments and Figures in the paper
 Here are the list of scripts corresponding to each paper section:
 
 | Section | Training | Plotting |
