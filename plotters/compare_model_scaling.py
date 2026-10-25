@@ -70,9 +70,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+sys.path.insert(0, str(Path(__file__).parent))
+from compare_sft_vs_joint import pretty_arm  # noqa: E402
+from plot_single_neuron_results import SEQ_LEN  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
-plt.rcParams.update({"font.size": 13, "axes.titlesize": 15, "axes.labelsize": 14,
-                     "legend.fontsize": 11})
+plt.rcParams.update({"font.size": 17, "axes.titlesize": 22, "axes.labelsize": 20,
+                     "xtick.labelsize": 17, "ytick.labelsize": 17, "legend.fontsize": 14})
 
 # display name -> (plot-dir suffix, n_layers, params in billions)
 MODEL_SETS = {
@@ -188,6 +192,32 @@ def _agg(df, by):
     return out
 
 
+FAMILY_MARKER = {"Llama": "o", "Qwen3": "^"}
+FAMILY_COLOR = {"Llama": "#2471a3", "Qwen3": "#c0392b"}
+READOUT_COLOR = {"endogenous": "#1b9e77", "interventional": "#d95f02"}
+METRIC_NAME = {"corr": "Correlation", "spearman": "Spearman \u03c1",
+               "kendall_tau": "Kendall \u03c4", "monotone_r2": "Monotone R\u00b2"}
+
+
+def model_styles(models):
+    """Colour and marker per model: Llama in blues, Qwen in reds (darker = larger), Qwen
+    drawn with triangles so the families stay apart in greyscale too."""
+    out = {}
+    for fam, cmap in (("Llama", "Blues"), ("Qwen3", "Reds")):
+        ms = sorted((m for m in models if family(m) == fam), key=lambda m: MODELS[m][2])
+        for m, c in zip(ms, sns.color_palette(cmap, len(ms) + 2)[2:]):
+            out[m] = dict(color=c, marker=FAMILY_MARKER[fam])
+    for m in models:
+        out.setdefault(m, dict(color="grey", marker="s"))
+    return out
+
+
+def _family_handles(families, color="k"):
+    from matplotlib.lines import Line2D
+    return [Line2D([], [], ls="", marker=FAMILY_MARKER.get(f, "s"), ms=10, color=color,
+                   label=f) for f in families]
+
+
 def _size_ticks(ax, params):
     """Round size ticks on the log axis. With three models each size gets its own tick;
     with more, sizes crowd (1.24 / 1.72, 3.21 / 4.02, 8.03 / 8.19), so round ticks are
@@ -210,35 +240,51 @@ def plot_depth_profile(df: pd.DataFrame, out_dir: Path, metric="corr"):
     average -- the reader sees the profile each model actually has, and whether the
     shape is preserved as scale grows.
     """
-    d = df[df["metric"] == metric]
+    _profile(df[df["metric"] == metric], "depth", out_dir / f"depth_profile_{metric}.png",
+             metric, xlabel="Relative Depth (Layer / # Layers)")
+
+
+def _profile(d, xcol, path, metric, xlabel, xticks=None, xmap=None):
+    """Shared body of the depth and position profiles: readouts x arms, one line per
+    model (Llama blues / circles, Qwen reds / triangles), mean +- SE over neurons."""
     if d.empty:
         return
     arms = [a for a in ARM_ORDER if a in set(d["arm"])]
+    # family-major order, so the two-column key reads Llama | Qwen
+    models = sorted((m for m in MODELS if m in set(d["model"])),
+                    key=lambda m: (family(m), MODELS[m][2]))
+    style = model_styles(models)
     fig, axes = plt.subplots(len(READOUTS), len(arms),
-                             figsize=(4.3 * len(arms), 3.9 * len(READOUTS)),
+                             figsize=(6.4 * len(arms), 5.4 * len(READOUTS)),
                              squeeze=False, sharex=True, sharey="row")
-    colors = dict(zip(MODELS, sns.color_palette("viridis", len(MODELS))))
     for r, readout in enumerate(READOUTS):
         for c, arm in enumerate(arms):
             ax = axes[r][c]
-            for model in MODELS:
+            for model in models:
                 q = _agg(d[(d["readout"] == readout) & (d["arm"] == arm)
-                           & (d["model"] == model)], ["depth"]).sort_values("depth")
+                           & (d["model"] == model)], [xcol]).sort_values(xcol)
                 if q.empty:
                     continue
-                ax.errorbar(q["depth"], q["mean"], yerr=q["se"], marker="o", ms=6,
-                            capsize=3, lw=1.8, color=colors[model], label=model)
+                x = q[xcol].map(xmap) if xmap else q[xcol]
+                ax.errorbar(x, q["mean"], yerr=q["se"], marker=style[model]["marker"],
+                            ms=9, capsize=3, lw=2, color=style[model]["color"], label=model)
             ax.axhline(0, color="k", lw=0.8, alpha=0.4)
             ax.set_ylim(-0.1, 1.02)
+            ax.grid(alpha=0.25)
+            if xticks is not None:
+                ax.set_xticks(xticks)
             if r == 0:
-                ax.set_title(arm)
+                ax.set_title(pretty_arm(arm))
             if r == len(READOUTS) - 1:
-                ax.set_xlabel("relative depth (layer / n_layers)")
+                ax.set_xlabel(xlabel)
             if c == 0:
-                ax.set_ylabel(f"{readout}\n{metric}")
-    axes[0][-1].legend(fontsize=9)
+                ax.set_ylabel(f"{readout.capitalize()} {METRIC_NAME.get(metric, metric)}\n"
+                              f"(Mean \u00b1 SE)")
+    # the endogenous panels sit high (~0.6-1), so their lower half is free for the key
+    axes[0][0].legend(loc="lower left", ncol=2, fontsize=13, frameon=False,
+                      handlelength=1.6, columnspacing=0.8)
     fig.tight_layout()
-    fig.savefig(out_dir / f"depth_profile_{metric}.png", dpi=150)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -250,7 +296,8 @@ def plot_position_profile(df: pd.DataFrame, out_dir: Path, metric="corr"):
     depths), so every model averages over the same depths and the lines differ by model,
     not by which depths each model happened to train. All *_hyper_tuned grids have all
     four; a model with fewer (the base 3B grid has two) is named in the panel note and
-    printed. Error bars are the SE over the pooled neurons at that position.
+    printed (no longer in a figure title). Error bars are the SE over the pooled neurons
+    at that position.
     """
     d = df[(df["metric"] == metric) & df["depth_bin"].notna()]
     if d.empty:
@@ -261,38 +308,12 @@ def plot_position_profile(df: pd.DataFrame, out_dir: Path, metric="corr"):
     if partial:
         print(f"[scale] position profile: averaged over fewer than {len(SHARED_DEPTHS)} "
               f"matched depths for {partial}")
-    positions = sorted(d["position"].unique())
-    fig, axes = plt.subplots(len(READOUTS), len(arms),
-                             figsize=(4.3 * len(arms), 3.9 * len(READOUTS)),
-                             squeeze=False, sharex=True, sharey="row")
-    colors = dict(zip(MODELS, sns.color_palette("viridis", len(MODELS))))
-    for r, readout in enumerate(READOUTS):
-        for c, arm in enumerate(arms):
-            ax = axes[r][c]
-            for model in MODELS:
-                q = _agg(d[(d["readout"] == readout) & (d["arm"] == arm)
-                           & (d["model"] == model)], ["position"]).sort_values("position")
-                if q.empty:
-                    continue
-                ax.errorbar(q["position"], q["mean"], yerr=q["se"], marker="o", ms=6,
-                            capsize=3, lw=1.8, color=colors[model], label=model)
-            ax.axhline(0, color="k", lw=0.8, alpha=0.4)
-            ax.set_ylim(-0.1, 1.02)
-            ax.set_xticks(positions)
-            if r == 0:
-                ax.set_title(arm)
-            if r == len(READOUTS) - 1:
-                ax.set_xlabel("token position (-1 = last)")
-            if c == 0:
-                ax.set_ylabel(f"{readout}\n{metric}")
-    axes[0][-1].legend(fontsize=9)
-    note = f"averaged over depths {list(SHARED_DEPTHS)}"
-    if partial:
-        note += "; fewer for " + ", ".join(f"{m} ({n})" for m, n in partial.items())
-    fig.suptitle(note, fontsize=10, y=1.0)
-    fig.tight_layout()
-    fig.savefig(out_dir / f"position_profile_{metric}.png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    # absolute token index (t = SEQ_LEN + position, last token = SEQ_LEN - 1), as in the
+    # per-model heatmaps
+    to_abs = lambda p: SEQ_LEN + int(p)  # noqa: E731
+    _profile(d, "position", out_dir / f"position_profile_{metric}.png", metric,
+             xlabel="Token Position", xmap=to_abs,
+             xticks=sorted(to_abs(p) for p in d["position"].unique()))
 
 
 def plot_scaling(df: pd.DataFrame, out_dir: Path, metric="corr", shared_depths_only=True):
@@ -308,31 +329,46 @@ def plot_scaling(df: pd.DataFrame, out_dir: Path, metric="corr", shared_depths_o
     matched = d[d["depth_bin"].notna()] if shared_depths_only else d
     # models whose layers only APPROXIMATE the shared depths (beyond float noise)
     approx = set(matched.loc[(matched["depth"] - matched["depth_bin"]).abs() > 1e-3, "model"])
-    fig, axes = plt.subplots(1, len(READOUTS), figsize=(6.4 * len(READOUTS), 5), sharey=True)
+    from matplotlib.lines import Line2D
+    fig, axes = plt.subplots(1, len(READOUTS), figsize=(7.4 * len(READOUTS), 5.8), sharey=True)
     arms = [a for a in ARM_ORDER if a in set(d["arm"])]
-    colors = dict(zip(arms, sns.color_palette("Set1", len(arms))))
+    colors = dict(zip(arms, ["#2471a3", "#5dade2", "#c0392b", "#e67e22"]
+                      if len(arms) == 4 else sns.color_palette("Set1", len(arms))))
+    colors.update({"sft_gateoff": "#2471a3", "joint_kl0.1": "#c0392b"})
     for ax, readout in zip(axes, READOUTS):
         for arm in arms:
             q = _agg(matched[(matched["readout"] == readout) & (matched["arm"] == arm)],
                      ["model", "params_b"]).sort_values("params_b")
             if q.empty:
                 continue
-            ax.errorbar(q["params_b"], q["mean"], yerr=q["se"], marker="o", ms=7,
-                        capsize=3, lw=1.8, color=colors[arm], label=arm)
-            # layers only near the shared depths: hollow, so the caveat is visible
-            off = q[q["model"].isin(approx)]
-            if len(off):
-                ax.scatter(off["params_b"], off["mean"], s=120, facecolors="white",
-                           edgecolors=colors[arm], linewidths=2, zorder=5)
+            q["family"] = q["model"].map(family)
+            # lines join models of one family only: across families they would zigzag
+            for fam, g in q.groupby("family"):
+                mk = FAMILY_MARKER.get(fam, "s")
+                ax.errorbar(g["params_b"], g["mean"], yerr=g["se"], marker=mk, ms=10,
+                            capsize=3, lw=1.6, color=colors[arm])
+                # layers only near the shared depths: hollow, so the caveat is visible
+                off = g[g["model"].isin(approx)]
+                if len(off):
+                    ax.scatter(off["params_b"], off["mean"], s=130, marker=mk,
+                               facecolors="white", edgecolors=colors[arm], linewidths=2,
+                               zorder=5)
         ax.set_xscale("log")
-        _size_ticks(ax, [m[2] for m in MODELS.values()])
+        _size_ticks(ax, matched["params_b"].unique())
         ax.axhline(0, color="k", lw=0.8, alpha=0.4)
-        ax.set_xlabel("parameters")
-        ax.set_title(readout)
-    axes[0].set_ylabel(metric)
-    axes[-1].legend(fontsize=9)
+        ax.grid(alpha=0.25)
+        ax.set_xlabel("Parameters")
+        ax.set_title(readout.capitalize())
+    axes[0].set_ylabel(f"{METRIC_NAME.get(metric, metric)} (Mean \u00b1 SE)")
+    handles = [Line2D([], [], color=colors[a], lw=2.5, label=pretty_arm(a)) for a in arms]
+    handles += _family_handles(sorted(set(matched["family"])))
+    if approx:
+        handles.append(Line2D([], [], ls="", marker="o", ms=10, mfc="white", mec="k",
+                              mew=2, label="Depth \u2248 Shared"))
+    # endogenous sits near the top, leaving its lower half empty for the key
+    axes[0].legend(handles=handles, fontsize=14, loc="lower left", frameon=False)
     fig.tight_layout()
-    fig.savefig(out_dir / f"scaling_{metric}.png", dpi=150)
+    fig.savefig(out_dir / f"scaling_{metric}.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -357,23 +393,53 @@ def joint_minus_sft(df: pd.DataFrame, out_dir: Path, metric="corr",
     tbl = (matched.groupby(["readout", "model", "params_b"])["delta"]
            .agg(mean="mean", std="std", n="count").reset_index())
     tbl["se"] = tbl["std"] / np.sqrt(tbl["n"].clip(lower=1))
+    tbl["family"] = tbl["model"].map(family)
     tbl.to_csv(out_dir / f"joint_minus_sft_{metric}.csv", index=False)
-    fig, ax = plt.subplots(figsize=(7, 5))
-    colors = dict(zip(READOUTS, sns.color_palette("Set2", len(READOUTS))))
+    from matplotlib.lines import Line2D
+    fig, ax = plt.subplots(figsize=(8.5, 6.2))
+    handles, fit_rows = [], []
     for readout in READOUTS:
-        q = tbl[tbl["readout"] == readout].sort_values("params_b")
+        q = tbl[tbl["readout"] == readout].sort_values("params_b").reset_index(drop=True)
         if q.empty:
             continue
-        ax.errorbar(q["params_b"], q["mean"], yerr=q["se"], marker="o", ms=7, capsize=3,
-                    lw=1.8, color=colors[readout], label=readout)
+        col = READOUT_COLOR[readout]
+        # points only, no line through all models: Llama and Qwen alternate in size
+        for fam, g in q.groupby("family"):
+            ax.errorbar(g["params_b"], g["mean"], yerr=g["se"], ls="",
+                        marker=FAMILY_MARKER.get(fam, "s"), ms=11, capsize=3, color=col)
+        label = readout.capitalize()
+        if len(q) >= 3:
+            # same fit as scale_trend: mean ~ log10(params) [+ family], drawn as the pooled
+            # slope through each family's own mean (where the OLS line for that family runs)
+            x = np.log10(q["params_b"].values)
+            fit = _ols(x, q["family"].values, q["mean"].values)
+            xs = np.array([x.min(), x.max()])
+            for fam, g in q.groupby("family"):
+                x0, y0 = np.log10(g["params_b"]).mean(), g["mean"].mean()
+                ax.plot(10 ** xs, y0 + fit["slope"] * (xs - x0), ls="--", lw=1.6,
+                        color=col, alpha=0.8)
+            label += f": {fit['slope']:+.3f}/decade, p={fit['p']:.2f}"
+            fit_rows.append({"readout": readout, "n_models": len(q),
+                             "slope_per_decade": fit["slope"], "ols_se": fit["se"],
+                             "ols_p": fit["p"], "ols_dof": fit["dof"],
+                             "family_term": fit["family_term"]})
+        handles.append(Line2D([], [], color=col, ls="--", lw=2, label=label))
+    if fit_rows:
+        fits = pd.DataFrame(fit_rows)
+        fits.to_csv(out_dir / f"joint_minus_sft_fits_{metric}.csv", index=False)
+        print(f"\n[scale] joint - SFT ({metric}) vs log10 params:")
+        print(fits.round(3).to_string(index=False))
+    handles += _family_handles(sorted(tbl["family"].unique()))
     ax.axhline(0, color="k", lw=0.9, alpha=0.5)
     ax.set_xscale("log")
-    _size_ticks(ax, [m[2] for m in MODELS.values()])
-    ax.set_xlabel("parameters")
-    ax.set_ylabel(f"{joint} - {base}  ({metric})")
-    ax.legend()
+    _size_ticks(ax, tbl["params_b"].unique())
+    ax.grid(alpha=0.25)
+    ax.set_xlabel("Parameters")
+    ax.set_ylabel(f"\u0394 {METRIC_NAME.get(metric, metric)} (Joint \u2212 SFT)\n"
+                  f"(Mean \u00b1 SE)")
+    ax.legend(handles=handles, fontsize=13, loc="best", frameon=False)
     fig.tight_layout()
-    fig.savefig(out_dir / f"joint_minus_sft_{metric}.png", dpi=150)
+    fig.savefig(out_dir / f"joint_minus_sft_{metric}.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
     return tbl
 
@@ -501,13 +567,13 @@ def scale_trend(df: pd.DataFrame, out_dir: Path, metric="corr",
     print(tbl.round(3).to_string())
 
     # figure: one panel per quantity, interventional on top, endogenous below
-    quantities = [("gain", f"{joint} - {base}"), ("joint", joint), ("sft", base)]
+    quantities = [("gain", "Joint \u2212 SFT"), ("joint", pretty_arm(joint)),
+                  ("sft", pretty_arm(base))]
     # interventional first: it is the primary readout of the test
     readouts = [r for r in ("interventional", "endogenous") if r in set(per_model["readout"])]
-    fig, axes = plt.subplots(len(readouts), 3, figsize=(15, 4.6 * len(readouts)),
+    fig, axes = plt.subplots(len(readouts), 3, figsize=(19, 6.2 * len(readouts)),
                              squeeze=False, sharex=True)
-    marker = {"Llama": "o", "Qwen3": "s"}
-    color = {"Llama": "#1f77b4", "Qwen3": "#d62728"}
+    marker, color = FAMILY_MARKER, FAMILY_COLOR
     for r, readout in enumerate(readouts):
         for c, (q, label) in enumerate(quantities):
             ax = axes[r][c]
@@ -515,11 +581,11 @@ def scale_trend(df: pd.DataFrame, out_dir: Path, metric="corr",
             for fam_name, g in pm.groupby("family"):
                 ax.errorbar(g["params_b"], g["mean"],
                             yerr=[g["mean"] - g["boot_lo"], g["boot_hi"] - g["mean"]],
-                            fmt=marker.get(fam_name, "o"), ms=8, capsize=3,
+                            fmt=marker.get(fam_name, "o"), ms=11, capsize=3,
                             color=color.get(fam_name, "grey"), label=fam_name)
                 for _, row in g.iterrows():
                     ax.annotate(row["model"].split("-", 1)[1], (row["params_b"], row["mean"]),
-                                textcoords="offset points", xytext=(6, 4), fontsize=8)
+                                textcoords="offset points", xytext=(7, 4), fontsize=13)
             f = fits[(fits["readout"] == readout) & (fits["quantity"] == q)
                      & fits["family_term"].isin([True, False])]
             if len(f):
@@ -530,19 +596,21 @@ def scale_trend(df: pd.DataFrame, out_dir: Path, metric="corr",
                     x0, y0 = np.log10(g["params_b"]).mean(), g["mean"].mean()
                     ax.plot(10 ** xs, y0 + f["slope_per_decade"] * (xs - x0), ls="--",
                             lw=1.2, color=color.get(fam_name, "grey"), alpha=0.7)
-                ax.set_title(f"{label}\nslope {f['slope_per_decade']:+.3f}/decade "
-                             f"(OLS p={f['ols_p']:.2f})", fontsize=11)
+                ax.set_title(f"{label}\nSlope {f['slope_per_decade']:+.3f}/decade "
+                             f"(p={f['ols_p']:.2f})", fontsize=20)
             if q == "gain":
                 ax.axhline(0, color="k", lw=0.8, alpha=0.5)
             ax.set_xscale("log")
             _size_ticks(ax, pm["params_b"].unique())
+            ax.grid(alpha=0.25)
             if r == len(readouts) - 1:
-                ax.set_xlabel("parameters")
+                ax.set_xlabel("Parameters")
             if c == 0:
-                ax.set_ylabel(f"{readout} {metric}")
-        axes[r][0].legend(fontsize=9)
+                ax.set_ylabel(f"{readout.capitalize()} {METRIC_NAME.get(metric, metric)}\n"
+                              f"(Mean, 95% CI)")
+    axes[0][0].legend(fontsize=14, frameon=False, loc="lower right")
     fig.tight_layout()
-    fig.savefig(out_dir / f"scale_trend_{metric}.png", dpi=150)
+    fig.savefig(out_dir / f"scale_trend_{metric}.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
     return fits
 
