@@ -76,6 +76,9 @@ def parse_args():
                    help="Permutations for the layer-matched nulls.")
     p.add_argument("--out-dir", type=Path, default=None,
                    help="Default: outputs/plots/<group>/head_knockout")
+    p.add_argument("--replot", action="store_true",
+                   help="Redraw the figures from knockout_runs.csv / "
+                        "knockout_head_prevalence.csv in the output dir (no run dirs).")
     return p.parse_args()
 
 
@@ -180,8 +183,14 @@ def _draw_row(axes, runs, xcol, xlabel, panels, fonts, titles=True, legends=True
             ax.scatter(x + rng.uniform(-width / 4, width / 4, len(x)), runs[col],
                        s=fonts["point"], color=color, alpha=0.5, label=label)
             med = runs.groupby(xcol)[col].median()
-            ax.scatter([pos[v] + off for v in med.index], med.values, marker="_",
-                       s=fonts["median"], color=color, linewidths=2.5)
+            mx = [pos[v] + off for v in med.index]
+            lw = fonts.get("median_lw", 2.5)
+            if fonts.get("median_edge"):
+                # dark outline under the bar, so it stands out of the point cloud
+                ax.scatter(mx, med.values, marker="_", s=fonts["median"] * 1.08, color="k",
+                           linewidths=lw + 3, zorder=4)
+            ax.scatter(mx, med.values, marker="_", s=fonts["median"], color=color,
+                       linewidths=lw, zorder=5)
         ax.set_xticks(range(len(levels)), levels)
         ax.set_xlabel(xlabel, fontsize=fonts["label"])
         ax.set_ylabel(ylabel, fontsize=fonts["label"])
@@ -226,6 +235,8 @@ def agreement_by_locale(runs: pd.DataFrame, k: int, q: float, out: Path):
     fig.savefig(out / "knockout_agreement_by_locale.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
+    agreement_grid(runs, k, q, out)
+
     for xcol, xlabel, fname in xs:
         fig, axes = plt.subplots(1, len(panels), figsize=(4.6 * len(panels), 6.2),
                                  squeeze=False)
@@ -235,6 +246,82 @@ def agreement_by_locale(runs: pd.DataFrame, k: int, q: float, out: Path):
         fig.subplots_adjust(left=0.04, right=0.99, top=0.86, bottom=0.36, wspace=0.48)
         fig.savefig(out / fname, dpi=200, bbox_inches="tight")
         plt.close(fig)
+
+
+FONTS_GRID = {"title": 32, "label": 28, "tick": 25, "legend": 26, "point": 55,
+              "median": 900, "median_lw": 6, "median_edge": True, "letter": 50}
+
+
+def _panel_letter(ax, letter, fonts):
+    """Bold lower-case panel letter tucked into the axes' bottom-left corner: below the
+    y tick labels and left of the x tick labels, so it adds no margin of its own."""
+    ax.annotate(letter, xy=(0, 0), xycoords="axes fraction", xytext=(-8, -6),
+                textcoords="offset points", fontsize=fonts["letter"], fontweight="bold",
+                ha="right", va="top")
+
+
+def _header(fig, x, y, title, handles, labels, fonts, below=False):
+    """Bold title at (x, y) (figure fraction, text baseline), its legend on the same line
+    right after it -- or, below=True, stacked one entry per line under it."""
+    t = fig.text(x, y, title, fontsize=fonts["title"], fontweight="bold",
+                 ha="left", va="baseline")
+    kw = dict(fontsize=fonts["legend"], frameon=False, markerscale=1.6, borderpad=0,
+              borderaxespad=0, handletextpad=0.2, columnspacing=1.0)
+    if below:
+        fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(x, y - 0.012),
+                   ncol=1, labelspacing=0.25, **kw)
+        return
+    bb = t.get_window_extent(fig.canvas.get_renderer())
+    fig.legend(handles, labels, loc="lower left",
+               bbox_to_anchor=(bb.x1 / fig.bbox.width + 0.012, y - 0.006),
+               ncol=len(labels), **kw)
+
+
+def agreement_grid(runs: pd.DataFrame, k: int, q: float, out: Path,
+                   xcol="signal_layer", xlabel="Signal Layer",
+                   fname="knockout_agreement_by_signal_layer_grid.png"):
+    """The same five panels as knockout_agreement_by_signal_layer.png, larger and grouped
+    by purpose: (a, b) the two overlap panels top left, (c, d) the two sparsity panels
+    below them, (e) transfer -- functional similarity -- as one big panel spanning both
+    rows on the right. Each group has one bold title with its legend beside it; the two
+    overlap panels draw "Observed" in one colour so one legend serves both.
+
+    Laid out by hand, in inches, because constrained layout cannot set a legend on the
+    same line as a title."""
+    over_mass, over_jac, transfer, sp_pos, sp_abs = _agreement_panels(k, q)
+    observed = "#7d3c98"     # not red / blue, which mean Endogenous / Interventional here
+    recolor = lambda pnl: (pnl[0], pnl[1], [(c, l, observed if l == "Observed" else col)  # noqa: E731
+                                            for c, l, col in pnl[2]], pnl[3])
+    over_mass, over_jac = recolor(over_mass), recolor(over_jac)
+    f = FONTS_GRID
+
+    W, H = 28.8, 12.8
+    aw, ah = 6.4, 4.0                      # small panels
+    x_a, x_b, x_e = 2.1, 10.9, 19.6        # left edges (room for 2-line y-labels)
+    y_bot, y_top = 1.4, 7.4                # bottom edges of the two rows
+    top = y_top + ah
+    fig = plt.figure(figsize=(W, H))
+    rect = lambda x, y, w, h: [x / W, y / H, w / W, h / H]  # noqa: E731
+    ax_a, ax_b = fig.add_axes(rect(x_a, y_top, aw, ah)), fig.add_axes(rect(x_b, y_top, aw, ah))
+    ax_c = fig.add_axes(rect(x_a, y_bot, aw, ah))
+    ax_d = fig.add_axes(rect(x_b, y_bot, aw, ah), sharey=ax_c)
+    e_top = top - 1.5                      # the stacked 3-entry legend sits above (e)
+    ax_e = fig.add_axes(rect(x_e, y_bot, W - x_e - 0.35, e_top - y_bot))
+
+    _draw_row([ax_a, ax_b], runs, xcol, xlabel, [over_mass, over_jac], f,
+              titles=False, legends=False)
+    _draw_row([ax_c, ax_d], runs, xcol, xlabel, [sp_pos, sp_abs], f,
+              titles=False, legends=False)
+    _draw_row([ax_e], runs, xcol, xlabel, [transfer], f, titles=False, legends=False)
+
+    for x0, y0, title, ax in ((x_a, top, "Overlap", ax_a), (x_a, y_bot + ah, "Sparsity", ax_c)):
+        _header(fig, x0 / W, (y0 + 0.3) / H, title, *ax.get_legend_handles_labels(), f)
+    _header(fig, x_e / W, (top + 0.3) / H, transfer[0], *ax_e.get_legend_handles_labels(),
+            f, below=True)
+    for ax, letter in zip((ax_a, ax_b, ax_c, ax_d, ax_e), "abcde"):
+        _panel_letter(ax, letter, f)
+    fig.savefig(out / fname, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
 def pooled_table(runs: pd.DataFrame, k: int, q: float) -> pd.DataFrame:
@@ -313,6 +400,12 @@ def main():
     args = parse_args()
     out = args.out_dir or ROOT / "outputs" / "plots" / args.group / args.analysis
     out.mkdir(parents=True, exist_ok=True)
+    if args.replot:
+        agreement_by_locale(pd.read_csv(out / "knockout_runs.csv"), args.k, args.mass, out)
+        if (out / "knockout_head_prevalence.csv").exists():
+            plot_prevalence(pd.read_csv(out / "knockout_head_prevalence.csv"), args.k, out)
+        print(f"[knockout-agg] redrew figures in {out}")
+        return
     runs, heads = load(args)
     runs.to_csv(out / "knockout_runs.csv", index=False)
     agreement_by_locale(runs, args.k, args.mass, out)

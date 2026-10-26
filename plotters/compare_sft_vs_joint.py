@@ -375,8 +375,9 @@ def ood_ladder_table(frames: dict, readout="endogenous", common_only=True):
 
 
 def plot_ood_ladders(frames: dict, out_dir, arm_colors=None, common_only=True):
-    """Both readouts across the corpus ladder in ONE figure: endogenous left,
-    interventional right, shared y; grouped bars, mean ± SE over runs (as in the CSVs).
+    """Both readouts across the corpus ladder, grouped bars, mean ± SE over runs (as in
+    the CSVs), drawn twice: ood_ladder.png (endogenous left, interventional right) and
+    ood_ladder_vertical.png (endogenous on top, interventional below).
 
     The x-order is set by the endogenous panel -- in-domain pinned leftmost, then OOD
     corpora by decreasing endogenous performance (averaged over arms) -- and reused for
@@ -389,6 +390,24 @@ def plot_ood_ladders(frames: dict, out_dir, arm_colors=None, common_only=True):
             t.to_csv(Path(out_dir) / f"ood_ladder_{readout}.csv", index=False)
     if not tables:
         return None
+    return draw_ood_ladders(tables, list(frames), out_dir, arm_colors)
+
+
+def replot_ood_ladders(out_dir):
+    """Redraw both ladder layouts from the ood_ladder_<readout>.csv a full run wrote, so
+    they can be restyled without the run directories. Arm order (and so the tab10
+    colours main() assigns) is the order the arms first appear in the CSV."""
+    tables = {r: pd.read_csv(f) for r in ("endogenous", "interventional")
+              if (f := Path(out_dir) / f"ood_ladder_{r}.csv").exists()}
+    if not tables:
+        print(f"[cmp] no ood_ladder_*.csv in {out_dir}")
+        return None
+    arms = list(dict.fromkeys(pd.concat(tables.values())["arm"]))
+    arm_colors = {a: c for a, c in zip(arms, plt.get_cmap("tab10").colors)}
+    return draw_ood_ladders(tables, arms, out_dir, arm_colors)
+
+
+def draw_ood_ladders(tables: dict, arms, out_dir, arm_colors=None):
     ref = tables.get("endogenous", next(iter(tables.values())))
     order = ["in-domain"] + (ref[ref["corpus"] != "in-domain"].groupby("corpus")["mean"].mean()
                              .sort_values(ascending=False).index.tolist())
@@ -397,12 +416,21 @@ def plot_ood_ladders(frames: dict, out_dir, arm_colors=None, common_only=True):
         extra = (t[~t["corpus"].isin(order)].groupby("corpus")["mean"].mean()
                  .sort_values(ascending=False).index.tolist())
         order += extra
+    for vertical in (False, True):
+        _draw_ood_ladder(tables, order, arms, arm_colors, out_dir, vertical)
+    return order
 
-    arms = list(frames)
+
+def _draw_ood_ladder(tables, order, arms, arm_colors, out_dir, vertical=False):
     # Grouped bars, mean ± SE over runs (the same numbers ood_ladder_*.csv holds). Sized
     # for a half-width paper column: titles / y-label larger than the generalization
-    # figures, unrotated two-line tick labels.
-    fig, axes = plt.subplots(1, 2, figsize=(19, 6.5), sharey=True)
+    # figures, unrotated two-line tick labels. The vertical layout stacks the panels so
+    # each gets the full width, with no titles (the readout names the y-label); x tick
+    # labels then appear once, under the bottom panel.
+    if vertical:
+        fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=True, sharey=True)
+    else:
+        fig, axes = plt.subplots(1, 2, figsize=(19, 6.5), sharey=True)
     xticklabels = [pretty_corpus(c).replace(" (", "\n(") for c in order]
     width = 0.8 / len(arms)
     for ax, readout in zip(axes, ("endogenous", "interventional")):
@@ -415,13 +443,19 @@ def plot_ood_ladders(frames: dict, out_dir, arm_colors=None, common_only=True):
             color = arm_colors.get(arm) if arm_colors else None
             ax.bar(xs, sub["mean"], width * 0.92, yerr=sub["se"], capsize=3, color=color,
                    label=pretty_arm(arm), error_kw=dict(lw=1.2))
-            print(f"[cmp] ladder ({readout}) {pretty_arm(arm)}: n={int(sub['n'].max())} runs")
-        ax.set_title(f"OOD {readout.capitalize()}", fontsize=36)
+            if not vertical:
+                print(f"[cmp] ladder ({readout}) {pretty_arm(arm)}: n={int(sub['n'].max())} runs")
+        if not vertical:
+            ax.set_title(f"OOD {readout.capitalize()}", fontsize=36)
         ax.set_xticks(np.arange(len(order)))
         ax.set_xticklabels(xticklabels, fontsize=24)
         ax.tick_params(axis="y", labelsize=26)
         ax.grid(axis="y", alpha=0.25)
-    axes[0].set_ylabel("Correlation\n(Mean \u00b1 SE)", fontsize=34)   # one line overruns the axis
+        if vertical:
+            # the readout moves from the title into the y-label, saving a title row each
+            ax.set_ylabel(f"{readout.capitalize()} Corr.\n(Mean \u00b1 SE)", fontsize=30)
+    if not vertical:
+        axes[0].set_ylabel("Correlation\n(Mean \u00b1 SE)", fontsize=34)   # one line overruns the axis
     # bars fill the panel from 0, so the legend needs headroom: the axis runs to 1.25
     # but is labelled 0-1 only, and the 2 x 2 legend sits above the tallest bars
     axes[0].set_ylim(0, 1.25)
@@ -433,10 +467,9 @@ def plot_ood_ladders(frames: dict, out_dir, arm_colors=None, common_only=True):
                        frameon=False, handlelength=1.0, columnspacing=0.8,
                        borderaxespad=0.2)
     fig.tight_layout()
-    path = Path(out_dir) / "ood_ladder.png"
+    path = Path(out_dir) / ("ood_ladder_vertical.png" if vertical else "ood_ladder.png")
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"[cmp] wrote {path}")
-    return order
 
 
 def pretty_arm(label: str) -> str:
@@ -672,10 +705,16 @@ if __name__ == "__main__":
                     help="e.g. _llama318b, _llama323b or _llama323b_hyper_tuned; appended "
                          "to every group name")
     ap.add_argument("--out-dir", default=None)
+    ap.add_argument("--replot-ladders", action="store_true",
+                    help="only redraw ood_ladder.png / ood_ladder_vertical.png from the "
+                         "ood_ladder_*.csv already in the output dir (no run dirs needed)")
     a = ap.parse_args()
     if a.model_suffix:
         for spec in ARMS.values():
             spec["group"] = spec["group"] + a.model_suffix
     out = a.out_dir or f"{ROOT}/outputs/plots/sft_vs_joint{a.model_suffix}"
+    if a.replot_ladders:
+        replot_ood_ladders(out)
+        raise SystemExit
     # default pairs = every joint arm against every sft arm (4 comparisons)
     main(ARMS, out_dir=out)
