@@ -9,17 +9,22 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1-16
+#$ -t 1-32
 
 # ============================================================================
-# SFT BASELINE GRID AT THE TUNED LR, Llama-3.1-8B: endogenous loss only (w=1), gate off, no
-# KL anchor. 4 layers x 4 token positions, 5 neurons per cell = 16 array tasks, 80 runs.
+# SFT BASELINE GRID AT THE TUNED LR, Llama-3.1-8B: endogenous loss only (w=1), no KL anchor,
+# BOTH gates. 4 layers x 4 token positions x 2 gates, 5 neurons per cell = 32 array tasks,
+# 160 runs. Tasks 1-16 = gate ON, 17-32 = gate OFF.
 # The baseline arm for train_single_mlp_introspector_joint_sweep_layer_token_llama318b_hyper_tuned.sh:
 # same cells, same 5 neurons per cell, same caches.
 #
 # >>> SUBMIT -- paste on SCC (from the repo root):
 # cd /projectnb/llamagrp/peter/low-level-introspection
+# # both gates (finished runs are skipped, so this is safe to resubmit):
 # qsub scripts/neuron/train_single_mlp_introspector_endogenous_sweep_layer_token_llama318b_hyper_tuned.sh
+# # only the gate-ON half (tasks 1-16) -- e.g. when the gate-off half has already run:
+# sed 's/^#\$ -t 1-32$/#$ -t 1-16/' scripts/neuron/train_single_mlp_introspector_endogenous_sweep_layer_token_llama318b_hyper_tuned.sh > log/train_single_mlp_introspector_endogenous_sweep_layer_token_llama318b_hyper_tuned_gateon.sh
+# qsub log/train_single_mlp_introspector_endogenous_sweep_layer_token_llama318b_hyper_tuned_gateon.sh
 # # once both arms finish:
 # python plotters/compare_sft_vs_joint.py --model-suffix _llama318b_hyper_tuned
 # <<< SUBMIT
@@ -31,7 +36,7 @@
 #
 # IDENTICAL to train_single_mlp_introspector_endogenous_sweep_layer_token_llama318b.sh
 # (the 5e-5 SFT grid) except: model and LAYERS (4 12 20 28 -- the depths 1/8, 3/8, 5/8,
-# 7/8 shared by every grid); LR; gate OFF only (the old grid also ran gate on); effective
+# 7/8 shared by every grid); LR; effective
 # batch 32 written as 16 x 2; group mlp_endo_sweep_layer_token_llama318b_hyper_tuned, a new directory because run names do
 # not carry the LR; and cache_signals never gets --overwrite-cache.
 # ============================================================================
@@ -54,18 +59,22 @@ export WANDB_RUN_GROUP=mlp_endo_sweep_layer_token_llama318b_hyper_tuned
 set -e
 
 ## ---- decode (layer, position) from the flat array index ----
-# GATE is the OUTER dimension (tasks 1-16 = the first gate, 17-32 = the second), so the
-# arms of a cell are 16 tasks apart and never race to build its cache. Gate OFF only
-# here (16 tasks); for the gated arm too, set GATES=(on off) and "#$ -t 1-32".
+# GATE is the OUTER dimension (tasks 1-16 = gate on, 17-32 = gate off), so the arms of a
+# cell are 16 tasks apart and never race to build its cache. Gate off was the first arm
+# run here (as tasks 1-16 of a GATES=(off) version, under the same run names); gate on
+# was added after, as the bypass baseline the old 5e-5 grids also had.
 index=$(($SGE_TASK_ID-1))
 LAYERS=(4 12 20 28)
 POSS=(-1 -8 -20 -28)
-GATES=(off)
+GATES=(on off)
 GATE=${GATES[$((index / 16))]}
 cell_idx=$((index % 16))
 LAYER=${LAYERS[$((cell_idx / 4))]}
 TOKEN_POS=${POSS[$((cell_idx % 4))]}
 
+#   on  = gated. No trainable parameter touches the introspected token, so the model
+#         cannot read the neuron: interventional corr pins at 0, and whatever endogenous
+#         score it gets is context bypass. Same LR as gate off -- not separately tuned.
 #   off = the adapter reaches the site, and the endogenous-only objective is the SFT
 #         baseline the joint loss is compared against (same access, different objective).
 W=1.0                    # weight on the ENDOGENOUS term; 1.0 => no interventional loss
