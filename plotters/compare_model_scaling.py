@@ -96,12 +96,14 @@ MODEL_SETS = {
         "Qwen3-14B": ("_qwen3_14b_hyper_tuned", 40, 14.8),
     },
 }
-# arms each set compares (the hyper-tuned grids ran only these two)
+# arms each set compares; scale_trend always compares joint_kl0.1 with sft_gateoff.
+# SFT gate on (the bypass baseline, run for the Llama hyper-tuned grids only) is left
+# out of every figure and aggregate: GATES below never loads its paired files.
 SET_ARMS = {"base": None, "hyper_tuned": ("joint_kl0.1", "sft_gateoff")}
 MODELS = MODEL_SETS["base"]      # main() rebinds this to the chosen set
 # joint arm label -> paired-file stem
 JOINT_ARMS = {"joint_kl0.1": "joint_kl0.1_vs_sft", "joint_free": "joint_free_vs_sft"}
-GATES = ("gateoff", "gateon")
+GATES = ("gateoff",)
 READOUTS = ("endogenous", "interventional")
 METRICS = ("corr", "spearman", "kendall_tau", "monotone_r2")
 # the depths 1B and 8B both trained, and every *_hyper_tuned grid's design depths
@@ -109,7 +111,7 @@ SHARED_DEPTHS = (0.125, 0.375, 0.625, 0.875)
 # a layer counts as sitting on a shared depth when it is this close (relative depth)
 DEPTH_TOL = 0.03
 N_BOOT = 2000
-ARM_ORDER = ["sft_gateon", "sft_gateoff", "joint_kl0.1", "joint_free"]
+ARM_ORDER = ["sft_gateoff", "joint_kl0.1", "joint_free"]
 
 
 def family(model: str) -> str:
@@ -258,6 +260,7 @@ def _profile(d, xcol, path, metric, xlabel, xticks=None, xmap=None):
                              figsize=(6.4 * len(arms), 5.4 * len(READOUTS)),
                              squeeze=False, sharex=True, sharey="row")
     for r, readout in enumerate(READOUTS):
+        lowest = -0.1     # extended below when a mean - SE falls under it
         for c, arm in enumerate(arms):
             ax = axes[r][c]
             for model in models:
@@ -265,11 +268,11 @@ def _profile(d, xcol, path, metric, xlabel, xticks=None, xmap=None):
                            & (d["model"] == model)], [xcol]).sort_values(xcol)
                 if q.empty:
                     continue
+                lowest = min(lowest, (q["mean"] - q["se"].fillna(0)).min() - 0.06)
                 x = q[xcol].map(xmap) if xmap else q[xcol]
                 ax.errorbar(x, q["mean"], yerr=q["se"], marker=style[model]["marker"],
                             ms=9, capsize=3, lw=2, color=style[model]["color"], label=model)
             ax.axhline(0, color="k", lw=0.8, alpha=0.4)
-            ax.set_ylim(-0.1, 1.02)
             ax.grid(alpha=0.25)
             if xticks is not None:
                 ax.set_xticks(xticks)
@@ -280,6 +283,7 @@ def _profile(d, xcol, path, metric, xlabel, xticks=None, xmap=None):
             if c == 0:
                 ax.set_ylabel(f"{readout.capitalize()} {METRIC_NAME.get(metric, metric)}\n"
                               f"(Mean \u00b1 SE)")
+        axes[r][0].set_ylim(lowest, 1.02)   # sharey="row": one call sets the row
     # the endogenous panels sit high (~0.6-1), so their lower half is free for the key
     axes[0][0].legend(loc="lower left", ncol=2, fontsize=13, frameon=False,
                       handlelength=1.6, columnspacing=0.8)
@@ -569,11 +573,10 @@ def scale_trend(df: pd.DataFrame, out_dir: Path, metric="corr",
            .reindex(columns=["joint", "sft", "gain"]).droplevel("_o"))
     print(tbl.round(3).to_string())
 
-    # figure: one panel per quantity, interventional on top, endogenous below
+    # figure: one panel per quantity, endogenous on top, interventional below
     quantities = [("gain", "Joint \u2212 SFT"), ("joint", pretty_arm(joint)),
                   ("sft", pretty_arm(base))]
-    # interventional first: it is the primary readout of the test
-    readouts = [r for r in ("interventional", "endogenous") if r in set(per_model["readout"])]
+    readouts = [r for r in ("endogenous", "interventional") if r in set(per_model["readout"])]
     fig, axes = plt.subplots(len(readouts), 3, figsize=(19, 6.2 * len(readouts)),
                              squeeze=False, sharex=True)
     marker, color = FAMILY_MARKER, FAMILY_COLOR
@@ -586,9 +589,14 @@ def scale_trend(df: pd.DataFrame, out_dir: Path, metric="corr",
                             yerr=[g["mean"] - g["boot_lo"], g["boot_hi"] - g["mean"]],
                             fmt=marker.get(fam_name, "o"), ms=11, capsize=3,
                             color=color.get(fam_name, "grey"), label=fam_name)
+                # Qwen labels left of the point, Llama right: the families interleave in
+                # size, so same-side labels collide (3.2-3B next to 4B). The smallest
+                # model's label stays right, clear of the y tick labels.
                 for _, row in g.iterrows():
+                    left = fam_name == "Qwen3" and row["params_b"] > pm["params_b"].min()
                     ax.annotate(row["model"].split("-", 1)[1], (row["params_b"], row["mean"]),
-                                textcoords="offset points", xytext=(7, 4), fontsize=13)
+                                textcoords="offset points", xytext=(-7 if left else 7, 4),
+                                ha="right" if left else "left", fontsize=13)
             f = fits[(fits["readout"] == readout) & (fits["quantity"] == q)
                      & fits["family_term"].isin([True, False])]
             if len(f):
@@ -605,6 +613,8 @@ def scale_trend(df: pd.DataFrame, out_dir: Path, metric="corr",
                 ax.axhline(0, color="k", lw=0.8, alpha=0.5)
             ax.set_xscale("log")
             _size_ticks(ax, pm["params_b"].unique())
+            # start at the smallest round tick, not matplotlib's padded margin
+            ax.set_xlim(left=min(0.5, pm["params_b"].min() / 1.15))
             ax.grid(alpha=0.25)
             if r == len(readouts) - 1:
                 ax.set_xlabel("Parameters")
