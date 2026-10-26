@@ -320,15 +320,18 @@ def plot_scaling(df: pd.DataFrame, out_dir: Path, metric="corr", shared_depths_o
     """Metric against parameter count, one line per arm.
 
     shared_depths_only restricts to the depths 1B and 8B both trained, so the trend is
-    not an artefact of which depths each model sampled. 3B shares none of them and is
-    drawn as an open marker at ITS OWN depths -- comparable in spirit, not matched.
+    not an artefact of which depths each model sampled. A model whose mean covers FEWER
+    of the shared depths than the others (the base 3B grid matches two of four) is drawn
+    hollow. Layers rounded onto a shared depth (<= 0.018 off in every *_hyper_tuned grid,
+    by design) count as on it and are drawn solid.
     """
     d = df[df["metric"] == metric]
     if d.empty:
         return
     matched = d[d["depth_bin"].notna()] if shared_depths_only else d
-    # models whose layers only APPROXIMATE the shared depths (beyond float noise)
-    approx = set(matched.loc[(matched["depth"] - matched["depth_bin"]).abs() > 1e-3, "model"])
+    # models averaged over fewer shared depths than the best-covered model
+    n_bins = matched.groupby("model")["depth_bin"].nunique()
+    partial = set(n_bins[n_bins < n_bins.max()].index)
     from matplotlib.lines import Line2D
     fig, axes = plt.subplots(1, len(READOUTS), figsize=(7.4 * len(READOUTS), 5.8), sharey=True)
     arms = [a for a in ARM_ORDER if a in set(d["arm"])]
@@ -347,8 +350,8 @@ def plot_scaling(df: pd.DataFrame, out_dir: Path, metric="corr", shared_depths_o
                 mk = FAMILY_MARKER.get(fam, "s")
                 ax.errorbar(g["params_b"], g["mean"], yerr=g["se"], marker=mk, ms=10,
                             capsize=3, lw=1.6, color=colors[arm])
-                # layers only near the shared depths: hollow, so the caveat is visible
-                off = g[g["model"].isin(approx)]
+                # fewer shared depths than the others: hollow, so the caveat is visible
+                off = g[g["model"].isin(partial)]
                 if len(off):
                     ax.scatter(off["params_b"], off["mean"], s=130, marker=mk,
                                facecolors="white", edgecolors=colors[arm], linewidths=2,
@@ -362,9 +365,9 @@ def plot_scaling(df: pd.DataFrame, out_dir: Path, metric="corr", shared_depths_o
     axes[0].set_ylabel(f"{METRIC_NAME.get(metric, metric)} (Mean \u00b1 SE)")
     handles = [Line2D([], [], color=colors[a], lw=2.5, label=pretty_arm(a)) for a in arms]
     handles += _family_handles(sorted(set(matched["family"])))
-    if approx:
+    if partial:
         handles.append(Line2D([], [], ls="", marker="o", ms=10, mfc="white", mec="k",
-                              mew=2, label="Depth \u2248 Shared"))
+                              mew=2, label="Fewer Shared Depths"))
     # endogenous sits near the top, leaving its lower half empty for the key
     axes[0].legend(handles=handles, fontsize=14, loc="lower left", frameon=False)
     fig.tight_layout()

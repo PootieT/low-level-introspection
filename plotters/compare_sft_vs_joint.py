@@ -47,7 +47,7 @@ import seaborn as sns
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 # the SFT sweep's heatmap style, shared so both scripts' heatmaps are identical
-from plot_single_neuron_results import SEQ_LEN, draw_layer_position_heatmap  # noqa: E402
+from plot_single_neuron_results import SEQ_LEN, RANGE01, draw_layer_position_heatmap  # noqa: E402
 
 # Poster-scale fonts: kept identical to plot_single_neuron_results.py so the two
 # scripts' figures share one look.
@@ -88,6 +88,9 @@ KEY = ["layer", "position", "neuron"]
 #   monotone_r2  cross-fit isotonic R^2, on Pearson r^2's scale: where r^2 ~= this, the
 #                relationship really is linear and nothing was lost by measuring it so
 FIDELITY_METRICS = ("corr", "spearman", "kendall_tau", "monotone_r2")
+# every metric that gets an absolute per-arm heatmap: the fidelity metrics plus L2
+# distance, which plot_single_neuron_results.py also maps for the SFT sweeps
+HEATMAP_METRICS = FIDELITY_METRICS + ("l2_dist",)
 # what the delta heatmaps are drawn for (one figure per readout per metric)
 DELTA_METRICS = ("corr", "spearman")
 
@@ -260,7 +263,7 @@ def load_group(exp_group: str, gate="off", w=None, kl=None) -> pd.DataFrame:
                "layer": int(n["layer"]), "index": int(n["index"]),
                "neuron": f"N{n['layer']}.{n['index']}", "position": int(p["pos"]),
                "w": float(mw["w"]) if mw else None, "kl": mkl["kl"] if mkl else None}
-        for metric in FIDELITY_METRICS:
+        for metric in HEATMAP_METRICS:
             # the legacy column names stay exactly as they were for Pearson
             suffix = "corr" if metric == "corr" else metric
             row[f"interventional_{suffix}"] = interv.get(metric)
@@ -474,7 +477,8 @@ def pretty_metric(metric: str) -> str:
     metric_words = {"corr": "Pearson r", "spearman": "Spearman rho",
                     "kendall_tau": "Kendall tau-b (smaller than r by construction)",
                     "monotone_r2": "Monotone R2 (isotonic, cross-fit)",
-                    "corr_minus_spearman": "Pearson r - Spearman rho"}
+                    "corr_minus_spearman": "Pearson r - Spearman rho",
+                    "l2_dist": "L2 distance (lower is better)"}
     for readout in ("interventional", "endogenous"):
         if metric.startswith(f"{readout}_"):
             tail = metric[len(readout) + 1:]
@@ -530,10 +534,12 @@ def plot_delta_heatmap(merged, metric, label_a, label_b, out_dir, lim=None):
     print(f"[cmp] wrote {path}")
 
 
-def plot_arm_heatmap(df, metric, label, out_dir):
+def plot_arm_heatmap(df, metric, label, out_dir, vmin=None, vmax=None):
     """Absolute per-(layer, position) heatmap of ONE arm's metric (not a difference),
     mean ± std over the cell's neurons -- what the arm scores on its own, so the delta
-    maps can be read against the levels they came from."""
+    maps can be read against the levels they came from. Drawn for every arm, SFT
+    included, so the SFT maps no longer need plot_single_neuron_results.py's separate
+    folders. vmin/vmax: a scale shared with the other maps of this metric (see main)."""
     if metric not in df:
         return
     sub = df[[*KEY, metric]].dropna()
@@ -541,9 +547,6 @@ def plot_arm_heatmap(df, metric, label, out_dir):
         return
     mean = sub.pivot_table(index="layer", columns="position", values=metric, aggfunc="mean")
     std = sub.pivot_table(index="layer", columns="position", values=metric, aggfunc="std")
-    # correlations get the SFT maps' fixed [0, 1] viridis scale, which also makes the
-    # endogenous and interventional maps share one colorbar
-    vmin, vmax = (0, 1) if metric.endswith("corr") else (None, None)
     title = f"Neuron {pretty_metric(metric)}"
     path = Path(out_dir) / f"heatmap_{label}_{metric}.png"
     draw_layer_position_heatmap(mean, std, title, path, vmin=vmin, vmax=vmax,
@@ -620,16 +623,24 @@ def main(arms: dict, out_dir, pairs=None, model=None):
     if tables:
         pd.concat(tables, ignore_index=True).to_csv(Path(out_dir) / "paired_summary.csv",
                                                     index=False)
-    # the joint arms' absolute (layer, position) maps on their own, so the joint results
-    # can be read without reference to SFT
-    for label, f in frames.items():
-        if not label.startswith("joint"):
-            continue
-        for fam in FIDELITY_METRICS:
-            for r in ("interventional", "endogenous"):
-                col = f"{r}_{fam}"
+    # every arm's absolute (layer, position) maps on their own -- joint AND SFT, so each
+    # can be read without the other and the SFT maps live in this folder too. One colour
+    # scale per metric: the correlations keep the fixed [0, 1] scale of the SFT maps;
+    # the rest (L2, monotone R2) share one range across both readouts and every arm, so
+    # any two maps of a metric in this folder are directly comparable
+    for fam in HEATMAP_METRICS:
+        cols = [f"{r}_{fam}" for r in ("interventional", "endogenous")]
+        if fam in RANGE01:
+            vmin, vmax = 0, 1
+        else:
+            cell_means = [f.groupby(["layer", "position"])[c].mean()
+                          for f in frames.values() for c in cols if c in f.columns]
+            vals = pd.concat(cell_means).dropna() if cell_means else pd.Series(dtype=float)
+            vmin, vmax = (float(vals.min()), float(vals.max())) if len(vals) else (None, None)
+        for label, f in frames.items():
+            for col in cols:
                 if col in f.columns and f[col].notna().any():
-                    plot_arm_heatmap(f, col, label, out_dir)
+                    plot_arm_heatmap(f, col, label, out_dir, vmin=vmin, vmax=vmax)
     # one color per arm, shared by both readout panels so one legend serves both
     arm_colors = {arm: c for arm, c in zip(frames, plt.get_cmap("tab10").colors)}
     plot_ood_ladders(frames, out_dir, arm_colors=arm_colors)
