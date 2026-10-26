@@ -242,6 +242,7 @@ write to `outputs/plots/`; the two `plot_paper_*` panels write to `paper_plots/`
 - Second order introspective tasks (i.e. "compute 1+1 but do it wrong if you detect neuron activation N2.12 > 0.5")
 - Reversing the task (i.e. prompt model to change neuron activation)
 
+
 ## Citations
 If you find our work or repo useful, please consider citing our paper!
 ```bibtex
@@ -252,3 +253,6 @@ If you find our work or repo useful, please consider citing our paper!
   year={2026}
 }
 ```
+
+## AI Assistance Disclaimer
+The repo is written with the help of Claude Code and OpenAI Models.
