@@ -9,7 +9,7 @@
   </a>
 </p>
 
-This repo contains the code to reproduce the paper `Interventional Training Reduces Causal Bypass in In-Context Introspection` on [Arxiv]() or [OpenReview](https://openreview.net/forum?id=5P7dVpGNPO). (In submission).
+This repo contains the code to reproduce the paper `Interventional Training Reduces Causal Bypass in In-Context Introspection` on [Arxiv](https://arxiv.org/abs/2610.38911v1). (In submission).
 
 <p align="center">
   <img src="./assets/teaser.png" alt="Example Box data and comical depiction of how LMs track entities" width="50%"/>
@@ -249,7 +249,7 @@ If you find our work or repo useful, please consider citing our paper!
 @article{tang2026,
   title={Interventional Training Reduces Causal Bypass in In-Context Introspection},
   author={Tang, Zilu and Kim, Jongin and Sahin, Kerem and Atkinson, David and Mueller, Aaron and Wijaya, Derry},
-  journal={arXiv preprint arXiv:XXXX.XXXXX},
+  journal={arXiv preprint arXiv:2610.38911v1},
   year={2026}
 }
 ```
