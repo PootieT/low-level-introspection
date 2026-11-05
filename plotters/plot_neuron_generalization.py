@@ -95,6 +95,8 @@ def _run_meta(d: Path):
             "n_rows": int(j.get("rows", j["rows_per_neuron"] * j["neurons"])),
             "epochs": float(j.get("epochs", 1)), "lora_r": int(j.get("lora_r", 16)),
             "layer": j.get("layer"),
+            # NaN = unconstrained (every run before the KL-budget sweep)
+            "kl_budget": float(j["kl_budget"]) if j.get("kl_budget") is not None else np.nan,
         }
     m_arm, m_n, m_r = ARM_RE.search(d.name), N_RE.search(d.name), R_RE.search(d.name)
     if not (m_arm and m_n and m_r):
@@ -104,8 +106,17 @@ def _run_meta(d: Path):
     return {
         "run": d.name, "group": LEGACY_GROUP[m_arm["arm"]], "n_neurons": n, "offset": 0,
         "rows_per_neuron": rows // max(1, n), "n_rows": rows, "epochs": 1, "lora_r": 16,
-        "layer": int(m_l["layer"]) if m_l else None,
+        "layer": int(m_l["layer"]) if m_l else None, "kl_budget": np.nan,
     }
+
+
+def _baseline_cfg(ps: pd.DataFrame) -> pd.Series:
+    """The reference configuration every sweep varies away from: 1 epoch, rank 16,
+    UNCONSTRAINED KL. The KL clause matters: the KL-budget sweep has r16 1-epoch rows at
+    the same (N, rows/neuron) as the scaling cells, and without it they would be pooled
+    into the scaling curves, the single-neuron null and every sweep's baseline star."""
+    kl = ps["kl_budget"] if "kl_budget" in ps else pd.Series(np.nan, index=ps.index)
+    return (ps["epochs"] == 1) & (ps["lora_r"] == 16) & kl.isna()
 
 
 def load_sweep(exp_group: str):
@@ -119,7 +130,7 @@ def load_sweep(exp_group: str):
             print(f"[neurongen] no run directories under {base}; re-plotting from {csv.name}")
             ps = pd.read_csv(csv)
             ps["arm_label"] = np.where(ps["is_trained"], "seen", "unseen")
-            ps["is_baseline_cfg"] = (ps["epochs"] == 1) & (ps["lora_r"] == 16)
+            ps["is_baseline_cfg"] = _baseline_cfg(ps)
             return ps, pd.DataFrame()
         sys.exit(f"No such experiment group: {base}")
     per_signal, summary, skipped = [], [], []
@@ -152,8 +163,7 @@ def load_sweep(exp_group: str):
         for name, why in skipped[:10]:
             print(f"    {name}: {why}")
     ps["arm_label"] = np.where(ps["is_trained"], "seen", "unseen")
-    # the reference configuration every sweep varies away from
-    ps["is_baseline_cfg"] = (ps["epochs"] == 1) & (ps["lora_r"] == 16)
+    ps["is_baseline_cfg"] = _baseline_cfg(ps)
     return ps, sm
 
 
@@ -538,6 +548,70 @@ def plot_data30k(ps: pd.DataFrame, out_dir, rpn: int = 30_000):
     return m
 
 
+KL_GROUPS = ("kl_rank", "kl_rank_n30")
+
+
+def plot_kl_capacity(ps: pd.DataFrame, out_dir):
+    """Capacity under a fixed KL budget: seen-neuron macro corr against LoRA rank, one
+    line per neuron count (left), and the same numbers against N, one line per rank
+    (right). A capacity limit is a rank below which the larger-N lines fall while the
+    N=1 line holds. Stars: the unconstrained run at the same (N, rows/neuron) and rank
+    16 -- what the KL budget costs at matched rank."""
+    d = ps[ps["group"].isin(KL_GROUPS) & (ps["arm_label"] == "seen")]
+    if d.empty:
+        return
+    key = ["eval_type", "n_neurons", "rows_per_neuron", "lora_r"]
+    m = _macro(d, key)
+    m["n_runs"] = d.groupby(key)["run"].nunique().values
+    m.to_csv(Path(out_dir) / "kl_capacity.csv", index=False)
+    ref = ps[ps["is_baseline_cfg"] & ps["is_trained"]]
+    cells = sorted(m[["n_neurons", "rows_per_neuron"]].drop_duplicates().itertuples(index=False))
+    ranks = sorted(m["lora_r"].unique())
+    pal_n = dict(zip(cells, sns.color_palette("viridis", len(cells))))
+    pal_r = dict(zip(ranks, sns.color_palette("rocket_r", len(ranks) + 1)[1:]))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10), sharey="row")
+    for row, et in enumerate(EVAL_TYPES):
+        ax = axes[row, 0]
+        for cell in cells:
+            n, rpn = cell
+            q = m[(m["eval_type"] == et) & (m["n_neurons"] == n)
+                  & (m["rows_per_neuron"] == rpn)].sort_values("lora_r")
+            lbl = f"N={n} @ {rpn // 1000}k/neuron"
+            ax.errorbar(q["lora_r"], q["corr_macro"], yerr=q["corr_std"].fillna(0), marker="o",
+                        ms=7, capsize=3, lw=1.8, color=pal_n[cell], label=lbl)
+            r = ref[(ref["n_neurons"] == n) & (ref["rows_per_neuron"] == rpn)
+                    & (ref["eval_type"] == et)]
+            if len(r):
+                ax.scatter([16], [_macro(r, ["run"])["corr_macro"].mean()], marker="*", s=220,
+                           color=pal_n[cell], edgecolors="k", zorder=5)
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(ranks, [str(r) for r in ranks])
+        ax.set_xlabel("LoRA Rank")
+        ax.set_ylabel(f"{et.capitalize()} Corr (Seen, Macro)")
+        ax.axhline(0, color="k", lw=0.9, alpha=0.4)
+        ax = axes[row, 1]
+        for r_ in ranks:
+            q = m[(m["eval_type"] == et) & (m["lora_r"] == r_)].sort_values("n_neurons")
+            ax.errorbar(q["n_neurons"], q["corr_macro"], yerr=q["corr_std"].fillna(0),
+                        marker="o", ms=7, capsize=3, lw=1.8, color=pal_r[r_], label=f"r={r_}")
+        ax.set_xscale("log")
+        ns = sorted(m["n_neurons"].unique())
+        ax.set_xticks(ns, [str(n) for n in ns])
+        ax.minorticks_off()
+        ax.set_xlabel("Trained Neurons (N)")
+        ax.axhline(0, color="k", lw=0.9, alpha=0.4)
+    axes[0, 0].scatter([], [], marker="*", s=160, color="w", edgecolors="k",
+                       label="Unconstrained KL, r=16")
+    axes[0, 0].legend(title="Neurons", fontsize=10)
+    axes[0, 1].legend(title="Rank", fontsize=10)
+    axes[0, 0].set_title("Fidelity vs Rank (KL=0.1)")
+    axes[0, 1].set_title("Fidelity vs Neuron Count (KL=0.1)")
+    fig.tight_layout()
+    fig.savefig(Path(out_dir) / "kl_capacity.png", dpi=150)
+    plt.close(fig)
+    return m
+
+
 def main(exp_group="mlp_neurongen"):
     out_dir = Path(f"{ROOT}/outputs/plots/{exp_group}")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -558,6 +632,7 @@ def main(exp_group="mlp_neurongen"):
                "sweep_rank")
     plot_data30k(ps, out_dir)
     plot_updates(ps, out_dir)
+    plot_kl_capacity(ps, out_dir)
     if m is not None:
         print("\n[neurongen] macro corr by (eval_type, arm, N):")
         print(m.sort_values(["eval_type", "arm_label", "n_neurons"]).to_string(index=False))

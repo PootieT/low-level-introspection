@@ -79,3 +79,40 @@ def test_linfit_slope_r2():
     x = np.linspace(0, 1, 50)
     assert linfit_slope_r2(x, 3 * x + 1) == pytest.approx((3.0, 1.0))
     assert linfit_slope_r2(np.ones(5), np.arange(5.0)) == (0.0, 0.0)   # no spread in x
+
+
+def test_signal_subspace_principal_is_sign_invariant():
+    """The write-in's sign flips with up_proj(x) across texts; the principal direction
+    must recover the axis where the signed mean cancels."""
+    import numpy as np
+    from mechanistic_analysis.trace_signal_subspace import principal, orthobasis
+    rng = np.random.default_rng(0)
+    axis = rng.normal(size=64); axis /= np.linalg.norm(axis)
+    signs = np.r_[np.ones(10), -np.ones(10)]
+    X = signs[:, None] * axis[None] * rng.uniform(0.5, 2, 20)[:, None]
+    v, e = principal(X)
+    assert abs(abs(v @ axis) - 1) < 1e-6 and abs(e - 1) < 1e-6
+    assert np.linalg.norm(X.mean(0)) < 0.5 * np.linalg.norm(X, axis=1).mean()
+    U = orthobasis(np.vstack([axis, axis, rng.normal(size=64)]))
+    assert U.shape == (64, 2) and np.allclose(U.T @ U, np.eye(2), atol=1e-8)
+
+
+def test_subspace_patch_is_exact():
+    """h <- h - (h - h_clean) U U^T inside the window: a full basis restores h_clean,
+    an empty basis changes nothing, and positions outside the window are untouched."""
+    import torch
+    from mechanistic_analysis.trace_signal_subspace import SubspacePatch
+    torch.manual_seed(0)
+    B, S, d = 2, 5, 8
+    h, h0 = torch.randn(B, S, d), torch.randn(B, S, d)
+    mask = torch.zeros(B, S); mask[:, 2:] = 1                  # window = positions 2..4
+    full = SubspacePatch(torch.eye(d), h0, mask, is_tuple=False)(None, None, h)
+    assert torch.allclose(full[:, 2:], h0[:, 2:], atol=1e-6)
+    assert torch.equal(full[:, :2], h[:, :2])
+    empty = SubspacePatch(torch.zeros(d, 0), h0, mask, is_tuple=True)(None, None, (h, "x"))
+    assert torch.equal(empty[0], h) and empty[1] == "x"
+    # a 1-d subspace removes exactly the difference's component along it
+    u = torch.zeros(d, 1); u[3] = 1
+    one = SubspacePatch(u, h0, mask, is_tuple=False)(None, None, h)
+    exp = h.clone(); exp[:, 2:, 3] = h0[:, 2:, 3]
+    assert torch.allclose(one, exp, atol=1e-6)
