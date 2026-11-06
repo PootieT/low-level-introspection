@@ -89,6 +89,14 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--max-seq-length", type=int, default=None)
     p.add_argument("--output-dir", type=Path, default=None)
+    p.add_argument("--dataset-dir", type=Path, default=None,
+                   help="Cached dataset directory holding train/ (default: the config's "
+                        "dataset_cache_dir). Any cache of the same corpus works: only the "
+                        "texts are used, never the cached activations.")
+    p.add_argument("--keep-bos", action="store_true",
+                   help="Include the BOS position in --positions all. Off by default: BOS "
+                        "is an attention-sink outlier with the same activation in every "
+                        "text, a point mass that dominates the covariance.")
     return p.parse_args()
 
 
@@ -97,7 +105,7 @@ def parse_args():
 # ======================================================================
 @torch.no_grad()
 def collect_layer_stats(model, tokenizer, texts, token_positions, layer, positions_mode,
-                        max_seq_length, batch_size, fire_thresh):
+                        max_seq_length, batch_size, fire_thresh, keep_bos=False):
     """
     Stream the base model over `texts`, hook layer-L mlp.act_fn, and accumulate
     sufficient statistics for the same-layer activation covariance:
@@ -128,6 +136,8 @@ def collect_layer_stats(model, tokenizer, texts, token_positions, layer, positio
 
             if positions_mode == "all":
                 mask = enc["attention_mask"].bool()         # [b, seq]
+                if not keep_bos and tokenizer.bos_token_id is not None:
+                    mask &= enc["input_ids"] != tokenizer.bos_token_id
                 X = h[mask]                                  # [num_tokens, p]
             else:  # introspected: one position per example
                 sel = []
@@ -184,7 +194,10 @@ def main():
     )
     model.eval()
 
-    train_raw = load_from_disk(str(Path(config.cache_dir) / config.experiment_name / "train"))
+    # Sweep caches are keyed by dataset_name (shared across a cell's neurons), not by
+    # experiment_name -- the old path fails on every grid config.
+    data_dir = args.dataset_dir or config.dataset_cache_dir
+    train_raw = load_from_disk(str(Path(data_dir) / "train"))
     texts = list(train_raw["text"])
     token_positions = list(train_raw["token_position"])
     if args.n_texts:
@@ -194,7 +207,7 @@ def main():
 
     n, s, G, fire = collect_layer_stats(
         model, tokenizer, texts, token_positions, layer, args.positions,
-        max_seq_length, args.batch_size, args.fire_thresh)
+        max_seq_length, args.batch_size, args.fire_thresh, keep_bos=args.keep_bos)
     p = s.shape[0]
     print(f"[redundancy] collected n={n} token-activations over {p} neurons")
     if n < 2 * p:
@@ -237,7 +250,8 @@ def main():
     with open(out_dir / "redundancy_meta.json", "w") as f:
         json.dump({"layer": layer, "n_tokens": int(n), "n_neurons": int(p),
                    "n_kept": int(len(kept_idx)), "ridge": args.ridge,
-                   "positions": args.positions,
+                   "positions": args.positions, "keep_bos": args.keep_bos,
+                   "dataset_dir": str(data_dir),
                    "R2_quantiles": {q: float(np.nanquantile(R2, q)) for q in (0.1, 0.25, 0.5, 0.75, 0.9)}},
                   f, indent=2)
     print(f"[redundancy] R2 kept quantiles: "
