@@ -20,7 +20,7 @@
 # not used, only its texts). All token positions except BOS go into the covariance.
 #
 # Afterwards (CPU, seconds):
-#   python plotters/plot_sft_vs_redundancy.py
+#   python plotters/plot_sft_vs_neuron_property.py --metric redundancy
 # ============================================================================
 
 echo "Start date : $(date)  Job: $JOB_NAME $JOB_ID task $SGE_TASK_ID"
