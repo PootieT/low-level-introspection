@@ -35,10 +35,12 @@
 # `ls data/` for it first, or submit one row of that N alone and the rest after.
 #
 # SUBMITTING
-#   GROUP=kl_rank qsub -t 1-15 <script>      N = 1, 3, 10 at 300k total rows
-#   GROUP=kl_rank_n30 qsub -t 1-5 <script>   N = 30 @ 30k/neuron = 900k rows, 3x the
-#                                            longest 300k run: raise h_rt (~36h) first
-#   RUN=kl0.1_n10_30k_r1 bash <script>       one row by name
+# SCC's qsub rejects -t on the command line and does not export the caller's
+# environment, so the array size lives in the header and the group is an ARGUMENT:
+#   qsub <script> kl_rank          header #$ -t 1-15   N = 1, 3, 10 at 300k total rows
+#   qsub <script> kl_rank_n30      header #$ -t 1-5    N = 30 @ 30k/neuron = 900k rows,
+#                                  3x the longest 300k run: also raise h_rt (~36h)
+#   RUN=kl0.1_n10_30k_r1 bash <script>                 one row by name (interactive)
 # Runs land in outputs/runs/mlp_neurongen next to the klinf runs; run_spec.json carries
 # kl_budget, which plotters/plot_neuron_generalization.py uses to keep them out of the
 # unconstrained baselines and to draw kl_capacity.png.
@@ -123,6 +125,12 @@ RUNS=(
 
 # ---- pick this task's row ------------------------------------------------------
 # GROUP filters the table first; RUN selects by name; otherwise SGE_TASK_ID indexes.
+# The group comes from the FIRST SCRIPT ARGUMENT (`qsub <script> <group>`): SGE passes
+# script arguments to the job, but NOT the submitting shell's environment, so
+# `GROUP=x qsub <script>` silently runs with GROUP unset and indexes the whole table.
+# The env var still works for `qsub -v GROUP=x <script>` and for interactive `bash`.
+GROUP=${1:-$GROUP}
+echo "selection: GROUP='${GROUP:-<all rows>}' RUN='${RUN:-}' task=${SGE_TASK_ID:-}"
 SELECTED=()
 for row in "${RUNS[@]}"; do
   read -r r_name r_group _ <<< "$row"
@@ -137,7 +145,7 @@ if [ -n "$RUN" ]; then
   ROW=${SELECTED[0]}
 else
   if [ -z "$SGE_TASK_ID" ] || [ "$SGE_TASK_ID" = "undefined" ]; then
-    echo "ERROR: SGE_TASK_ID unset; use 'qsub -t 1-${#SELECTED[@]}', or RUN=<name> for one row" >&2
+    echo "ERROR: SGE_TASK_ID unset; set '#$ -t 1-${#SELECTED[@]}' in the header, or RUN=<name> for one row" >&2
     exit 1
   fi
   index=$(($SGE_TASK_ID-1))

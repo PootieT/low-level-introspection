@@ -32,8 +32,10 @@
 #   lora_r    adapter rank (alpha = 2r, the convention everywhere else)
 #
 # SELECTING RUNS -- three ways, so a one-off never means editing the table:
-#   qsub -t 1-26 <script>                     every row, by index
-#   GROUP=rank qsub -t 1-4 <script>           only rows in that group, indexed within it
+# (SCC's qsub rejects -t on the command line and does not export the caller's
+# environment: set the array size in the header and pass the group as an ARGUMENT.)
+#   qsub <script>                             every row, by index (header #$ -t)
+#   qsub <script> rank                        only rows in that group, indexed within it
 #   RUN=steps_n1_30k_ep10 bash <script>       one row by name (interactive)
 #
 # CACHES. The POOL cache (all 200 neurons, test split) is built once. Each run's own
@@ -179,6 +181,12 @@ RUNS=(
 
 # ---- pick this task's row ------------------------------------------------------
 # GROUP filters the table first; RUN selects by name; otherwise SGE_TASK_ID indexes.
+# The group comes from the FIRST SCRIPT ARGUMENT (`qsub <script> <group>`): SGE passes
+# script arguments to the job, but NOT the submitting shell's environment, so
+# `GROUP=x qsub <script>` silently runs with GROUP unset and indexes the whole table.
+# The env var still works for `qsub -v GROUP=x <script>` and for interactive `bash`.
+GROUP=${1:-$GROUP}
+echo "selection: GROUP='${GROUP:-<all rows>}' RUN='${RUN:-}' task=${SGE_TASK_ID:-}"
 SELECTED=()
 for row in "${RUNS[@]}"; do
   read -r r_name r_group _ <<< "$row"
@@ -193,7 +201,7 @@ if [ -n "$RUN" ]; then
   ROW=${SELECTED[0]}
 else
   if [ -z "$SGE_TASK_ID" ] || [ "$SGE_TASK_ID" = "undefined" ]; then
-    echo "ERROR: SGE_TASK_ID unset; use 'qsub -t 1-${#SELECTED[@]}', or RUN=<name> for one row" >&2
+    echo "ERROR: SGE_TASK_ID unset; set '#$ -t 1-${#SELECTED[@]}' in the header, or RUN=<name> for one row" >&2
     exit 1
   fi
   index=$(($SGE_TASK_ID-1))

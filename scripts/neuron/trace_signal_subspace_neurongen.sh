@@ -19,10 +19,11 @@
 # Runs are sharded over the array by mechanistic_analysis/trace_signal_subspace.py itself
 # ($SGE_TASK_ID / $SGE_TASK_LAST); --skip-existing makes resubmission resume.
 #
-# RUN_GLOB selects runs (default: every neurongen run, unconstrained and KL=0.1). The
-# questions mostly need the multi-neuron runs, e.g.
-#   RUN_GLOB='neurongen_kl0.1_*' qsub <script>
-#   RUN_GLOB='neurongen_armA_*' qsub <script>        # unconstrained scaling cells
+# The run glob is the FIRST SCRIPT ARGUMENT (default: every neurongen run, unconstrained
+# and KL=0.1). SGE passes script arguments to the job but not the caller's environment,
+# so `RUN_GLOB=x qsub <script>` would silently analyse every run. E.g.
+#   qsub <script> 'neurongen_kl0.1_*'
+#   qsub <script> 'neurongen_armA_*'           # unconstrained scaling cells
 # Cost: quadratic in neurons analysed (<=40 here): ~minutes per run on one GPU, fp32.
 # ============================================================================
 
@@ -41,8 +42,11 @@ export HF_HOME=/projectnb/ivc-ml/SharedHuggingFaceCache
 
 set -e
 
+RUN_GLOB=${1:-${RUN_GLOB:-neurongen_*}}
+echo "run glob: $RUN_GLOB"
+
 python mechanistic_analysis/trace_signal_subspace.py \
     --group mlp_neurongen \
-    --run-glob "${RUN_GLOB:-neurongen_*}" \
+    --run-glob "$RUN_GLOB" \
     --n-texts 64 --max-trained 30 --n-heldout 10 \
     --skip-existing
