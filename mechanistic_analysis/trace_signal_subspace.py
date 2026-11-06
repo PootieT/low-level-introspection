@@ -34,12 +34,13 @@ different activation scales are comparable)
                 the per-example directions (1 = one fixed AXIS across contexts -- the
                 write-in's sign flips with up_proj(x), so axes, not signed means);
                 context dimension (participation ratio of per-example directions);
-                mean |cos| between trained neurons' principal directions, raw and with the
-                final readout direction r = w*gamma/||w*gamma|| projected out (every
-                neuron must converge onto r at the top, so raw similarity there is
-                trivial); union participation ratio over trained neurons; the same
-                write-in geometry in the BASE model (adapter disabled), to separate
-                directions the base model already had from ones the adapter created.
+                mean |cos| between trained neurons' principal directions, and between
+                held-out and trained ones; |cos| of each direction with the readout
+                covector (w*gamma before the final norm, w after it); the union
+                participation ratio (effective number of distinct directions among the
+                N trained ones, in the CSV); the same in the BASE model (adapter
+                disabled), to separate directions the base model already had from ones
+                the adapter created.
   cross-talk    every (prompt i, source j) pair over trained + held-out neurons, per
                 layer at the readout token: norm ratio ||D_{i<-j}|| / ||D_{j<-j}|| and
                 per-example |cos(D_{i<-j}(x), D_{j<-j}(x))| on the same text (signed means
@@ -54,9 +55,12 @@ different activation scales are comparable)
                     h <- h - (h - h_clean) U U^T,
                 which removes exactly the injection's effect within U and nothing else.
                 U = i's own subspace (top PCs of its per-example readout directions plus
-                its write-in), the union of the OTHER trained neurons' subspaces, and
-                random subspaces of the same dimensions. Retained fraction = readout
-                slope under the patch / clean slope.
+                its write-in); ONE other trained neuron's own subspace at a time (same
+                dimension as own, so own-vs-other is not a dimension comparison); the
+                union of all other trained neurons' subspaces; and random subspaces of
+                the own and union dimensions. Retained fraction = readout slope under
+                the patch / clean slope, pooled over neurons as sum/sum so a neuron the
+                readout barely reads cannot dominate.
                     own kills, others do not       private channels
                     others kill too                shared channel
                     random kills as much           dimension-generic, not a channel
@@ -66,6 +70,7 @@ Usage
 python mechanistic_analysis/trace_signal_subspace.py --config experiment_configs/mlp_neurongen/neurongen_data_n30_30k.json
 python mechanistic_analysis/trace_signal_subspace.py --group mlp_neurongen --run-glob 'neurongen_kl0.1_*' --skip-existing
 python mechanistic_analysis/trace_signal_subspace.py --config <cfg> --from-cache     # replot
+python mechanistic_analysis/trace_signal_subspace.py --config <cfg> --scale 10        # -> signal_subspace_x10/
 
 Outputs in <run>/signal_subspace/:
   signal_subspace_geometry.csv     per (site, layer, model): geometry summary
@@ -110,9 +115,10 @@ GROUPS = {("trained", "trained"): "Trained ← Trained",
           ("trained", "heldout"): "Trained Prompt ← Held-Out Source",
           ("heldout", "trained"): "Held-Out Prompt ← Trained Source",
           ("heldout", "heldout"): "Held-Out ← Held-Out"}
-ABL_CONDITIONS = ("own", "others", "random_own", "random_others")
-ABL_LABELS = {"own": "Own Subspace", "others": "Other Neurons' Subspaces",
-              "random_own": "Random (Own Dim)", "random_others": "Random (Others' Dim)"}
+ABL_CONDITIONS = ("own", "single_other", "random_own", "others", "random_others")
+ABL_LABELS = {"own": "Own Subspace", "single_other": "One Other Neuron's Subspace",
+              "random_own": "Random (Own Dim)", "others": "All Other Neurons' Subspaces",
+              "random_others": "Random (All-Others Dim)"}
 FONTS = {"title": 16, "label": 15, "tick": 12, "legend": 11}
 
 
@@ -140,6 +146,10 @@ def parse_args():
                    help="Dimensions of each neuron's own subspace (top PCs of its "
                         "per-example readout directions, plus its write-in direction).")
     p.add_argument("--max-others-dims", type=int, default=256)
+    p.add_argument("--max-single-others", type=int, default=10,
+                   help="Per trained neuron, how many OTHER neurons' own subspaces to "
+                        "patch one at a time (same dimension as its own subspace, so the "
+                        "own-vs-other comparison is not confounded by dimension).")
     p.add_argument("--no-crosstalk", action="store_true",
                    help="Diagonal only (prompt names the injected neuron): skips the "
                         "quadratic part.")
@@ -361,6 +371,13 @@ def mean_abs_offdiag_cos(M):
     return float(np.abs(C[~np.eye(len(M), dtype=bool)]).mean())
 
 
+def cross_abs_cos(A, B):
+    """Mean |cos| between every row of A and every row of B."""
+    if len(A) == 0 or len(B) == 0:
+        return np.nan
+    return float(np.abs(unit(A) @ unit(B).T).mean())
+
+
 def orthobasis(X, k=None, tol=1e-6):
     """Orthonormal basis [d, r] of the row space of X, optionally top-k by energy."""
     if len(X) == 0:
@@ -423,7 +440,10 @@ def analyze_run(run, spec, args, out_dir: Path):
 
     gamma = run.base.model.norm.weight.detach().float().cpu().numpy()
     w = run.model.regression_head.weight.detach().float().cpu().numpy().reshape(-1)
-    r_hat = unit(w * gamma)
+    # the readout covector in each layer's space: the head reads the POST-norm final
+    # layer directly (w), and every earlier residual through the final RMSNorm (w*gamma)
+    r_pre, r_post = unit(w * gamma), unit(w)
+    r_for = lambda l: r_post if l == n_layers - 1 else r_pre
     d_model = len(gamma)
 
     nL = len(layers)
@@ -528,13 +548,15 @@ def analyze_run(run, spec, args, out_dir: Path):
                     rank1_energy=float(rank1[(mdl, site)][a, li]),
                     coherence_signed=float(np.linalg.norm(m) / max(norms.mean(), 1e-30)),
                     context_pr=participation_ratio(X),
-                    abs_cos_readout_dir=float(abs(P[a, li] @ r_hat)),
+                    abs_cos_readout_dir=float(abs(P[a, li] @ r_for(l))),
                     capture_trained=cap, capture_random=U.shape[1] / d_model,
                     sigma=stats[k][1]))
-            Pt_r = remove_dir(Pt, r_hat)
+            Pt_r = remove_dir(Pt, r_for(l))
+            Ph = P[[kidx[k] for k in heldout], li]
             geo_rows.append(dict(
                 model=mdl, site=site, layer=l, n_trained=len(tr),
                 mean_abs_cos=mean_abs_offdiag_cos(Pt),
+                mean_abs_cos_heldout_trained=cross_abs_cos(Ph, Pt),
                 mean_abs_cos_r_removed=mean_abs_offdiag_cos(Pt_r),
                 union_pr=participation_ratio(unit(Pt)) if len(tr) else np.nan,
                 union_pr_r_removed=participation_ratio(unit(Pt_r)) if len(tr) else np.nan,
@@ -578,7 +600,8 @@ def analyze_run(run, spec, args, out_dir: Path):
         abl_df.to_csv(out_dir / "signal_subspace_ablation.csv", index=False)
     np.savez_compressed(out_dir / "signal_subspace_dirs.npz",
                         neurons=np.array(neurons), roles=np.array([role[k] for k in neurons]),
-                        layers=np.array(layers), r_hat=r_hat.astype(np.float32),
+                        layers=np.array(layers), r_hat=r_pre.astype(np.float32),
+                        r_hat_post=r_post.astype(np.float32),
                         **{f"principal_{m}_{s}": v.astype(np.float16)
                            for (m, s), v in pdirs.items()},
                         **{f"mean_{m}_{s}": v.astype(np.float16) for (m, s), v in mdirs.items()})
@@ -654,7 +677,13 @@ def ablate(run, args, layers, trained, kidx, batches, chunks, stats, diag, pdirs
             bases = {"own": own[k], "others": U_oth,
                      "random_own": random_basis(d_model, own[k].shape[1], rng),
                      "random_others": random_basis(d_model, U_oth.shape[1], rng)}
-            slopes = {c: [] for c in ("clean",) + ABL_CONDITIONS}
+            pool = [j for j in trained if j != k]
+            singles = ([int(j) for j in rng.choice(pool, size=min(args.max_single_others,
+                                                                 len(pool)), replace=False)]
+                       if pool else [])
+            for j in singles:
+                bases[("single_other", j)] = own[j]
+            slopes = {c: [] for c in ("clean",) + tuple(bases)}
             for c_idx, c in enumerate(chunks):
                 b = batches[k][c_idx]
                 nc = len(c)
@@ -674,11 +703,13 @@ def ablate(run, args, layers, trained, kidx, batches, chunks, stats, diag, pdirs
                                             patch=(l, hook), keep_sites=False)
                     slopes[cond].append(split_pm(pred, 1, nc, args.scale)[0].cpu().numpy())
             clean = np.concatenate(slopes["clean"])
-            for cond in ABL_CONDITIONS:
-                if not slopes[cond]:
+            for key, U in bases.items():
+                if not slopes[key]:
                     continue
-                s = np.concatenate(slopes[cond])
-                rows.append(dict(neuron=k, layer=l, condition=cond, dim=bases[cond].shape[1],
+                cond, other = (key if isinstance(key, tuple) else (key, -1))
+                s = np.concatenate(slopes[key])
+                rows.append(dict(neuron=k, layer=l, condition=cond, other=other,
+                                 dim=U.shape[1],
                                  clean_slope=float(clean.mean()), slope=float(s.mean()),
                                  retained=float(s.mean() / clean.mean())
                                  if abs(clean.mean()) > 1e-12 else np.nan))
@@ -761,33 +792,29 @@ def plot_readout(ro, out_dir, title):
     plt.close(fig)
 
 
+SITE_TITLES = {"t": "Token t (Where the Neuron Fires)", "readout": "Readout Token (Last)"}
+
+
 def plot_geometry(geo, nd, out_dir, title):
-    fig, axes = plt.subplots(2, 3, figsize=(17, 9))
+    """Per site (rows): how aligned the neurons' signal directions are (left) and how
+    large the signal is (right). Directions are sign-invariant principal directions."""
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9.5))
     for r, site in enumerate(SITES):
-        site_name = "Token t (Write-In)" if site == "t" else "Readout Token"
         ax = axes[r, 0]
         for mdl, ls in (("adapted", "-"), ("base", ":")):
             g = geo[(geo["site"] == site) & (geo["model"] == mdl)]
             ax.plot(g["layer"], g["mean_abs_cos"], ls=ls, marker="o", color="tab:blue",
-                    label=f"Raw ({mdl.capitalize()})")
-            ax.plot(g["layer"], g["mean_abs_cos_r_removed"], ls=ls, marker="s",
-                    color="tab:red", label=f"Readout Dir Removed ({mdl.capitalize()})")
+                    label=f"Trained vs Trained ({mdl.capitalize()})")
+            if "mean_abs_cos_heldout_trained" in g and g["mean_abs_cos_heldout_trained"].notna().any():
+                ax.plot(g["layer"], g["mean_abs_cos_heldout_trained"], ls=ls, marker="s",
+                        color="tab:orange", label=f"Held-Out vs Trained ({mdl.capitalize()})")
         if len(geo):
             ax.axhline(geo["random_abs_cos"].iloc[0], color="gray", lw=1, ls="--",
                        label="Random Directions")
-        _style(ax, "Layer", "Mean |cos| Between Trained Neurons")
-        ax.set_title(site_name, fontsize=FONTS["title"])
-        ax.legend(fontsize=9)
+        ax.set_ylim(0, 1.02)
+        _style(ax, "Layer", "Mean |cos| of Signal Directions")
+        ax.set_title(f"Direction Alignment: {SITE_TITLES[site]}", fontsize=FONTS["title"])
         ax = axes[r, 1]
-        for mdl, ls in (("adapted", "-"), ("base", ":")):
-            g = geo[(geo["site"] == site) & (geo["model"] == mdl)]
-            ax.plot(g["layer"], g["union_pr"] / g["n_trained"].clip(lower=1), ls=ls,
-                    marker="o", color="tab:purple", label=mdl.capitalize())
-        ax.set_ylim(0, 1.05)
-        _style(ax, "Layer", "Union PR / N Trained")
-        ax.set_title("Shared (0) vs Separate (1) Directions", fontsize=FONTS["title"])
-        ax.legend(fontsize=9)
-        ax = axes[r, 2]
         for (rl, mdl), col, ls in ((("trained", "adapted"), "tab:blue", "-"),
                                    (("heldout", "adapted"), "tab:orange", "-"),
                                    (("trained", "base"), "tab:blue", ":"),
@@ -797,13 +824,33 @@ def plot_geometry(geo, nd, out_dir, title):
             ax.plot(m.index, m.values, ls=ls, marker="o", ms=4, color=col,
                     label=f"{'Held-Out' if rl == 'heldout' else 'Trained'} ({mdl.capitalize()})")
         ax.set_yscale("log")
-        _style(ax, "Layer", "||D|| per σ")
-        ax.set_title("Signal Norm", fontsize=FONTS["title"])
-        ax.legend(fontsize=9)
+        _style(ax, "Layer", "Signal Norm ||\u0394h|| per \u03c3")
+        ax.set_title(f"Signal Norm: {SITE_TITLES[site]}", fontsize=FONTS["title"])
+    for c in range(2):
+        h, lab = axes[0, c].get_legend_handles_labels()
+        axes[1, c].legend(h, lab, fontsize=FONTS["legend"], loc="upper center",
+                          bbox_to_anchor=(0.5, -0.16), ncol=2, frameon=False)
     fig.suptitle(title, fontsize=FONTS["title"])
     fig.tight_layout()
     fig.savefig(out_dir / "signal_subspace_geometry.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+def heldout_cos_from_npz(out_dir: Path, geo: pd.DataFrame) -> pd.DataFrame:
+    """Backfill Held-Out vs Trained |cos| for results written before that column."""
+    f = out_dir / "signal_subspace_dirs.npz"
+    if "mean_abs_cos_heldout_trained" in geo or not f.exists():
+        return geo
+    z = np.load(f)
+    tr, layers = z["roles"] == "trained", list(z["layers"])
+    vals = []
+    for _, r in geo.iterrows():
+        key = f"principal_{r['model']}_{r['site']}"
+        if key not in z:
+            vals.append(np.nan); continue
+        P = z[key].astype(np.float32)[:, layers.index(int(r["layer"]))]
+        vals.append(cross_abs_cos(P[~tr], P[tr]))
+    return geo.assign(mean_abs_cos_heldout_trained=vals)
 
 
 def plot_heldout(nd, out_dir, title):
@@ -849,23 +896,45 @@ def plot_heldout(nd, out_dir, title):
     plt.close(fig)
 
 
-def plot_ablation(abl, out_dir, title):
+def pooled_retained(g):
+    """Retained fraction over neurons as sum(slope) / sum(clean slope): weighted by how
+    strongly each neuron is read, so a neuron whose clean slope is ~0 cannot blow the
+    average up (a per-neuron ratio with a near-zero denominator is unbounded)."""
+    return float(g["slope"].sum() / g["clean_slope"].sum())
+
+
+def plot_ablation(abl, out_dir, title, n_boot=500):
     if abl.empty:
         return
-    fig, ax = plt.subplots(figsize=(8, 5))
-    colors = dict(zip(ABL_CONDITIONS, ("tab:blue", "tab:red", "tab:gray", "silver")))
+    abl = abl.copy()
+    if "other" not in abl:
+        abl["other"] = -1
+    # one row per (neuron, layer, condition): single_other averaged over the others first
+    per = (abl.groupby(["neuron", "layer", "condition"])
+           .agg(slope=("slope", "mean"), clean_slope=("clean_slope", "first"),
+                dim=("dim", "median")).reset_index())
+    rng = np.random.default_rng(0)
+    fig, ax = plt.subplots(figsize=(8.5, 5.2))
+    colors = {"own": "tab:blue", "single_other": "tab:green", "random_own": "tab:gray",
+              "others": "tab:red", "random_others": "silver"}
     for cond in ABL_CONDITIONS:
-        g = abl[abl["condition"] == cond].groupby("layer")["retained"]
-        if g.ngroups == 0:
+        g = per[per["condition"] == cond]
+        if g.empty:
             continue
-        dim = int(abl[abl["condition"] == cond]["dim"].median())
-        ax.errorbar(g.mean().index, g.mean().values, yerr=g.sem().values, marker="o",
-                    capsize=3, lw=1.8, color=colors[cond],
-                    ls="--" if cond.startswith("random") else "-",
-                    label=f"{ABL_LABELS[cond]} (dim {dim})")
+        xs, ys, lo, hi = [], [], [], []
+        for l, gl in g.groupby("layer"):
+            neurons = gl["neuron"].unique()
+            boots = [pooled_retained(gl.set_index("neuron").loc[rng.choice(neurons, len(neurons))])
+                     for _ in range(n_boot)]
+            xs.append(l); ys.append(pooled_retained(gl))
+            lo.append(np.percentile(boots, 2.5)); hi.append(np.percentile(boots, 97.5))
+        ys, lo, hi = map(np.array, (ys, lo, hi))
+        ax.errorbar(xs, ys, yerr=[ys - lo, hi - ys], marker="o", capsize=3, lw=1.8,
+                    color=colors[cond], ls="--" if cond.startswith("random") else "-",
+                    label=f"{ABL_LABELS[cond]} (dim {int(g['dim'].median())})")
     ax.axhline(1, color="k", lw=0.8)
     ax.axhline(0, color="k", lw=0.8, alpha=0.4)
-    _style(ax, "Patched Layer (Tokens t..Last)", "Readout Slope Retained")
+    _style(ax, "Patched Layer (Tokens t..Last)", "Readout Slope Retained (Pooled)")
     ax.legend(fontsize=FONTS["legend"], loc="upper center", bbox_to_anchor=(0.5, -0.17),
               ncol=2, frameon=False)
     ax.set_title(title, fontsize=FONTS["title"])
@@ -884,7 +953,7 @@ def plot_all(out_dir: Path, title: str):
     if len(ro):
         plot_readout(ro, out_dir, title)
     if len(geo) and len(nd):
-        plot_geometry(geo, nd, out_dir, title)
+        plot_geometry(heldout_cos_from_npz(out_dir, geo), nd, out_dir, title)
         plot_heldout(nd, out_dir, title)
     plot_ablation(abl, out_dir, title)
 
@@ -896,8 +965,10 @@ def main():
     runs = runs_from_args(args)
     if not runs:
         raise SystemExit("No runs with checkpoints matched.")
+    # a non-default injection size is a separate measurement, kept beside the default
+    name = ANALYSIS if args.scale == 1 else f"{ANALYSIS}_x{args.scale:g}"
     for k, spec in enumerate(runs, 1):
-        out_dir = spec.run_dir / ANALYSIS
+        out_dir = spec.run_dir / name
         action = resolve_run_action(args, out_dir / SENTINEL)
         if action == "skip":
             print(f"[subspace] {spec.name}: results exist, skipping")

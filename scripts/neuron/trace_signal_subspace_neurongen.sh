@@ -24,6 +24,10 @@
 # so `RUN_GLOB=x qsub <script>` would silently analyse every run. E.g.
 #   qsub <script> 'neurongen_kl0.1_*'
 #   qsub <script> 'neurongen_armA_*'           # unconstrained scaling cells
+# A SECOND argument is passed through as extra flags, e.g. the training-size injection
+# (results go to signal_subspace_x10/, beside the default 1-sigma ones):
+#   qsub <script> 'neurongen_kl0.1_n10_30k_r16' '--scale 10'
+# --skip-existing keys on signal_subspace_meta.json: delete it to recompute a run.
 # Cost: quadratic in neurons analysed (<=40 here): ~minutes per run on one GPU, fp32.
 # ============================================================================
 
@@ -43,10 +47,11 @@ export HF_HOME=/projectnb/ivc-ml/SharedHuggingFaceCache
 set -e
 
 RUN_GLOB=${1:-${RUN_GLOB:-neurongen_*}}
-echo "run glob: $RUN_GLOB"
+EXTRA=${2:-}
+echo "run glob: $RUN_GLOB  extra: $EXTRA"
 
 python mechanistic_analysis/trace_signal_subspace.py \
     --group mlp_neurongen \
     --run-glob "$RUN_GLOB" \
     --n-texts 64 --max-trained 30 --n-heldout 10 \
-    --skip-existing
+    --skip-existing $EXTRA

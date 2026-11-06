@@ -35,6 +35,7 @@ Outputs (in the metric's directory unless --out-dir)
   sft_vs_<metric>_<x>_stats.csv       pooled / within-layer / partial / per-layer stats
   sft_vs_<metric>_<x>_gate<g>.png     pooled and within-layer scatters per outcome
   <metric>_<x>_by_layer.png           each layer's distribution, grid neurons marked
+  <metric>_<x>_density_by_layer.png   one density line per layer on a shared axis
 
 Usage
   python plotters/plot_sft_vs_neuron_property.py --metric context [--x n_eff] [--gate off]
@@ -46,9 +47,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib
+import matplotlib.ticker
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.stats import spearmanr, t as tdist
+from scipy.stats import spearmanr, gaussian_kde, t as tdist
 
 ROOT = Path(__file__).resolve().parents[1]
 GRID_PLOTS = ROOT / "outputs/plots/mlp_endo_sweep_layer_token"
@@ -228,6 +230,58 @@ def plot_layer_distributions(scores, m, xcol, out_png):
     plt.close(fig)
 
 
+def plot_layer_density_lines(scores, m, xcol, out_png):
+    """One density line per layer over that layer's reference neurons, so layers can be
+    compared on one axis; the grid neurons as same-coloured ticks underneath. For an
+    R2-type score bunched just below 1, a second panel shows the unexplained fraction
+    1 - R2 on a log axis, where the layers actually separate."""
+    layers = sorted(scores["layer"].unique())
+    col = dict(zip(layers, plt.cm.viridis(np.linspace(0, 0.95, len(layers)))))
+    ref = scores[scores["is_reference"]]
+    panels = [(xcol, X_LABELS.get(xcol, xcol), False)]
+    if xcol in ("R2",) or xcol.startswith("r2"):
+        panels.append((xcol, f"1 − {X_LABELS.get(xcol, xcol)} (Unexplained, Log Scale)", True))
+    fig, axes = plt.subplots(1, len(panels), figsize=(7.5 * len(panels), 5.2), squeeze=False)
+    for ax, (c, lab, log_resid) in zip(axes[0], panels):
+        tf = (lambda v: np.log10(np.clip(1 - v, 1e-6, None))) if log_resid else (lambda v: v)
+        allv = tf(ref[c].dropna().values)
+        lo, hi = np.percentile(allv, [0.5, 99.5])
+        grid_x = np.linspace(lo, hi, 400)
+        ymax = 0
+        for L in layers:
+            v = tf(ref[ref["layer"] == L][c].dropna().values)
+            if len(v) < 5 or np.std(v) == 0:
+                continue
+            dens = gaussian_kde(v)(grid_x)
+            ymax = max(ymax, dens.max())
+            ax.plot(10 ** grid_x if log_resid else grid_x, dens, color=col[L], lw=2,
+                    label=f"L{L} (median {np.median(ref[ref['layer'] == L][c]):.3g})")
+        for k, L in enumerate(layers):         # grid neurons as ticks below zero
+            g = tf(m[m["layer"] == L][c].dropna().values)
+            y = -ymax * (0.04 + 0.035 * k)
+            ax.scatter(10 ** g if log_resid else g, np.full(len(g), y), marker="|", s=90,
+                       color=col[L], lw=1.6)
+        ax.axhline(0, color="k", lw=0.6)
+        if log_resid:      # the density is of log10(1 - R2), drawn against 1 - R2
+            ax.set_xscale("log")
+            ax.set_xlim(10 ** lo, 10 ** hi)
+            ticks = [t for t in (0.001, 0.002, 0.005, 0.01, 0.02, 0.03, 0.05, 0.1, 0.2, 0.3, 0.5, 1)
+                     if 10 ** lo <= t <= 10 ** hi]
+            ax.set_xticks(ticks, [f"{t:g}" for t in ticks])
+            ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+        else:
+            ax.set_xlim(lo, hi)
+        ax.set_xlabel(lab)
+        ax.set_ylabel("Density (Reference Neurons)")
+        ax.grid(alpha=0.25)
+    axes[0, 0].legend(fontsize=10, title="Layer", loc="upper left")
+    fig.suptitle("Lines: All Reference Neurons per Layer | Ticks Below: Grid Neurons",
+                 fontsize=14)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main():
     args = parse_args()
     spec = METRICS[args.metric]
@@ -258,6 +312,8 @@ def main():
         index=False, float_format=lambda v: f"{v:.3g}"))
     plot_scatter(m, st, xcol, out_dir / f"{stem}_gate{args.gate}.png", args.gate)
     plot_layer_distributions(scores, m, xcol, out_dir / f"{args.metric}_{xcol}_by_layer.png")
+    plot_layer_density_lines(scores, m, xcol,
+                             out_dir / f"{args.metric}_{xcol}_density_by_layer.png")
     print(f"[sft-vs-prop] wrote {out_dir}")
 
 
