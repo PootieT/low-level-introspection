@@ -68,12 +68,17 @@ class SAESteerAllPositionsHook:
         return (hidden,) + tuple(output[1:]) if is_tuple else hidden
 
 
-def _on_magnitude(row):
+def _on_magnitude(row, column=None):
     """PEAK 'on' activation to scale steering strengths by. Steering to a small
     multiple of the feature's *mean* active value (~4-5) barely perturbs a residual of
     norm ~127 and produces no visible concept, so we anchor to the feature's PEAK
     activation instead -- Neuronpedia's maxActApprox, else our own active_max. Doses
     are then multiples of that peak (e.g. 5x, 10x, 20x = clamp well above natural)."""
+    if column:   # an explicit base, e.g. act_q99 (data_prep/sae_activation_quantiles.py)
+        v = row.get(column)
+        if v is None or not np.isfinite(v) or float(v) <= 0:
+            raise SystemExit(f"feature {row.get('feature')}: no usable {column!r} in --annotated")
+        return float(v)
     for key in ("np_max_act", "active_max", "active_mean"):
         v = row.get(key)
         if v is not None and np.isfinite(v) and float(v) > 0:
@@ -107,6 +112,11 @@ def build_prompt_pool(args):
     subset (seeded per feature) so the deterministic unsteered baseline text is NOT
     shared across features -- otherwise a judge can spot the baseline by recognizing
     the same string repeated in every feature block (the blinding leak)."""
+    if args.prompt_file:   # frozen pool (works offline); same construction, saved by --write-prompt-file
+        texts = json.loads(Path(args.prompt_file).read_text())["prompts"]
+        if len(texts) < args.prompt_pool:
+            raise SystemExit(f"{args.prompt_file} has {len(texts)} prompts, need {args.prompt_pool}")
+        return texts[:args.prompt_pool]
     from datasets import load_dataset
     ds = load_dataset(args.dataset, args.dataset_config, split=args.split, streaming=True)
     texts = []
@@ -120,8 +130,8 @@ def build_prompt_pool(args):
 
 
 def tokenize_prompts(tokenizer, texts, args, device):
-    enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True,
-                    max_length=args.prompt_words + 4, padding_side="left")
+    # no truncation: the judge is shown the full prompt, so the model must see all of it
+    enc = tokenizer(texts, return_tensors="pt", padding=True, padding_side="left")
     return {k: v.to(device) for k, v in enc.items()}
 
 
@@ -155,6 +165,12 @@ def parse_args():
     p.add_argument("--max-features", type=int, default=20,
                    help="Cap number of explained features sampled (when --features unset).")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--magnitude-column", default=None,
+                   help="Column of --annotated that the strengths multiply (default: Neuronpedia peak).")
+    p.add_argument("--prompt-file", type=Path, default=None,
+                   help="Read the prompt pool from this JSON instead of streaming the dataset.")
+    p.add_argument("--write-prompt-file", type=Path, default=None,
+                   help="Build the pool from the dataset, save it here, and exit (no model loaded).")
     p.add_argument("--out-dir", type=Path, default=Path("data/sae_steering_samples"))
     return p.parse_args()
 
@@ -162,6 +178,14 @@ def parse_args():
 @torch.no_grad()
 def main():
     args = parse_args()
+    if args.write_prompt_file:
+        pool = build_prompt_pool(args)
+        args.write_prompt_file.parent.mkdir(parents=True, exist_ok=True)
+        args.write_prompt_file.write_text(json.dumps({
+            "dataset": args.dataset, "config": args.dataset_config, "split": args.split,
+            "prompt_words": args.prompt_words, "prompts": pool}, indent=1))
+        print(f"[steer-gen] wrote {len(pool)} prompts -> {args.write_prompt_file}")
+        return
     device = "cuda" if torch.cuda.is_available() else "cpu"
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -218,8 +242,8 @@ def main():
         for _, row in cand.iterrows():
             feat = int(row["feature"])
             concept = str(row.get("explanation"))
-            on_mag = _on_magnitude(row.to_dict())
-            rng = random.Random(args.seed + feat)
+            on_mag = _on_magnitude(row.to_dict(), args.magnitude_column)
+            rng = random.Random(f"{args.seed}:{args.layer}:{feat}")   # distinct per (seed, layer, feature)
 
             feat_prompts = rng.sample(pool, min(args.n_prompts, len(pool)))
             batch = tokenize_prompts(tokenizer, feat_prompts, args, device)
@@ -230,7 +254,8 @@ def main():
                 model, module, bundle, tokenizer, batch, feat, target, args.max_new_tokens)
                 for name, target in conditions}
 
-            key[str(feat)] = {"concept": concept, "on_magnitude": on_mag, "prompts": []}
+            key[str(feat)] = {"concept": concept, "on_magnitude": on_mag,
+                              "magnitude_column": args.magnitude_column or "np_max_act", "prompts": []}
             judge_md.append(f"\n## Feature S{args.layer}.{feat}\n")
             judge_md.append(f"**Concept:** {concept}\n")
 
@@ -254,8 +279,11 @@ def main():
 
             print(f"  feat {feat:>6}  concept={concept[:50]!r}")
 
-    judge_path.write_text("\n".join(judge_md))
-    key_path.write_text(json.dumps(key, indent=2))
+    # key first, judge file last, each via rename: a judge file on disk implies a complete key
+    for path, text in ((key_path, json.dumps(key, indent=2)), (judge_path, "\n".join(judge_md))):
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text)
+        tmp.replace(path)
     print(f"\n[steer-gen] wrote:\n  {judge_path}  (blind — give this to the judge)\n"
           f"  {key_path}      (answer key — withhold from the judge)\n"
           f"  {samples_path}  (raw records)")

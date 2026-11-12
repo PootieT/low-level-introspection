@@ -1,0 +1,31 @@
+{
+  "description": "Deterministic SAE feature selection for the layer x position sweep (2026-10-11). Every parameter that affects which features are chosen lives here.",
+  "layers": [5, 10, 15, 20],
+  "n_select": {"default": 3},
+  "candidates": {
+    "stats": "data/sae_stats/gemma2-2b_res{L}_pos-1_16k.annotated.parquet",
+    "density_band": [0.001, 0.01],
+    "rank_positions": [8, 16, 24, 31],
+    "pos_stats": "data/sae_stats/gemma2-2b_res{L}_pos{P}_16k.parquet",
+    "act_quantiles": "data/sae_stats/gemma2-2b_res{L}_act_quantiles_16k.parquet",
+    "cache_size": 20000,
+    "rank_by": "proj_pos_mean",
+    "block": 200,
+    "max_rank": 3000
+  },
+  "steering": {
+    "model": "google/gemma-2-2b",
+    "sae_release": "gemma-scope-2b-pt-res-canonical",
+    "width": "16k",
+    "n_prompts": 50, "prompt_pool": 200, "prompt_words": 8, "max_new_tokens": 40,
+    "strengths": [1, 2, 3, 5], "seed": 0,
+    "magnitude": "act_q99"
+  },
+  "judge": {
+    "model": "Qwen/Qwen3.8-27B",
+    "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "temperature": 0.0, "enable_thinking": false, "seed": 0
+  },
+  "pass_rule": {"hit_rule": "any", "min_hit": 0.6, "min_judged": 50},
+  "semantic_rubric": "You classify one-line descriptions of features learned by a sparse autoencoder on a language model's activations.\nA feature is SEMANTIC if its description names a topic, sentiment, stance or meaning that can occur in many kinds of ordinary prose, for example gratitude, disagreement, dramatic conflict, cooking, legal proceedings, humour, health.\nA feature is NOT semantic if its description is mainly about any of these (use the category name in brackets):\n- punctuation, formatting, whitespace, symbols or special characters [punctuation_formatting]\n- numbers, dates, measurements, statistics or numerical data [numbers]\n- code, markup or programming syntax [code_markup]\n- specific words or word forms, or grammatical function such as pronouns, articles, prepositions, conjunctions, sentence beginnings or endings, questions as a form [lexical_grammar]\n- web or document template text: contact information, licenses or legal disclaimers, navigation, calls to action, prompts to click, subscribe, comment or give feedback, citations, references or identifiers, step-by-step instructions or how-to steps [template_web]\n- exclamation or emphasis on its own [exclamation]\n- too vague or generic to name a concept [vague]\n- none of the above: not a topic, sentiment, stance or meaning, but also not one of these structural kinds [other]\nIf a description mixes a structural element with a concept, decide by its main focus.\nReply with JSON only, exactly: {\"semantic\": true|false, \"category\": \"semantic\"|\"punctuation_formatting\"|\"numbers\"|\"code_markup\"|\"lexical_grammar\"|\"template_web\"|\"exclamation\"|\"vague\"|\"other\", \"reason\": \"<one short sentence>\"}"
+}

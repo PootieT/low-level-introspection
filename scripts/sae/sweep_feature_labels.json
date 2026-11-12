@@ -16,8 +16,20 @@
     "S15.7473": "statements expressing strong opinions or feelings",
     "S20.10859": "contact information and details for events or programs",
     "S20.8322": "encouragement for audience interaction and feedback on the content",
-    "S20.7717": "expressions of gratitude and friendly communication"
+    "S20.7717": "expressions of gratitude and friendly communication",
+    "S5.5351": "terms related to culinary skills and professionals",
+    "S5.14360": "terms and phrases related to architecture and architectural design",
+    "S5.15778": "references to religious institutions and expressions of faith",
+    "S10.6098": "references to time, particularly transitions between events or seasons",
+    "S10.231": "references to specific locations and amenities in a community context",
+    "S10.4151": "references to legal frameworks and institutional structures",
+    "S15.12152": "references to vintage and nostalgic items or concepts",
+    "S15.2471": "terms related to promotions and discounts",
+    "S15.10912": "references to hotels and accommodations",
+    "S20.15213": "references to dating services and relationships",
+    "S20.7652": "references to wine and related events",
+    "S20.14104": "references to death or burial events"
   },
-  "source": "neuronpedia gemma-2-2b res-16k",
+  "source": "neuronpedia gemma-2-2b res-16k; v3 sweep features added from results/sae_feature_selection/candidates.csv (frozen 2026-11-09)",
   "fetched_at": "2026-10-11T02:10:20.575247+00:00"
 }

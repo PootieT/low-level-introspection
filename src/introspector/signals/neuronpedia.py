@@ -126,15 +126,23 @@ def fetch_feature_raw(
     max_retries: int = 4,
     rate_limit_s: float = 0.2,
     use_cache: bool = True,
+    offline: bool = False,
 ) -> Optional[dict]:
     """GET one feature record, cached on disk. Returns the raw JSON dict, or None on
-    a persistent 404 / failure. Retries transient errors with exponential backoff."""
+    a persistent 404 / failure. Retries transient errors with exponential backoff.
+    A 404 is cached as `<index>.404`, so a cached None is told apart from a failed
+    request. offline=True never touches the network and raises if nothing is cached."""
     cache_path = Path(cache_dir) / source_id / f"{index}.json"
+    missing_path = cache_path.with_suffix(".404")
     if use_cache and cache_path.exists():
         try:
             return json.loads(cache_path.read_text())
         except (json.JSONDecodeError, OSError):
             pass
+    if use_cache and missing_path.exists():
+        return None
+    if offline:
+        raise FileNotFoundError(f"{source_id}/{index} is not in the Neuronpedia cache {cache_dir}")
 
     import requests
     sess = session or requests.Session()
@@ -146,6 +154,8 @@ def fetch_feature_raw(
             resp = sess.get(url, timeout=timeout,
                             headers={"Accept": "application/json"})
             if resp.status_code == 404:
+                missing_path.parent.mkdir(parents=True, exist_ok=True)
+                missing_path.touch()
                 return None
             if resp.status_code == 429 or resp.status_code >= 500:
                 raise requests.HTTPError(f"HTTP {resp.status_code}")
