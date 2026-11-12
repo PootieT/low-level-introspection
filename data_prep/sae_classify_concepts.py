@@ -1,21 +1,11 @@
 #!/usr/bin/env python3
-"""Step 2: semantic vs structural, from the description alone (no steering results are
-seen). One greedy, thinking-off request per candidate to the judge model in config.json,
-with the written rubric there. Writes concept_labels.csv (feature_id, semantic, category,
-reason) and raw responses next to it. Candidates already in --out keep their label, so
-deepening the pool only classifies the new ones.
-
-    python data_prep/sae_classify_concepts.py \
-        --candidates results/sae_feature_selection/candidates.csv \
-        --out results/sae_feature_selection/concept_labels.csv
-"""
 import argparse, csv, json, re
 from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 CATS = {"semantic", "punctuation_formatting", "numbers", "code_markup", "lexical_grammar",
-        "template_web", "exclamation", "vague", "other"}   # "other" = outside the rubric; not selected
+        "template_web", "exclamation", "vague", "other"}
 
 
 def parse(text):
@@ -42,11 +32,10 @@ def main():
     args = p.parse_args()
     cfg = json.loads(args.config.read_text())
     jc = cfg["judge"]
-    # stdlib csv only: this runs in judge_env (vLLM), which has no pandas
     with open(args.candidates, newline="") as fh:
-        cand = [r for r in csv.DictReader(fh) if r["explanation"]]   # no description: not eligible
+        cand = [r for r in csv.DictReader(fh) if r["explanation"]]
     old, old_raw = [], []
-    if args.out.exists():   # unparsed rows from a failed run are classified again, not kept
+    if args.out.exists():
         with open(args.out, newline="") as fh:
             old = [r for r in csv.DictReader(fh) if r["category"] != "unparsed"]
         keep = {r["feature_id"] for r in old}
@@ -66,7 +55,7 @@ def main():
              {"role": "user", "content": f"Feature description: {r['explanation']}"}] for r in cand]
     texts = [o.outputs[0].text for o in llm.chat(conv, sp, use_tqdm=True, **kw)]
     bad = [i for i, t in enumerate(texts) if parse(t) is None]
-    if bad:   # one stricter retry, then record as unparsed
+    if bad:
         retry = [conv[i][:1] + [{"role": "user", "content": conv[i][1]["content"] + "\n\nAnswer with the JSON object only."}] for i in bad]
         for i, o in zip(bad, llm.chat(retry, sp, use_tqdm=False, **kw)):
             texts[i] = o.outputs[0].text

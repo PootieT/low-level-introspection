@@ -8,16 +8,11 @@
 #SBATCH --mem=64G
 #SBATCH --time=00:45:00
 #SBATCH --output=log/%x-%A_%a.out
-#SBATCH --array=1-4    # one task per layer in LAYERS
+#SBATCH --array=1-4
 
-# ============================================================================
-# Step A1b of the selection: activation percentiles of every in-band feature over the A1 token
-# pass (needs network: streams C4). Run once before run_selection.sh; skips existing outputs.
-#     sbatch scripts/sae/selection/activation_quantiles.sh
-# ============================================================================
 echo "Start: $(date) task $SLURM_ARRAY_TASK_ID on $(hostname)"; nvidia-smi -L || true
 set -e
-ROOT=/work/neu/p2026_0061_neu/low-level-introspection; cd $ROOT
+ROOT=${ROOT:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)}}; cd $ROOT
 module load miniforge3; source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate ${INTRO_ENV:-$ROOT/introspection_env}
 export HF_HOME=${HF_HOME:-$ROOT/.hf_cache}

@@ -129,9 +129,7 @@ def fetch_feature_raw(
     offline: bool = False,
 ) -> Optional[dict]:
     """GET one feature record, cached on disk. Returns the raw JSON dict, or None on
-    a persistent 404 / failure. Retries transient errors with exponential backoff.
-    A 404 is cached as `<index>.404`, so a cached None is told apart from a failed
-    request. offline=True never touches the network and raises if nothing is cached."""
+    a persistent 404 / failure. Retries transient errors with exponential backoff."""
     cache_path = Path(cache_dir) / source_id / f"{index}.json"
     missing_path = cache_path.with_suffix(".404")
     if use_cache and cache_path.exists():

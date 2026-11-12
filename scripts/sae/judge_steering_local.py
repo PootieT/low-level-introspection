@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-"""Blind steering judge on a self-hosted model (vLLM), one request per prompt.
-
-Reads ONLY blinded *.judge.md files (concept + prompt + shuffled options A/B/C; the
-steered/unsteered key lives in a separate *.key.json that this script never opens) and
-asks the judge, separately for every prompt, which options express the concept.
-Decoding is greedy with thinking off, so a rerun reproduces the same picks.
-
-Writes, under --out-dir:
-  raw/<feature>.jsonl   every request's prompt index, raw response and parsed picks
-  picks/<feature>.json  {"feature", "concept", "picks": {"1": ["A"], ...}}  -- the format
-                        scripts/sae/score_steering_judge.py reads
-  run_info.json         model, revision, rubric, sampling, date
-
-    python scripts/sae/judge_steering_local.py \
-        --judge-md data/sae_steering_samples/gemma-2-2b_res5_16k.judge.md ... \
-        --out-dir data/sae_steering_judge/qwen3.8-27b
-"""
 import argparse, ast, hashlib, json, re, sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,12 +19,10 @@ RUBRIC = (
 
 
 def rubric(letters):
-    """The system prompt with the reply format spelled out for these option letters."""
     return RUBRIC.replace("{REPLY}", "{" + ", ".join(f'"{k}": true|false' for k in letters) + "}")
 
 
 def parse_judge_md(path):
-    """[(feature_id, concept, [(prompt_text, {"A": str, "B": str, "C": str}), ...]), ...]"""
     md = Path(path).read_text()
     out = []
     for block in re.split(r"^## Feature ", md, flags=re.M)[1:]:
@@ -62,8 +43,6 @@ def parse_judge_md(path):
 
 
 def samples_sha(feat):
-    """Hash of one feature's judged material (concept, prompts, options) and the judge rubric,
-    stored with its picks: changing either re-judges the feature."""
     return hashlib.sha256(json.dumps([RUBRIC, *feat[1:]], sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -105,7 +84,7 @@ def main():
         feats = [f for f in feats if f[0] in set(args.features)]
     (args.out_dir / "raw").mkdir(parents=True, exist_ok=True)
     (args.out_dir / "picks").mkdir(parents=True, exist_ok=True)
-    def done(f):   # judged, and on exactly these samples (picks are keyed by prompt number and letter)
+    def done(f):
         p = args.out_dir / "picks" / f"{f[0]}.json"
         return p.exists() and json.loads(p.read_text()).get("samples_sha") == samples_sha(f)
     todo = [f for f in feats if not done(f)]
@@ -130,7 +109,6 @@ def main():
     outs = llm.chat(conv, sp, use_tqdm=True, **kw)
     texts = [o.outputs[0].text for o in outs]
 
-    # one stricter retry for unparseable answers, then record them as unjudged
     bad = [j for j, t in enumerate(texts) if parse_answer(t, index[j][2]) is None]
     if bad:
         retry = [conv[j][:1] + [{"role": "user", "content": conv[j][1]["content"]
@@ -150,7 +128,7 @@ def main():
         picks = {str(i): a for i, t, a in rows if a is not None}
         bad = sum(a is None for _, _, a in rows)
         n_fail += bad
-        if bad:   # no picks file: the feature stays "not judged" and the run fails below
+        if bad:
             print(f"[judge] {fid}: {bad} prompts unparsed after retry; see raw/{fid}.jsonl")
             continue
         (args.out_dir / "picks" / f"{fid}.json").write_text(
@@ -159,7 +137,7 @@ def main():
     info = {"model": args.model, "revision_requested": args.revision, "rubric": RUBRIC, "temperature": 0.0, "max_tokens": 64,
             "enable_thinking": False, "seed": args.seed, "date": datetime.now(timezone.utc).isoformat(),
             "judge_md": [str(x) for x in args.judge_md], "unparsed_after_retry": n_fail}
-    try:   # the snapshot actually loaded from the local cache
+    try:
         from huggingface_hub import try_to_load_from_cache
         info["revision"] = Path(try_to_load_from_cache(args.model, "config.json",
                                                        revision=args.revision)).parent.name

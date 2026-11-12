@@ -74,7 +74,7 @@ def _on_magnitude(row, column=None):
     norm ~127 and produces no visible concept, so we anchor to the feature's PEAK
     activation instead -- Neuronpedia's maxActApprox, else our own active_max. Doses
     are then multiples of that peak (e.g. 5x, 10x, 20x = clamp well above natural)."""
-    if column:   # an explicit base, e.g. act_q99 (data_prep/sae_activation_quantiles.py)
+    if column:
         v = row.get(column)
         if v is None or not np.isfinite(v) or float(v) <= 0:
             raise SystemExit(f"feature {row.get('feature')}: no usable {column!r} in --annotated")
@@ -112,7 +112,7 @@ def build_prompt_pool(args):
     subset (seeded per feature) so the deterministic unsteered baseline text is NOT
     shared across features -- otherwise a judge can spot the baseline by recognizing
     the same string repeated in every feature block (the blinding leak)."""
-    if args.prompt_file:   # frozen pool (works offline); same construction, saved by --write-prompt-file
+    if args.prompt_file:
         texts = json.loads(Path(args.prompt_file).read_text())["prompts"]
         if len(texts) < args.prompt_pool:
             raise SystemExit(f"{args.prompt_file} has {len(texts)} prompts, need {args.prompt_pool}")
@@ -130,7 +130,6 @@ def build_prompt_pool(args):
 
 
 def tokenize_prompts(tokenizer, texts, args, device):
-    # no truncation: the judge is shown the full prompt, so the model must see all of it
     enc = tokenizer(texts, return_tensors="pt", padding=True, padding_side="left")
     return {k: v.to(device) for k, v in enc.items()}
 
@@ -243,7 +242,7 @@ def main():
             feat = int(row["feature"])
             concept = str(row.get("explanation"))
             on_mag = _on_magnitude(row.to_dict(), args.magnitude_column)
-            rng = random.Random(f"{args.seed}:{args.layer}:{feat}")   # distinct per (seed, layer, feature)
+            rng = random.Random(f"{args.seed}:{args.layer}:{feat}")
 
             feat_prompts = rng.sample(pool, min(args.n_prompts, len(pool)))
             batch = tokenize_prompts(tokenizer, feat_prompts, args, device)
@@ -279,7 +278,6 @@ def main():
 
             print(f"  feat {feat:>6}  concept={concept[:50]!r}")
 
-    # key first, judge file last, each via rename: a judge file on disk implies a complete key
     for path, text in ((key_path, json.dumps(key, indent=2)), (judge_path, "\n".join(judge_md))):
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(text)

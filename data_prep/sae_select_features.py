@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""Step 5: apply the selection rule. For each layer: among candidates the classifier
-labelled semantic, keep those passing the steering judge (hit >= min_hit, where a prompt is a
-hit if a steered option is marked and the unsteered one is not; all prompts judged), then take the n_select highest-ranked.
-Writes selection_record.csv (every candidate, with every number and the reason it was or
-was not chosen) and the features file the sweep reads.
-
-    python data_prep/sae_select_features.py \
-        --scores results/sae_feature_selection/steering_scores.csv
-"""
 import argparse, json
 from pathlib import Path
 
@@ -57,7 +48,7 @@ def main():
               f"   (semantic {int((df[df.layer == L].semantic == True).sum())}, "
               f"eligible {int(df[(df.layer == L) & df.eligible].shape[0])})")
     other = df[df.category == "other"]
-    if len(other):   # outside the rubric's categories: excluded, listed for review
+    if len(other):
         print(f"{len(other)} candidates fell outside the rubric (category 'other', not selected):")
         print(other[["feature_id", "rank", "explanation", "reason"]].to_string(index=False))
     df.to_csv(args.dir / "selection_record.csv", index=False)

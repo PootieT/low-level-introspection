@@ -17,11 +17,7 @@ LAYERS=(${LAYERS_OVERRIDE:-5 10 15 20})
 POSITIONS=(${POSITIONS_OVERRIDE:-8 16 24 31})
 WEIGHTS=(${WEIGHTS:-1.0 0.9})
 N_FEATS=3
-# Features come from the deterministic selection (scripts/sae/selection/run_selection.sh, 2026-10-11).
-# The first sweep (2026-10-09 features, scripts/sae/sweep_features.txt) is group sae_layerpos_joint.
 FEATURES_FILE=${FEATURES_FILE:-results/sae_feature_selection/sweep_features.txt}
-# v2 (2026-10-13): first deterministic selection. v3 (2026-11-10): selection with 1/2/3/5x q99
-# steering, the coherence rubric, hit >= 0.6 and max_rank 3000.
 EXP_GROUP=${EXP_GROUP:-sae_layerpos_joint_v3}
 SEQ_LEN=32
 TRAIN_SAMPLES=${TRAIN_SAMPLES:-150000}

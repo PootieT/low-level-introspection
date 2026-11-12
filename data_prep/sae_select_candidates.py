@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""Step 1: freeze the candidate pool. For each layer in config.json, take the features
-with density in the band, rank them by expected active examples per training cache averaged
-over the sweep's token positions (config "rank_positions"),
-and keep the top <depth> with their Neuronpedia descriptions. The depth starts at one block
-(config "block") and run_selection.sh deepens it by a block for layers that are still short,
-up to "max_rank". The CSV is the snapshot every later step reads; fetched descriptions are
-cached under data/neuronpedia_cache, so a later change on Neuronpedia cannot change a rerun.
-
-    python data_prep/sae_select_candidates.py --out results/sae_feature_selection/candidates.csv \
-        [--depth-file data/sae_selection/depth.json]   # {"5": 400, ...}; missing layers: one block
-"""
 import argparse, json
 from pathlib import Path
 
@@ -42,7 +31,7 @@ def main():
     if args.depth_all:
         depth = {str(L): args.depth_all for L in cfg["layers"]}
     from src.introspector.signals.neuronpedia import fetch_feature, source_id_for
-    from data_prep.annotate_sae_features_neuronpedia import _row_from_info   # same columns as Step 1.5
+    from data_prep.annotate_sae_features_neuronpedia import _row_from_info
     args.annotated_out.mkdir(parents=True, exist_ok=True)
     rows = []
     for L in cfg["layers"]:
@@ -50,26 +39,23 @@ def main():
         pos = [pd.read_parquet(ROOT / c["pos_stats"].format(L=L, P=P)).set_index("feature").pos_density
                for P in c["rank_positions"]]
         mean = pd.concat(pos, axis=1).mean(axis=1)
-        # activation percentiles (A1b), which the steering strengths multiply
         q = pd.read_parquet(ROOT / c["act_quantiles"].format(L=L)).set_index("feature")
         for col in [k for k in q.columns if k.startswith("act_q")]:
             full[col] = full.feature.map(q[col])
         full["pos_density_mean"] = full.feature.map(mean)
         full[c["rank_by"]] = (full.pos_density_mean * c["cache_size"]).round().astype("int64")
         d = full[(full.density >= lo) & (full.density <= hi)]
-        # rank on the unrounded rate (the rounded count is for display); remaining ties by feature index
         d = d.sort_values(["pos_density_mean", "feature"], ascending=[False, True], kind="mergesort")
         k = min(int(depth.get(str(L), c["block"])), c["max_rank"])
         d = d.head(k).copy()
         src = source_id_for(L, site="res", width=cfg["steering"]["width"])
-        for i in d.index[d.explanation.isna()]:   # features the step-1.5 annotation did not reach
+        for i in d.index[d.explanation.isna()]:
             f = int(d.at[i, "feature"])
             info = fetch_feature("gemma-2-2b", src, f, cache_dir=args.cache_dir, offline=args.offline)
             if info is None and not (args.cache_dir / src / f"{f}.404").exists():
                 raise SystemExit(f"Neuronpedia request for {src}/{f} failed (not a 404); rerun when "
                                  f"the network is back -- a skipped candidate would change the picks")
             if info is not None and info.has_explanation:
-                # every Neuronpedia column, incl. np_max_act which sets the steering strength
                 for col, v in _row_from_info(info).items():
                     full.at[i, col] = v
                 d.at[i, "explanation"] = info.explanation

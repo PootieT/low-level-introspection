@@ -1,20 +1,4 @@
 #!/usr/bin/env python3
-"""Unblind the blind steering judge's picks against the answer key.
-
-Input: one JSON per judged feature, written by the blind LLM judge, which saw only
-the *.judge.md text (concept + prompt + options A/B/C):
-    {"feature": "S5.14311", "concept": "...", "picks": {"1": ["A"], "2": [], ...}}
-Key: data/sae_steering_samples/gemma-2-2b_res{L}_16k.key.json, which maps each
-prompt's letters to baseline / steer_x3 / steer_x5.
-
-Per feature it reports how often the judge chose each dose, how often it chose any
-steered option, and how often it chose the unsteered baseline, then applies the pass
-rule: on >= --min-hit of prompts a steered option is chosen AND the unsteered one is not
-(a "hit"); a prompt where the unsteered option also shows the concept is not a hit. Rank is
-the feature's position in the judge file, or --rank-file.
-
-    python scripts/sae/score_steering_judge.py --picks <dir with S*.json> [--csv out.csv]
-"""
 import argparse, json, re
 from collections import defaultdict
 from pathlib import Path
@@ -39,9 +23,9 @@ def score(picks, key_feature):
             chose[lab] += 1
         any_steer = any(l.startswith("steer") for l in labels)
         steered += any_steer
-        hit += any_steer and "baseline" not in labels   # concept only where steering was applied
+        hit += any_steer and "baseline" not in labels
         doses = {v for v in kp["mapping"].values() if v.startswith("steer")}
-        hit_all += doses <= labels and "baseline" not in labels   # every dose shows it, unsteered not
+        hit_all += doses <= labels and "baseline" not in labels
     j = max(judged, 1)
     doses = sorted({v for kp in key_feature["prompts"] for v in kp["mapping"].values() if v.startswith("steer")},
                    key=lambda s: float(s[len("steer_x"):]))
@@ -68,13 +52,13 @@ def main():
     p.add_argument("--csv", type=Path)
     args = p.parse_args()
 
-    import judge_steering_local as jl   # same directory; samples_sha ties picks to their samples
+    import judge_steering_local as jl
     rows, keys, shas, n_out = [], {}, {}, 0
     ranks = json.loads(args.rank_file.read_text()) if args.rank_file else None
     for f in sorted(args.picks.glob("S*.json")):
         d = json.loads(f.read_text())
         if ranks is not None and d["feature"] not in ranks:
-            n_out += 1   # judged in an earlier, deeper search; not in the current candidate pool
+            n_out += 1
             continue
         L, idx = re.match(r"S(\d+)\.(\d+)$", d["feature"]).groups()
         if L not in keys:
