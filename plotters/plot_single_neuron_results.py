@@ -741,7 +741,7 @@ if __name__ == "__main__":
 
 
     # ---- endogenous (W=1.0) layer x token sweep -------------------------
-    for suffix in ["", "_llama323b", "_llama318b"]:
+    for suffix in ["", "_llama323b_hyper_tuned", "_llama318b_hyper_tuned"]:
         EXP_GROUP = f"mlp_endo_sweep_layer_token{suffix}" # "mlp_endo_sweep_layer_token"
         OUT_DIR = f"{ROOT}/outputs/plots/{EXP_GROUP}"
 

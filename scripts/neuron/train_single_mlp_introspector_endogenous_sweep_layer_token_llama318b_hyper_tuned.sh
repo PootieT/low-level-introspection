@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1-32
+#$ -t 1-16
 
 # ============================================================================
 # SFT BASELINE GRID AT THE TUNED LR, Llama-3.1-8B: endogenous loss only (w=1), no KL anchor,

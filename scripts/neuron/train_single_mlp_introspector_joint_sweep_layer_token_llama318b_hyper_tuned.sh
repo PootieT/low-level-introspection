@@ -9,7 +9,7 @@
 #$ -o log
 #$ -j y
 ###$ -m ea
-#$ -t 1-16
+#$ -t 9
 
 # ============================================================================
 # MAIN GRID AT THE TUNED LR, Llama-3.1-8B: joint introspection training, KL 0.1 only,

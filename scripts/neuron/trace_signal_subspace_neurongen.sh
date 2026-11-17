@@ -54,4 +54,5 @@ python mechanistic_analysis/trace_signal_subspace.py \
     --group mlp_neurongen \
     --run-glob "$RUN_GLOB" \
     --n-texts 64 --max-trained 30 --n-heldout 10 \
-    --skip-existing $EXTRA
+     $EXTRA
+#    --skip-existing \
