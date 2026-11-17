@@ -287,6 +287,8 @@ GATE_RE = re.compile(r"gate(?P<gate>on|off)")
 R_RE = re.compile(r"_r(?P<r>\d+)_")
 LR_RE = re.compile(r"_lr(?P<lr>[0-9.e+-]+?)_")
 W_RE = re.compile(r"_w(?P<w>[0-9.]+)")
+# ExperimentConfig.mlp_site, in names as _site<site>_ (the mlp_site sweep); absent -> act_fn
+SITE_RE = re.compile(r"_site(?P<site>act_fn|gate|down_in)_")
 
 # (file, key path into the json, label). Both files are written by
 # trainers/train_introspector_joint.py at the end of a run.
@@ -323,7 +325,7 @@ GAP_METRIC = "corr_minus_spearman"
 
 
 def load_endogenous_sweep(exp_group: str, metrics=ENDO_METRICS, gate="on",
-                          lora_r=None, lr=None, w=None) -> pd.DataFrame:
+                          lora_r=None, lr=None, w=None, site=None) -> pd.DataFrame:
     """
     Long-form table: one row per (run, eval, metric).
 
@@ -331,7 +333,8 @@ def load_endogenous_sweep(exp_group: str, metrics=ENDO_METRICS, gate="on",
     averaging the two arms into a cell would silently mix two different models.
     Pass gate=None to keep both (and then facet on the column).
 
-    `lora_r` / `lr` / `w` are optional filters for when a group dir holds several
+    `site` keeps one MLP site (act_fn / gate / down_in; names without _site<..>_ are
+    act_fn). `lora_r` / `lr` / `w` are optional filters for when a group dir holds several
     configurations of the same cell. Runs missing a metrics file are skipped and
     counted, so unfinished cells appear in the coverage report rather than quietly
     shifting a mean.
@@ -344,7 +347,7 @@ def load_endogenous_sweep(exp_group: str, metrics=ENDO_METRICS, gate="on",
             skipped.append((d.name, "unparsable name"))
             continue
         g, m_lr, m_w = GATE_RE.search(d.name), LR_RE.search(d.name), W_RE.search(d.name)
-        m_r = R_RE.search(d.name)
+        m_r, m_site = R_RE.search(d.name), SITE_RE.search(d.name)
         base = {
             "run": d.name,
             "neuron": f"N{n['layer']}.{n['index']}",
@@ -354,11 +357,13 @@ def load_endogenous_sweep(exp_group: str, metrics=ENDO_METRICS, gate="on",
             "lora_r": int(m_r["r"]) if m_r else None,
             "lr": m_lr["lr"] if m_lr else None,
             "w": float(m_w["w"]) if m_w else None,
+            "site": m_site["site"] if m_site else "act_fn",
         }
         if ((gate is not None and base["gate"] != gate)
                 or (lora_r is not None and base["lora_r"] != lora_r)
                 or (lr is not None and base["lr"] != lr)
-                or (w is not None and base["w"] != w)):
+                or (w is not None and base["w"] != w)
+                or (site is not None and base["site"] != site)):
             excluded += 1
             continue
         for fname, key, eval_name in ENDO_EVALS:
@@ -388,7 +393,7 @@ def load_endogenous_sweep(exp_group: str, metrics=ENDO_METRICS, gate="on",
     # What configurations actually survived? A cell built from two different configs
     # is not a cell, and with two naming schemes in one directory that is easy to do
     # by accident.
-    inventory = (df.groupby(["gate", "lora_r", "lr", "w"], dropna=False)["run"]
+    inventory = (df.groupby(["site", "gate", "lora_r", "lr", "w"], dropna=False)["run"]
                  .nunique().reset_index(name="n_runs"))
     print("[endo] configurations kept:")
     print(inventory.to_string(index=False))
@@ -398,7 +403,7 @@ def load_endogenous_sweep(exp_group: str, metrics=ENDO_METRICS, gate="on",
 
     # Same neuron+position twice means one cell is averaging two runs -- typically the
     # short-named and fully-specified copies of the same experiment.
-    keys = ["neuron", "position", "eval_type", "metric"]
+    keys = ["site", "neuron", "position", "eval_type", "metric"]
     dup = df[df.duplicated(keys, keep=False)]
     if len(dup):
         pairs = (dup.groupby(keys)["run"].apply(lambda r: sorted(set(r))).reset_index(name="runs"))
