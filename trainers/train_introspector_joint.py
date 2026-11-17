@@ -60,7 +60,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root
 from src.introspector.config import ExperimentConfig
 from src.introspector.dataset_utils import apply_signal_filter, pair_pool_dir
 from src.introspector.signals.schema import is_pair_selector
-from src.introspector.models.signal_paths import resolve_mlp_signal_path
+from src.introspector.models.signal_paths import resolve_mlp_signal_path, register_mlp_site_hook
 from src.introspector.models.attention_logits import (
     AttentionLogitPort, AttentionWeightPort, PortFanOut, attention_model_kwargs,
     installed_ports, is_attention_type, port_site,
@@ -791,9 +791,10 @@ def _capture_activations(model, batch, abs_pos, signal_layer, signal_index, offs
             m = signal_layer == layer
             rows = torch.nonzero(m, as_tuple=True)[0]
             hook = ActivationCaptureHook(rows, abs_pos[m], signal_index[m], offsets)
-            act_path = resolve_mlp_signal_path(model, layer, path_to_output=False)
+            site = getattr(model, "mlp_site", "act_fn")
+            act_path = resolve_mlp_signal_path(model, layer, path_to_output=False, site=site)
             module = operator.attrgetter(act_path)(model)
-            handles.append(module.register_forward_hook(hook))
+            handles.append(register_mlp_site_hook(module, site, hook))
             hooks.append((rows, hook))
             # same positions, same neuron index, on the transmission tensors
             for site in TRANSMISSION_SITES:
@@ -1795,7 +1796,8 @@ def main():
         intervention_distribution=config.training_config.intervention_signal_distribution,
         intervention_extreme_scale=config.training_config.intervention_extreme_scale,
         attention_site=port_site(signal_type) if attention_run else None,
-        head_activation=config.training_config.regression_head_activation)
+        head_activation=config.training_config.regression_head_activation,
+        mlp_site=config.mlp_site)
     print(f"[joint] regression head: {type(model.regression_head).__name__} "
           f"(regression_head_activation={config.training_config.regression_head_activation})")
     regression_loss = config.training_config.regression_loss

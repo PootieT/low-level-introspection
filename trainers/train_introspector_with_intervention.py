@@ -633,6 +633,7 @@ def main():
             signal_ranges=signal_ranges,
             intervention_distribution=config.training_config.intervention_signal_distribution,
             intervention_extreme_scale=config.training_config.intervention_extreme_scale,
+            mlp_site=config.mlp_site,
         )
         # model.__class__ = IntrospectionRegressionModel
         # model.regression_head = nn.Linear(model.config.hidden_size,1,bias=False,)

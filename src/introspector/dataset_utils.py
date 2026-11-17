@@ -166,7 +166,7 @@ def dataset_identity(config) -> dict[str, Any]:
     (add_special_tokens=True, i.e. BOS). If that ever becomes configurable it MUST
     be added here, or old and new caches will collide.
     """
-    return {
+    ident = {
         "model_name": config.model_name,
         "seed": config.seed,
         "load_in_4bit": config.load_in_4bit,
@@ -187,6 +187,13 @@ def dataset_identity(config) -> dict[str, Any]:
             "test": config.test_token_selector.model_dump(),
         },
     }
+    # Only when not the default: the key would otherwise move the hash of every MLP
+    # cache built before the field existed. A different site is a different quantity
+    # and must never share a cache with act_fn.
+    site = getattr(config, "mlp_site", "act_fn")
+    if site != "act_fn":
+        ident["mlp_site"] = site
+    return ident
 
 
 def identity_hash(config, length: int = 8) -> str:
@@ -207,7 +214,9 @@ def canonical_dataset_name(config) -> str:
         _short_model(config.model_name),
         "_".join([
             _short_dataset(config.train_dataset),
-            _short_signals(config.train_signals),
+            _short_signals(config.train_signals)
+            + ("" if getattr(config, "mlp_site", "act_fn") == "act_fn"
+               else f"-{config.mlp_site}"),
             _short_selector(config.train_token_selector),
             f"seq{config.train_dataset.max_seq_length}",
             _short_count(config.train_dataset.max_samples),

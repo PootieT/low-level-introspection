@@ -4,7 +4,7 @@
 Schema classes for experiments, datasets, etc
 """
 from pathlib import Path
-from typing import List, Any, Optional, Union
+from typing import List, Any, Literal, Optional, Union
 
 from pydantic import BaseModel
 
@@ -163,6 +163,12 @@ class ExperimentConfig(BaseModel):
     # pass per text serves every neuron -- and still train one introspector per
     # neuron. None => use every row in the cache (all signals jointly).
     signal_filter: Optional[str] = None
+    # WHICH MLP quantity an "mlp" signal names (models/signal_paths.py MLP_SITES):
+    # "act_fn" = silu(gate_proj(x)) (default; every run before this field existed),
+    # "gate" = gate_proj(x), "down_in" = act_fn(gate_proj(x)) * up_proj(x), the input
+    # of down_proj. Cached, trained on AND injected at the same site. Part of the cache
+    # identity only when not the default, so existing caches keep their hashes.
+    mlp_site: Literal["act_fn", "gate", "down_in"] = "act_fn"
 
     training_config: TrainingConfig
     eval_config: EvalConfig = EvalConfig(

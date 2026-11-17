@@ -150,6 +150,7 @@ def extract_activations_batch(
     batch_token_positions: List[int],
     seq_lens=None,
     batch_src_positions: List[int] | None = None,
+    mlp_site: str = "act_fn",
 ) -> Dict[SignalSpec, List[float]]:
     """
     Extract internal signals using NNsight.
@@ -162,6 +163,7 @@ def extract_activations_batch(
         present, to bound-check the source positions.
     :param batch_src_positions: PAIR MODE only (specs with src_offset=None): the absolute
         SOURCE position per example, shared by every attention spec of the batch.
+    :param mlp_site: which MLP quantity an "mlp" spec reads (signal_paths.MLP_SITES)
     :return: Extracted signals.
     """
     signal_activations = {}
@@ -236,7 +238,7 @@ def extract_activations_batch(
             if mlp_signal_specs:
                 mlp_signal_specs_layer = [s for s in mlp_signal_specs if s.layer == layer]
                 if mlp_signal_specs_layer:
-                    mlp_layer_path = resolve_mlp_signal_path(model, layer)
+                    mlp_layer_path = resolve_mlp_signal_path(model, layer, site=mlp_site)
                     getter = operator.attrgetter(mlp_layer_path)
                     # assuming dimensions are [bs, token, h], output dim is [bs, h]
                     mlp_out_layer = getter(model)[range(bs), batch_token_positions].detach()
@@ -301,6 +303,7 @@ def create_batch_example(
     negative_keep: float | None = None,
     seed: int = 0,
     doc_offset: int = 0,
+    mlp_site: str = "act_fn",
 ) -> List[dict[str, Any]]:
     """
     Create a single example of (text, signal, token_position, value)
@@ -344,6 +347,7 @@ def create_batch_example(
         batch_token_positions=batch_token_positions,
         seq_lens=seq_lens,
         batch_src_positions=batch_src_positions,
+        mlp_site=mlp_site,
     )
     out = []
 
@@ -573,6 +577,7 @@ def build_split(
             negative_keep=dataset_config.negative_keep,
             seed=config.seed,
             doc_offset=seen,
+            mlp_site=config.mlp_site,
         )
         seen += len(text_batch)
 
@@ -810,11 +815,19 @@ _SIGNAL_SITES = {
 }
 
 
-def _signal_site(specs) -> str:
+_MLP_SITE_DESC = {
+    "act_fn": _SIGNAL_SITES["mlp"],
+    "gate": "mlp.gate_proj output (gate pre-activation, before SiLU)",
+    "down_in": "mlp.down_proj input (act_fn(gate_proj(x)) * up_proj(x))",
+}
+
+
+def _signal_site(specs, mlp_site: str = "act_fn") -> str:
     """Human description of WHAT was captured. Was hardcoded to the MLP string, which
     would have mislabelled every attention cache built after this."""
     kinds = sorted({s.type for s in specs})
-    return " + ".join(_SIGNAL_SITES.get(k, k) for k in kinds) if kinds else "none"
+    desc = {**_SIGNAL_SITES, "mlp": _MLP_SITE_DESC[mlp_site]}
+    return " + ".join(desc.get(k, k) for k in kinds) if kinds else "none"
 
 
 def _leading_bos(model) -> bool:
@@ -863,7 +876,7 @@ def write_dataset_metadata(config: ExperimentConfig, output_dir: Path, model,
                 "test": config.test_dataset.max_seq_length,
             },
         },
-        "capture": {"model_dtype": dtype, "signal_site": _signal_site(config.train_signals),
+        "capture": {"model_dtype": dtype, "signal_site": _signal_site(config.train_signals, config.mlp_site),
                     "attn_implementation": getattr(model.config, "_attn_implementation", None)},
         "row_counts": row_counts,
         # What the cache ACTUALLY contains, not what was requested. A length sweep is

@@ -610,8 +610,8 @@ def analyze_run(run, spec, args, out_dir: Path):
                 heldout=heldout, n_texts=n, scale=args.scale, layers=layers,
                 stats={str(k): v for k, v in stats.items()}, write_in_check=bool(write_in_ok),
                 note="last layer is post final-norm (the space the head reads)")
-    plot_all(out_dir, title=pretty_run_name(run.config.experiment_name))
     (out_dir / SENTINEL).write_text(json.dumps(meta, indent=2))
+    plot_all(out_dir, title=pretty_run_name(run.config.experiment_name))
     print(f"[subspace] wrote {out_dir}")
 
 
@@ -757,35 +757,51 @@ def plot_selection(xt, out_dir, title):
     plt.close(fig)
 
 
-def plot_readout(ro, out_dir, title):
-    """R[i, j] / R[j, j]: the readout with the prompt naming i when j is injected,
-    relative to the matched prompt. Diagonal = 1 by construction."""
+def plot_readout(ro, out_dir, title, sigma=None):
+    """Readout response R[i, j] (prompt names i, neuron j injected) in units of j's
+    sigma: the change in the regression output per 1-sigma change of j, divided by
+    sigma_j. A readout that reports the named neuron exactly gives the identity matrix:
+    1 when i == j (it moves by as much as the neuron did), 0 when i != j.
+
+    Dividing by sigma_j rather than by the diagonal R[j, j] matters: the diagonal is ~0
+    for held-out neurons and small for weakly read trained ones, and dividing by it
+    turns noise into large ratios."""
+    if sigma is None:
+        return
+    ro = ro.assign(per_sigma=ro["readout_slope"] / ro["source"].map(sigma))
     order = (ro[["source", "source_role"]].drop_duplicates()
              .sort_values("source_role", key=lambda s: s != "trained")["source"].tolist())
-    R = ro.pivot(index="prompt", columns="source", values="readout_slope").loc[order, order]
-    diag = np.diag(R.values)
-    Rn = R.values / np.where(np.abs(diag) > 1e-12, diag, np.nan)[None, :]
+    R = ro.pivot(index="prompt", columns="source", values="per_sigma").loc[order, order]
     n_tr = int((ro.drop_duplicates("source")["source_role"] == "trained").sum())
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.6),
+    fig, axes = plt.subplots(1, 2, figsize=(13.5, 5.8),
                              gridspec_kw=dict(width_ratios=[1.25, 1]))
-    lim = np.nanmax(np.abs(Rn)) if np.isfinite(Rn).any() else 1
-    im = axes[0].imshow(Rn, cmap="RdBu_r", vmin=-lim, vmax=lim)
+    lim = max(1.0, float(np.nanmax(np.abs(R.values))))
+    im = axes[0].imshow(R.values, cmap="RdBu_r", vmin=-lim, vmax=lim)
     for ax_line in (axes[0].axhline, axes[0].axvline):
         ax_line(n_tr - 0.5, color="k", lw=1)
-    axes[0].set_xlabel("Injected Neuron j (Trained | Held-Out)", fontsize=FONTS["label"])
-    axes[0].set_ylabel("Prompted Neuron i", fontsize=FONTS["label"])
+    n = len(order)
+    for x, txt in ((n_tr / 2 - 0.5, "Trained"), (n_tr + (n - n_tr) / 2 - 0.5, "Held-Out")):
+        axes[0].text(x, -0.9, txt, ha="center", va="bottom", fontsize=FONTS["tick"])
+        axes[0].text(-0.9, x, txt, ha="right", va="center", rotation=90,
+                     fontsize=FONTS["tick"])
+    axes[0].set_xlabel("Injected Neuron j", fontsize=FONTS["label"])
+    axes[0].set_ylabel("Prompted Neuron i", fontsize=FONTS["label"], labelpad=30)
     axes[0].set_xticks([]); axes[0].set_yticks([])
-    axes[0].set_title("Readout Cross-Talk R[i, j] / R[j, j]", fontsize=FONTS["title"])
+    axes[0].set_title("Readout Response per \u03c3 of j (Ideal: Identity)",
+                      fontsize=FONTS["title"], pad=24)
     fig.colorbar(im, ax=axes[0], fraction=0.046)
     d = ro[ro["prompt"] == ro["source"]]
     for k, (rl, col) in enumerate((("trained", "tab:blue"), ("heldout", "tab:orange"))):
-        v = d[d["source_role"] == rl]["readout_slope"].values
-        axes[1].scatter(np.full(len(v), k) + np.random.default_rng(k).uniform(-.1, .1, len(v)),
-                        v, color=col, alpha=0.7)
+        g = d[d["source_role"] == rl]
+        x = np.full(len(g), k) + np.random.default_rng(k).uniform(-.1, .1, len(g))
+        axes[1].errorbar(x, g["per_sigma"], yerr=1.96 * g["readout_slope_sem"]
+                         / g["source"].map(sigma), fmt="o", color=col, alpha=0.8, capsize=2)
     axes[1].set_xticks([0, 1], ["Trained", "Held-Out"])
     axes[1].axhline(0, color="k", lw=0.8)
-    _style(axes[1], "", "Readout Slope per σ (Prompt = Injected)")
-    axes[1].set_title("Matched-Prompt Readout Response", fontsize=FONTS["title"])
+    axes[1].axhline(1, color="k", lw=0.8, ls="--", label="Exact Report")
+    axes[1].legend(fontsize=FONTS["legend"])
+    _style(axes[1], "", "Readout Change / \u03c3 of Named Neuron")
+    axes[1].set_title("Matched-Prompt Readout Gain", fontsize=FONTS["title"])
     fig.suptitle(title, fontsize=FONTS["title"])
     fig.tight_layout()
     fig.savefig(out_dir / "signal_subspace_readout.png", dpi=150, bbox_inches="tight")
@@ -950,8 +966,11 @@ def plot_all(out_dir: Path, title: str):
     abl = rd("signal_subspace_ablation.csv")
     if len(xt):
         plot_selection(xt, out_dir, title)
+    meta = out_dir / SENTINEL
+    sigma = ({int(k): v[1] for k, v in json.loads(meta.read_text())["stats"].items()}
+             if meta.exists() else None)
     if len(ro):
-        plot_readout(ro, out_dir, title)
+        plot_readout(ro, out_dir, title, sigma)
     if len(geo) and len(nd):
         plot_geometry(heldout_cos_from_npz(out_dir, geo), nd, out_dir, title)
         plot_heldout(nd, out_dir, title)

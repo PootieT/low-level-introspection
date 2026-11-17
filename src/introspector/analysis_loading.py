@@ -291,7 +291,8 @@ def load_run_for_analysis(
     model = IntrospectionRegressionModel(
         peft_model, signal_ranges=signal_ranges,
         intervention_distribution=config.training_config.intervention_signal_distribution,
-        intervention_extreme_scale=config.training_config.intervention_extreme_scale)
+        intervention_extreme_scale=config.training_config.intervention_extreme_scale,
+        mlp_site=getattr(config, "mlp_site", "act_fn"))
     load_regression_head(model, str(checkpoint))
     load_added_token_embeddings(model, str(checkpoint))   # no-op unless embeddings were stripped
     replace_model_with_gated_version(model)

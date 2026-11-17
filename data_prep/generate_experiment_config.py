@@ -227,6 +227,12 @@ def parse_args() -> argparse.Namespace:
                              "(layer, position) cell once with all its neurons -- the forward pass "
                              "is shared across signals -- then split it here. Not part of the cache "
                              "identity, so every subset of a cell reuses the same dataset.")
+    parser.add_argument("--mlp-site", default="act_fn", choices=["act_fn", "gate", "down_in"],
+                        help="Which MLP quantity an 'mlp' signal (N<layer>.<index>) is: "
+                             "act_fn = silu(gate_proj(x)) (default), gate = gate_proj(x), "
+                             "down_in = act_fn(gate_proj(x)) * up_proj(x), the input of "
+                             "down_proj. Cached, trained on and injected at the same site; part "
+                             "of the cache identity when not act_fn.")
     parser.add_argument("--dataset-name", default=None,
                         help="Identity of the cached signal dataset. Set the SAME value across runs "
                              "that share data (rank/lr/w sweeps) to reuse one cache instead of "
@@ -401,6 +407,7 @@ def main() -> None:
         output_dir=args.output_dir,
         dataset_name=args.dataset_name,
         signal_filter=args.signal_filter,
+        mlp_site=args.mlp_site,
     )
 
     # Derive the cache key from the fields that actually determine the cached

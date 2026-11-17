@@ -13,7 +13,8 @@ from peft import PeftModelForCausalLM
 from peft.tuners.lora.layer import Linear
 from transformers import TrainerCallback
 
-from src.introspector.models.signal_paths import resolve_mlp_signal_path
+from src.introspector.models.signal_paths import (
+    check_mlp_site, register_mlp_site_hook, resolve_mlp_signal_path)
 from src.introspector.models.attention_logits import (
     AttentionLogitPort, AttentionWeightPort, PORT_ATTR, PORT_ATTRS,
     assert_attention_impl, is_attention_type, resolve_attention_module,
@@ -564,9 +565,14 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
         intervention_fn=None,
         attention_site=None,
         head_activation="identity",
+        mlp_site="act_fn",
     ):
         # IMPORTANT: do NOT call super().__init__
         self.__dict__ = model.__dict__
+        # which MLP tensor an "mlp" signal's injection replaces (signal_paths.MLP_SITES).
+        # MUST match the cache's ExperimentConfig.mlp_site, or the model is trained on
+        # one quantity and intervened on another.
+        self.mlp_site = check_mlp_site(mlp_site)
         if head_activation not in HEAD_ACTIVATIONS:
             raise ValueError(f"head_activation {head_activation!r} not in {HEAD_ACTIVATIONS}")
         # Keep the head in fp32 for stable MSE regression, but move it onto the
@@ -782,9 +788,10 @@ class IntrospectionRegressionModel(PeftModelForCausalLM):
                         intervention_values=intervention_values[mask],
                     )
 
-                    module_path = resolve_mlp_signal_path(self,layer,path_to_output=False,)
+                    module_path = resolve_mlp_signal_path(self, layer, path_to_output=False,
+                                                          site=self.mlp_site)
                     module = operator.attrgetter(module_path)(self)
-                    handle =  module.register_forward_hook(hook)
+                    handle = register_mlp_site_hook(module, self.mlp_site, hook)
                     hooks.append(handle)
                 if attention_batch:
                     assert_attention_impl(self)
