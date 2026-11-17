@@ -1,7 +1,7 @@
 # low-level-introspection
 
 <p align="left">
-  <a href="">
+  <a href="https://arxiv.org/abs/2610.38911">
     <img src="https://img.shields.io/badge/arXiv-b31b1b.svg?style=flat&logo=arxiv&logoColor=white" alt="arXiv"/>
   </a>
   <a href="https://github.com/PootieT/low-level-introspection/blob/main/LICENCE">
