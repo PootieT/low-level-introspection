@@ -15,6 +15,10 @@ FEATURES (all from the base model; see FEATURES below for the transforms)
                  mechanistic_analysis/score_neuron_redundancy.py
   context      n_eff, R2 with the current token only, token-identity table R2
                  mechanistic_analysis/score_neuron_context_dependence.py
+  write        write fidelity corr(a, a*u)^2, up_proj sign consistency, log one-sigma
+               write norm / residual norm, bypass exactness corr(a, g)^2, held-out
+               ridge R^2 of a from the pre-MLP residual, causal ceiling (E u)^2 / E u^2
+                 mechanistic_analysis/score_neuron_write_stats.py
 
 MODEL
   outcome ~ layer (fixed effects) + features
@@ -24,6 +28,12 @@ MODEL
   is the confound, and every coefficient here is a within-layer effect.
 
 WHAT IS REPORTED
+  univariate     within-layer Spearman rho of each feature with each outcome (layer
+                 means removed from both), 95% bootstrap CI over neurons resampled
+                 within layer, on all layers and on layers 0-6 only (interventional is
+                 ~0 with no within-layer spread at 8-14). Every feature with data,
+                 whatever --features says: the multivariate fit overfits on 40 neurons,
+                 this does not. feature_univariate.png / .csv
   coefficients   beta, 95% bootstrap CI (neurons resampled within layer), OLS p, VIF
                  (within-layer). With ~10 correlated features on 80 neurons a single
                  coefficient can be unstable: read VIF next to it. A large VIF means
@@ -43,6 +53,7 @@ Outputs: outputs/plots/mlp_endo_sweep_layer_token/feature_regression/
 
 Usage
   python plotters/fit_sft_feature_regression.py [--gate off] [--n-boot 2000]
+  python plotters/fit_sft_feature_regression.py --max-layer 6     # where interventional varies
 """
 import argparse
 from pathlib import Path
@@ -52,7 +63,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.stats import t as tdist
+from scipy.stats import t as tdist, spearmanr
 
 ROOT = Path(__file__).resolve().parents[1]
 GRID = ROOT / "outputs/plots/mlp_endo_sweep_layer_token"
@@ -72,8 +83,15 @@ FEATURES = {
     "n_eff":          ("Effective Context Length", "context", lambda d: d["n_eff"]),
     "r2_1":           ("R² Current Token Only", "context", lambda d: d["r2_1"]),
     "r2_token_table": ("Token-Identity R²", "context", lambda d: d["r2_token_table"]),
+    "r2_a_h":         ("corr²(Natural a, MLP Write)", "write", lambda d: d["r2_a_h"]),
+    "u_sign_consistency": ("Up-Proj Sign Consistency", "write", lambda d: d["u_sign_consistency"]),
+    "log_write_rel":  ("log Write / Residual Norm", "write", lambda d: np.log(d["write_rel"])),
+    "r2_a_g":         ("Bypass Exactness corr(a, g)²", "write", lambda d: d["r2_a_g"]),
+    "bypass_r2_a":    ("Bypass R² (Pre-MLP Resid → a)", "write", lambda d: d["bypass_r2_a"]),
+    "causal_ceiling_a": ("corr²(Injected a, MLP Write)", "write", lambda d: d["causal_ceiling_a"]),
 }
-GROUP_COLORS = {"activation": "tab:blue", "redundancy": "tab:orange", "context": "tab:green"}
+GROUP_COLORS = {"activation": "tab:blue", "redundancy": "tab:orange", "context": "tab:green",
+                "write": "tab:purple"}
 plt.rcParams.update({"font.size": 13, "axes.titlesize": 15, "axes.labelsize": 14})
 
 
@@ -87,7 +105,11 @@ def parse_args():
     p.add_argument("--n-repeats", type=int, default=50, help="CV repeats.")
     p.add_argument("--k-folds", type=int, default=5)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--out-dir", type=Path, default=GRID / "feature_regression")
+    p.add_argument("--max-layer", type=int, default=None,
+                   help="Fit only layers <= this (e.g. 6: interventional is ~0 with no "
+                        "within-layer spread at layers 8-14).")
+    p.add_argument("--out-dir", type=Path, default=None,
+                   help="Default: <grid>/feature_regression[_L0-<max-layer>].")
     return p.parse_args()
 
 
@@ -116,7 +138,18 @@ def load_features():
     red = pd.concat(red)
     m = stats.merge(ctx, on=["layer", "index"], how="left").merge(red, on=["layer", "index"],
                                                                   how="left")
+    wpath = GRID / "write_stats/write_stats.csv"
+    if wpath.exists():
+        w = pd.read_csv(wpath).drop(columns=["neuron", "std_a"])
+        m = m.merge(w, on=["layer", "index"], how="left")
     return m
+
+
+def _has(m, f):
+    try:
+        return FEATURES[f][2](m).notna().any()
+    except KeyError:
+        return False
 
 
 def design(m, names):
@@ -292,18 +325,97 @@ def plot_correlations(Z, layers, out_png):
     plt.close(fig)
 
 
+def univariate(m, names, subsets, n_boot, rng):
+    """Within-layer Spearman rho of each feature with each outcome, bootstrap CI."""
+    rows = []
+    for sub_name, keep in subsets:
+        d = m[keep(m)].reset_index(drop=True)
+        X = design(d, names)
+        layers = d["layer"].values
+        cols = list(names) + [oc for oc, _ in OUTCOMES]
+        dm = pd.concat([X, d[[oc for oc, _ in OUTCOMES]]], axis=1)
+        dm = dm - dm.groupby(layers).transform("mean")
+        idx_by_layer = [np.flatnonzero(layers == L) for L in sorted(set(layers))]
+        boots = [np.concatenate([rng.choice(ix, len(ix), replace=True) for ix in idx_by_layer])
+                 for _ in range(n_boot)]
+        for f in names:
+            for oc, _ in OUTCOMES:
+                ok = dm[f].notna().values & dm[oc].notna().values
+                x, y = dm[f].values, dm[oc].values
+                rho, p = spearmanr(x[ok], y[ok])
+                bs = []
+                for b in boots:
+                    b = b[ok[b]]
+                    bs.append(spearmanr(x[b], y[b])[0])
+                lo, hi = np.nanpercentile(bs, [2.5, 97.5])
+                rows.append(dict(subset=sub_name, feature=f, outcome=oc, rho=rho, p=p,
+                                 ci_lo=lo, ci_hi=hi, n=int(ok.sum())))
+    return pd.DataFrame(rows)
+
+
+def plot_univariate(uv, out_png):
+    feats = [f for f in FEATURES if f in set(uv["feature"])]
+    subsets = list(dict.fromkeys(uv["subset"]))
+    markers, offs = ["o", "D"], np.linspace(0.17, -0.17, len(subsets))
+    fig, axes = plt.subplots(1, len(OUTCOMES), figsize=(7.5 * len(OUTCOMES), 0.5 * len(feats) + 2.4),
+                             sharey=True)
+    ypos = np.arange(len(feats))[::-1]
+    for ax, (oc, lab) in zip(axes, OUTCOMES):
+        for si, (sub, mk, off) in enumerate(zip(subsets, markers, offs)):
+            u = uv[(uv["outcome"] == oc) & (uv["subset"] == sub)].set_index("feature")
+            for y, f in zip(ypos, feats):
+                if f not in u.index:
+                    continue
+                r, col = u.loc[f], GROUP_COLORS[FEATURES[f][1]]
+                ax.plot([r.ci_lo, r.ci_hi], [y + off] * 2, color=col, lw=1.8, alpha=0.8)
+                ax.scatter([r.rho], [y + off], marker=mk, s=55, zorder=3, linewidths=1.8,
+                           color=col if r.p < 0.05 else "white", edgecolors=col)
+        ax.axvline(0, color="k", lw=0.8)
+        ax.set_xlim(-1, 1)
+        ax.set_title(lab)
+        ax.set_xlabel("Within-Layer Spearman ρ (95% Bootstrap CI)")
+        ax.grid(axis="x", alpha=0.3)
+    axes[0].set_yticks(ypos, [FEATURES[f][0] for f in feats])
+    handles = [plt.Line2D([], [], color=c, lw=3, label=g.title()) for g, c in GROUP_COLORS.items()
+               if any(FEATURES[f][1] == g for f in feats)]
+    handles += [plt.Line2D([], [], marker=mk, color="gray", ls="", markersize=8, label=sub)
+                for sub, mk in zip(subsets, markers)]
+    handles.append(plt.Line2D([], [], marker="o", color="gray", mfc="white", ls="",
+                              markersize=8, label="p ≥ 0.05 (hollow)"))
+    fig.legend(handles=handles, loc="lower center", ncol=len(handles), frameon=False,
+               bbox_to_anchor=(0.5, -0.02 - 0.03 * (len(handles) > 6)), fontsize=11)
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    fig.savefig(out_png, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 # ======================================================================
 def main():
     args = parse_args()
     rng = np.random.default_rng(args.seed)
-    names = args.features.split(",") if args.features else list(FEATURES)
     m = load_sft(args.gate).merge(load_features(), on=["layer", "index"], how="left",
                                   suffixes=("", "_feat"))
+    if args.features:
+        names = args.features.split(",")
+    else:                       # every feature whose scorer output exists
+        names = [f for f in FEATURES if _has(m, f)]
+    if args.out_dir is None:
+        args.out_dir = GRID / ("feature_regression" if args.max_layer is None
+                               else f"feature_regression_L0-{args.max_layer}")
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    all_names = [f for f in FEATURES if _has(m, f)]
+    uv = univariate(m, all_names, [("All Layers", lambda d: d["layer"] >= 0),
+                                   ("Layers 0–6", lambda d: d["layer"] <= 6)],
+                    min(args.n_boot, 1000), rng)
+    uv.to_csv(args.out_dir / "feature_univariate.csv", index=False)
+    plot_univariate(uv, args.out_dir / "feature_univariate.png")
     X = design(m, names)
     ok = X.notna().all(axis=1) & m[["interventional", "endogenous"]].notna().all(axis=1)
     if (~ok).any():
         print(f"[reg] dropping {(~ok).sum()} neurons with missing features: "
               f"{m.loc[~ok, 'neuron'].tolist()[:10]}")
+    if args.max_layer is not None:
+        ok &= m["layer"] <= args.max_layer
     m, X = m[ok].reset_index(drop=True), X[ok].reset_index(drop=True)
     layers = m["layer"].values
     Z = within_z(X, layers)

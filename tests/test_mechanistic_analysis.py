@@ -116,3 +116,34 @@ def test_subspace_patch_is_exact():
     one = SubspacePatch(u, h0, mask, is_tuple=False)(None, None, h)
     exp = h.clone(); exp[:, 2:, 3] = h0[:, 2:, 3]
     assert torch.allclose(one, exp, atol=1e-6)
+
+
+def test_head_set_conditions_partition_and_keep():
+    from mechanistic_analysis.score_head_set_ablation import condition_sets, kept_set
+    E, I = {0, 1, 2, 3}, {2, 3, 4}
+    c = condition_sets(E, I, n_heads=8)
+    assert c["endo_only"] == {0, 1} and c["interv_only"] == {4} and c["joint"] == {2, 3}
+    assert c["keep_endo"] == {4, 5, 6, 7} and c["keep_interv"] == {0, 1, 5, 6, 7}
+    assert kept_set("keep_endo", E, I) == E and kept_set("joint", E, I) is None
+
+
+def test_head_set_definitions_use_positive_drops_only():
+    from mechanistic_analysis.score_head_set_ablation import build_head_set, parse_cells
+    imp = np.array([0.5, -0.2, 0.3, 0.0, 0.2, np.nan])
+    assert build_head_set(imp, "top2") == {0, 2}
+    assert build_head_set(imp, "top30") == {0, 2, 4}           # only 3 heads hurt
+    assert build_head_set(imp, "mass0.8") == {0, 2}            # 0.8 of 1.0 total
+    assert parse_cells("2:-1, 8:-28") == {(2, -1), (8, -28)} and parse_cells(None) is None
+
+
+def test_random_controls_match_per_layer_counts():
+    from mechanistic_analysis.score_head_set_ablation import random_control
+    layers = np.repeat([3, 4, 5], 6)                              # 18 heads, 3 layers
+    E, I = {0, 1, 6}, {7, 12}
+    rng = np.random.default_rng(0)
+    count = lambda s: np.bincount(layers[sorted(s)] - 3, minlength=3).tolist()
+    for _ in range(20):
+        r = random_control("endo_only", E - I, E, I, layers, rng)
+        assert count(r) == count(E - I)
+        kept = set(range(18)) - random_control("keep_endo", set(range(18)) - E, E, I, layers, rng)
+        assert count(kept) == count(E)

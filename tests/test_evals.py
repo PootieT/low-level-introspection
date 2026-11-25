@@ -80,3 +80,32 @@ def test_lm_degradation_summary_splits_at_train_length():
     assert row["kl_mean_beyond_trainlen"] == pytest.approx(0.5)
     assert row["nll_delta"] == 0 and row["ppl_base"] == pytest.approx(np.exp(2.0))
     assert "kl_mean_within_trainlen" not in summarize(per_pos, 32, train_len=32)
+
+
+def test_injection_regime_arms_and_support():
+    """evals/score_injection_regimes.py: arm parsing, the training-range fractions behind
+    the 'outside training support' annotation, and the within-example local metric."""
+    from evals.score_injection_regimes import (
+        parse_arms, train_support, frac_outside, corr_or_zero, parse_cells, parse_neurons)
+
+    arms = parse_arms("x1,x30,local@0.25,local")
+    assert [a.name for a in arms] == ["endogenous", "x1", "x30", "local@0.25s", "local@1s"]
+    assert [a.kind for a in arms] == ["endogenous", "global", "global", "local", "local"]
+    with pytest.raises(SystemExit):
+        parse_arms("x1,x1")
+    assert parse_cells("2:-1, 8:-28") == {(2, -1), (8, -28)}
+    assert parse_neurons("2.1447,8.3852") == {(2, 1447), (8, 3852)}
+
+    # 'extreme' x10 = uniform over 10x the natural range, centred on its midpoint
+    stats = {"min": -0.25, "max": 0.75, "mean": 0.0, "std": 0.1}
+    lo, hi = train_support(stats, "extreme", 10.0)
+    assert np.isclose(lo, 0.25 - 5.0) and np.isclose(hi, 0.25 + 5.0)
+    assert train_support(stats, "gaussian", 10.0) is None
+    assert frac_outside(np.array([0.0, 6.0, -5.0, -4.0]), (lo, hi)) == 0.5
+
+    # a prediction that does not move under the perturbation scores 0, not NaN
+    rng = np.random.default_rng(0)
+    delta = rng.normal(size=500)
+    assert corr_or_zero(np.zeros(500), delta) == (0.0, True)
+    r, deg = corr_or_zero(delta + 0.1 * rng.normal(size=500), delta)
+    assert r > 0.99 and not deg

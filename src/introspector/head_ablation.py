@@ -218,6 +218,21 @@ def eval_arm_outputs(run, dataset, arm: Arm, ablator: HeadAblator, batch_size: i
     injected values are identical across every ablation config and to the reported run.
     Targets: the cached activation (endogenous) or the injected value.
     """
+    preds, targets, _ = eval_arm_with_activation(run, dataset, arm, ablator, batch_size,
+                                                 window)
+    return preds, targets
+
+
+@torch.no_grad()
+def eval_arm_with_activation(run, dataset, arm: Arm, ablator: HeadAblator, batch_size: int,
+                             window: str = "all") -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """eval_arm_outputs plus each row's cached NATURAL activation.
+
+    For an injected arm the natural activation is the value the injection replaced, so
+    corr(prediction, activation) there measures how much the report still follows the
+    natural signal once the site no longer carries it (context bypass). For the
+    endogenous arm it equals the targets.
+    """
     model = run.model
     model.eval()
     prev = (model.intervention_distribution, model.intervention_scale)
@@ -226,7 +241,7 @@ def eval_arm_outputs(run, dataset, arm: Arm, ablator: HeadAblator, batch_size: i
         model.intervention_scale = arm.scale
         model.seed_intervention_rng(run.config.seed)
     head = model.regression_head
-    preds, targets = [], []
+    preds, targets, acts = [], [], []
     try:
         for batch in DataLoader(dataset, batch_size=batch_size, collate_fn=run.collator,
                                 shuffle=False):
@@ -244,11 +259,12 @@ def eval_arm_outputs(run, dataset, arm: Arm, ablator: HeadAblator, batch_size: i
                          .squeeze(-1).float().cpu())
             targets.append(out.intervention_values.float().cpu() if arm.injected
                            else act.float().cpu())
+            acts.append(act.float().cpu())
     finally:
         model.intervention_distribution, model.intervention_scale = prev
         ablator.buckets = None
         ablator.window = None
-    return torch.cat(preds).numpy(), torch.cat(targets).numpy()
+    return torch.cat(preds).numpy(), torch.cat(targets).numpy(), torch.cat(acts).numpy()
 
 
 def safe_corr(p: np.ndarray, t: np.ndarray) -> float:
