@@ -127,6 +127,14 @@ class TrainingConfig(BaseModel):
     # Bernoulli deviance KL(p||q) / KL(p||p_bar), for a sigmoid head on probability targets.
     # Both read as ~1 - R^2, so a joint loss mixes them at a balance set by w, not by scale.
     regression_loss: str = "var_norm_mse"
+    # Seeds TRAINING only (src/introspector/training/seeding.py): model init (LoRA A, the
+    # regression head, the added separator row), the training-time intervention draws,
+    # the KL position sampler and the Trainer's data order. ExperimentConfig.seed is left
+    # alone because it fixes what the run is EVALUATED on (injected eval values, probe
+    # splits) and how its cache was built, so a seed study varies this and nothing else.
+    # None = every run before 2026-11-25: unseeded init and intervention draws, data
+    # order at the HF default (42) -- i.e. a random draw, but not a reproducible one.
+    train_seed: int | None = None
 
 
 class EvalConfig(BaseModel):

@@ -93,6 +93,7 @@ from trainers.train_introspector_with_intervention import (
     get_argmax_from_logits,
 )
 from src.introspector.training.model import resize_embeddings_for_tokenizer
+from src.introspector.training.seeding import seed_training, trainer_seed_kwargs
 
 
 def parse_args():
@@ -1788,6 +1789,10 @@ def main():
     # logit and the cached target disagree at the bf16 level and the alignment check
     # cannot reach corr ~0.9999. attention_model_kwargs returns {} for neuron/SAE runs,
     # which therefore keep loading under sdpa exactly as before.
+    # train_seed (None for every earlier run, which leaves this a no-op) must be set
+    # before the base loads: the embedding resize below samples the separator's row.
+    train_seed = config.training_config.train_seed
+    seed_training(train_seed)
     base = AutoModelForCausalLM.from_pretrained(
         config.model_name, device_map="auto",
         torch_dtype=torch.bfloat16 if config.training_config.bf16 else torch.float32,
@@ -1832,6 +1837,11 @@ def main():
         attention_site=port_site(signal_type) if attention_run else None,
         head_activation=config.training_config.regression_head_activation,
         mlp_site=config.mlp_site)
+    if train_seed is not None:
+        # training-time injections; the post-training evals re-seed to config.seed
+        model.seed_intervention_rng(train_seed)
+        print(f"[joint] train_seed={train_seed}: init, training injections and data "
+              f"order seeded (evaluation stays on config.seed={config.seed})")
     print(f"[joint] regression head: {type(model.regression_head).__name__} "
           f"(regression_head_activation={config.training_config.regression_head_activation})")
     regression_loss = config.training_config.regression_loss
@@ -1964,7 +1974,8 @@ def main():
         logging_steps=max(1, math.ceil(100 / _eff_batch(config))),
         eval_strategy="steps", eval_steps=_eval_steps(len(train_dataset), config, args.evals_per_run),
         bf16=config.training_config.bf16,
-        remove_unused_columns=False, report_to="wandb", **save_kwargs, **epoch_kwargs)
+        remove_unused_columns=False, report_to="wandb", **save_kwargs, **epoch_kwargs,
+        **trainer_seed_kwargs(train_seed))
 
     # PEFT stores the whole resized embed_tokens/lm_head (~1.0 GB, 98% of the file)
     # because the vocab grew by one; drop them as each checkpoint is written, keeping

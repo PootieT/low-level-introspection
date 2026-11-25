@@ -100,3 +100,25 @@ def test_cross_model_config_keeps_source_rows_and_predictor_training(tmp_path):
     assert ExperimentConfig.model_validate_json(cfg.model_dump_json()).signal_model_name == source.model_name
     with pytest.raises(SystemExit):                            # self is not a cross run
         make_cross_config(source, source, name="x", output_dir="o", max_seq_length=128)
+
+
+def test_seed_configs_copy_the_original_except_name_output_and_train_seed():
+    """data_prep/make_seed_configs.py: a seed replicate must reuse the original run's
+    cache, schedule and evaluation seed -- only the name, output dir and train_seed move."""
+    import json
+    from src.introspector.config import ExperimentConfig
+    from data_prep.make_seed_configs import seed_copy
+
+    src = REPO_ROOT / "experiment_configs/mlp_endo_sweep_layer_token/endo_N2.1447_POS-1_gateoff_w1.0_300K.json"
+    raw = json.loads(src.read_text())
+    new = seed_copy(raw, 3, "grp")
+    changed = {k for k in raw if raw[k] != new[k]}
+    assert changed == {"experiment_name", "output_dir", "training_config"}
+    assert new["experiment_name"] == raw["experiment_name"] + "_seed3"
+    assert new["output_dir"] == "outputs/runs/grp"
+    tc_changed = {k for k in new["training_config"]
+                  if raw["training_config"].get(k) != new["training_config"][k]}
+    assert tc_changed == {"train_seed"} and new["training_config"]["train_seed"] == 3
+    cfg = ExperimentConfig.model_validate(new)
+    assert cfg.dataset_name == raw["dataset_name"] and cfg.seed == raw["seed"]
+    assert "train_seed" not in raw["training_config"]          # the source is untouched

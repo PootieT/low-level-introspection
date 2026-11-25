@@ -196,3 +196,57 @@ def test_cross_model_grid_pairs_columns_and_marks_significant_cross_cells(tmp_pa
     assert "(self)" in llama_row.split("|")[2] and "**" not in llama_row
     pc.plot(pc.summarize(df), models, tmp_path, pc.paired_tests(df))
     assert (tmp_path / "cross_model_heatmap.png").exists()
+
+
+def test_fig3_significance_summary_route_matches_raw_tests():
+    """plotters/stats_sft_vs_joint.py: the attention panel is tested from printed
+    (mean, SE) and pooled across cells by the law of total variance, so that route must
+    give exactly the paired t-test the raw neuron/SAE units get."""
+    from scipy.stats import ttest_1samp
+    from plotters.stats_sft_vs_joint import (
+        t_test, summarize_units, pool_cells, holm, attention_cells, ATTN_HEADS)
+
+    rng = np.random.default_rng(0)
+    units = [rng.normal(rng.normal(), 0.3, 3) for _ in range(5)]
+    cells = pd.DataFrame([{"n": 3, "mean": u.mean(), "sd": u.std(ddof=1)} for u in units])
+    flat = np.concatenate(units)
+    ref = ttest_1samp(flat, 0)
+    assert np.allclose(t_test(*pool_cells(cells)), (ref.statistic, ref.pvalue))
+    assert np.allclose(t_test(*summarize_units(units[0])), tuple(ttest_1samp(units[0], 0)))
+
+    assert t_test(3, 0.0, 0.0) == (0.0, 1.0)                     # all-zero deltas: no effect
+    assert all(np.isnan(t_test(3, 0.01, 0.0)))                    # constant shift: untestable
+    adj = holm([0.01, 0.04, np.nan, 0.03])
+    assert np.allclose(adj[[0, 3, 1]], [0.03, 0.06, 0.06]) and np.isnan(adj[2])
+
+    nom, con = attention_cells(False), attention_cells(True)
+    assert len(nom) == 2 * 4 * 5 and (nom["n"] == ATTN_HEADS).all()
+    # the conservative copy never has a larger |mean| or a smaller sd than the nominal one
+    assert (con["mean"].abs() <= nom["mean"].abs() + 1e-12).all() and (con["sd"] > nom["sd"]).all()
+
+
+def test_seed_variance_separates_seed_from_neuron_spread(tmp_path):
+    """plotters/table_seed_variance.py: pairs joint and SFT replicate by replicate, and
+    splits the delta's spread into across-seed (within neuron) and across-neuron."""
+    from plotters.table_seed_variance import load_runs, summarize
+
+    seed_g, joint_g, sft_g = (tmp_path / g for g in ("seedgrp", "jg", "sg"))
+    # delta = 0.5 + neuron offset (0, 0.2) + seed jitter (+-0.01): seed SD << neuron SD
+    for k, idx in enumerate((11, 22)):
+        for rep, jitter in (("", 0.0), ("_seed1", 0.01), ("_seed2", -0.01)):
+            for arm, base, grp in (("joint", 0.9, joint_g), ("endo", 0.4, sft_g)):
+                name = (f"joint_N2.{idx}_POS-1_gateoff_scale10_kl0.1_w0.01_300K" if arm == "joint"
+                        else f"endo_N2.{idx}_POS-1_gateoff_w1.0_300K") + rep
+                d = (seed_g if rep else grp) / name
+                d.mkdir(parents=True)
+                v = base + (0.2 * k + jitter if arm == "joint" else 0.0)
+                (d / "endogenous_test_metrics_endogenous.json").write_text(json.dumps({"corr": v}))
+                (d / "interventional_test_metrics_gaussian.json").write_text(
+                    json.dumps({"test": {"corr": v}}))
+    df = load_runs(tmp_path, "seedgrp", {"joint": "jg", "endo": "sg"}, True)
+    assert set(df["replicate"]) == {"original", "seed1", "seed2"} and len(df) == 2 * 2 * 3 * 2
+    s = summarize(df).set_index("metric").loc["interventional"]
+    assert s["n_neurons"] == 2 and s["n_replicates"] == 3 and s["n_deltas"] == 6
+    assert np.isclose(s["delta_mean"], 0.6)
+    assert np.isclose(s["delta_seed_sd"], 0.01) and np.isclose(s["delta_neuron_sd"], 0.2 / np.sqrt(2))
+    assert s["delta_positive"] == 6 and np.isclose(s["sft_seed_sd"], 0.0)

@@ -111,3 +111,41 @@ def test_cross_model_rows_are_valid_iff_the_prompt_fits():
     assert out["position_valid"] and not out["text_truncated"]
     cut = preprocess_example(ex, max_length=12, cross_model=True, **kw)
     assert not cut["position_valid"] and cut["text_truncated"]
+
+
+def _tiny_seeded_build(train_seed):
+    """What trainers/train_introspector_joint.py does, in its order, on a tiny random
+    Llama: seed, build base, add LoRA, wrap with the regression head."""
+    from peft import LoraConfig, get_peft_model
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from src.introspector.training.model import IntrospectionRegressionModel
+    from src.introspector.training.seeding import seed_training
+
+    seed_training(train_seed)
+    base = LlamaForCausalLM(LlamaConfig(vocab_size=64, hidden_size=16, intermediate_size=32,
+                                        num_hidden_layers=2, num_attention_heads=2,
+                                        num_key_value_heads=2))
+    peft = get_peft_model(base, LoraConfig(r=4, lora_alpha=8, target_modules="all-linear",
+                                           task_type="CAUSAL_LM"))
+    model = IntrospectionRegressionModel(peft, signal_ranges={(0, 1): {
+        "mean": 0.0, "std": 1.0, "min": -1.0, "max": 1.0}})
+    if train_seed is not None:
+        model.seed_intervention_rng(train_seed)
+    lora_a = next(p for n, p in model.named_parameters() if "lora_A" in n).detach().clone()
+    return lora_a, model.regression_head.weight.detach().clone(), model.intervention_rng.random()
+
+
+def test_train_seed_fixes_init_and_injections_and_none_changes_nothing():
+    """TrainingConfig.train_seed: same seed -> same LoRA init, head and training-time
+    injection stream; another seed -> different; None (every pre-existing run) seeds
+    nothing and adds no TrainingArguments kwargs."""
+    from src.introspector.config import TrainingConfig
+    from src.introspector.training.seeding import trainer_seed_kwargs
+
+    a1, h1, r1 = _tiny_seeded_build(3)
+    a2, h2, r2 = _tiny_seeded_build(3)
+    b1, g1, s1 = _tiny_seeded_build(4)
+    assert torch.equal(a1, a2) and torch.equal(h1, h2) and r1 == r2
+    assert not torch.equal(a1, b1) and not torch.equal(h1, g1) and r1 != s1
+    assert trainer_seed_kwargs(3) == {"seed": 3, "data_seed": 3}
+    assert trainer_seed_kwargs(None) == {} and TrainingConfig().train_seed is None
