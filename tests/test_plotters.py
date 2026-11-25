@@ -125,4 +125,36 @@ def test_injection_regime_tables_bold_only_significant_joint_cells(tmp_path):
     assert rows["Gaussian 1×"].count("**") == 2                  # joint bold, SFT not
     assert rows["Gaussian 1×"].split("|")[2].strip().startswith("**0.95")
     assert "**" not in rows["Endogenous (no injection)"] and "**" not in rows["Local ±1σ"]
-    assert "Holm-corrected over all 2 comparisons" in md
+    assert "Holm-corrected over its 2 comparisons" in md
+
+
+def test_injection_regime_pooled_table_pairs_runs_across_locales(tmp_path):
+    """The pooled comparison pairs each (layer, neuron, token) run across methods over
+    EVERY locale, and its table comes first with its own bolding."""
+    from plotters.plot_injection_regimes import (
+        POOLED, paired_tests, pooled_title, summarize, write_markdown)
+
+    rng = np.random.default_rng(0)
+    rows = []
+    for layer in (2, 8):
+        for t in (4, 31):
+            for i in range(3):           # neuron i is shared by both token positions
+                for m, a, r in (("joint", "x1", 0.95), ("sft", "x1", 0.4),
+                                ("joint", "endogenous", 0.98), ("sft", "endogenous", 0.98)):
+                    rows.append({"method": m, "arm": a, "layer": layer, "t": t,
+                                 "index": i, "corr": r + rng.normal(0, 0.02)})
+    df = pd.DataFrame(rows)
+    pt = paired_tests(df, by=POOLED).set_index("arm")
+    assert (pt["n_pairs"] == 12).all()                         # 2 layers x 2 tokens x 3
+    assert pt.loc["x1", "significant"] and not pt.loc["endogenous", "significant"]
+    title = pooled_title(df)
+    assert "All 4 locales pooled" in title and "12 runs per method = 6 neurons × 2 token" in title
+
+    md = write_markdown(summarize(df), tmp_path, paired_tests(df),
+                        pooled=summarize(df, by=POOLED), pooled_tests=pt.reset_index(),
+                        pooled_title=title)
+    first = md.split("\n\n")[0]
+    assert first == title                                      # pooled table leads
+    pooled_block = md.split("**Layer")[0]
+    assert "| Gaussian 1× | **" in pooled_block
+    assert "Pooled table, pairs = the same (layer, neuron, token) run" in md
