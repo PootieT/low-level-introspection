@@ -58,7 +58,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root
 from src.introspector.config import ExperimentConfig
-from src.introspector.dataset_utils import apply_signal_filter, pair_pool_dir
+from src.introspector.dataset_utils import (
+    apply_signal_filter, pair_pool_dir, cache_signal_model, is_cross_model)
 from src.introspector.signals.schema import is_pair_selector
 from src.introspector.models.signal_paths import resolve_mlp_signal_path, register_mlp_site_hook
 from src.introspector.models.attention_logits import (
@@ -1535,9 +1536,42 @@ def main():
         raise ValueError("--interv-eval-only needs --checkpoint (the run to evaluate)")
 
     cache_dir = config.dataset_cache_dir
+    # CROSS-MODEL run (privileged-access baseline): this model predicts ANOTHER model's
+    # neuron from the text alone. SFT and endogenous eval only -- every injection path
+    # (interventional evals, drift, routing probe, scale sweep) would write into the
+    # PREDICTOR's own neuron at the source's (layer, index), which is a different neuron
+    # or, across sizes, out of range (Llama-1B indices reach 8191, Qwen3-0.6B has 3072).
+    # The derived-cache evals (OOD, length, neuron-gen) would build caches by running
+    # this model, i.e. cache the predictor's activations under the source's labels.
+    cross = is_cross_model(config)
+    if cross:
+        refused = [f for f, on in (
+            ("--joint-loss-weight < 1", args.joint_loss_weight < 1.0),
+            ("--ood-eval", args.ood_eval), ("--ood-only", args.ood_only),
+            ("--length-eval", args.length_eval), ("--length-only", args.length_only),
+            ("--neuron-gen-eval", args.neuron_gen_eval),
+            ("--neuron-gen-only", args.neuron_gen_only),
+            ("--interv-eval-only", args.interv_eval_only), ("--diag-only", args.diag_only),
+            ("--diag-fp32", args.diag_fp32), ("--prepare-only", args.prepare_only)) if on]
+        if refused:
+            raise SystemExit(f"[joint] cross-model run ({config.model_name} reading "
+                             f"{config.signal_model_name}): {refused} need(s) to inject into "
+                             f"or cache from the source model, which this run does not have.")
+        built_from = cache_signal_model(config)
+        if built_from != config.signal_model_name:
+            raise SystemExit(f"[joint] cross-model run expects a finished cache of "
+                             f"{config.signal_model_name}'s activations at {cache_dir}, found "
+                             f"{'no finished cache' if built_from is None else built_from}. "
+                             f"Never build it from this config (that would run "
+                             f"{config.model_name}); run the source model's own config.")
+        print(f"[joint] CROSS-MODEL run: {config.model_name} predicts "
+              f"{config.signal_model_name}'s activations from text; SFT + endogenous eval only")
     output_dir = Path(config.output_dir) / config.experiment_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    if ((output_dir / "routing_probe_by_position.csv").exists()
+    # a cross run never writes the routing probe; its last output is the endogenous eval
+    sentinel = ("endogenous_test_metrics_endogenous.json" if cross
+                else "routing_probe_by_position.csv")
+    if ((output_dir / sentinel).exists()
             and not args.overwrite_cache and not args.diag_only and not args.ood_only
             and not args.length_only and not args.neuron_gen_only
             and not args.interv_eval_only):
@@ -1701,7 +1735,7 @@ def main():
                                  prompt_fn=PROMPT_REGISTRY[config.training_config.prompt_type],
                                  max_length=config.training_config.max_seq_length,
                                  return_frozen_input_len=True, return_position_valid=True,
-                                 for_prediction=True)
+                                 for_prediction=True, cross_model=cross)
         out["token_position"] = ex["token_position"]
         out["signal_layer"] = ex["signal_layer"]
         out["signal_index"] = ex["signal_index"]
@@ -1987,6 +2021,12 @@ def main():
     else:
         train_results = trainer.train()
         trainer.save_metrics("train", train_results.metrics)
+
+    if cross:
+        # endogenous only (see the cross-model note at the top of main)
+        eval_endogenous_test(model, test_dataset_pred, pred_collator, config, eval_out_dir,
+                             provenance=test_provenance)
+        return
 
     # ---- frontier metrics: interventional (gaussian@1 by default) AND endogenous ----
     run_interventional_evals(model, test_dataset_pred, pred_collator, config, eval_out_dir,

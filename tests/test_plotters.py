@@ -158,3 +158,41 @@ def test_injection_regime_pooled_table_pairs_runs_across_locales(tmp_path):
     pooled_block = md.split("**Layer")[0]
     assert "| Gaussian 1× | **" in pooled_block
     assert "Pooled table, pairs = the same (layer, neuron, token) run" in md
+
+
+def test_cross_model_grid_pairs_columns_and_marks_significant_cross_cells(tmp_path):
+    """plotters/plot_cross_model_prediction.py: self cells come from each model's own SFT
+    grid for exactly the cross runs' signals, every column is paired, and only cross cells
+    that differ significantly from their column's self run are bold."""
+    from plotters import plot_cross_model_prediction as pc
+
+    models = ["llama1b", "qwen06b"]
+    sigs = {"llama1b": [(2, i, -1) for i in range(5)], "qwen06b": [(4, i, -28) for i in range(5)]}
+    rng = np.random.default_rng(0)
+    for src, ss in sigs.items():
+        for k, (L, i, pos) in enumerate(ss):
+            base = 0.90 + 0.01 * k
+            # llama1b's neurons: self clearly better; qwen06b's: no gap
+            runs = {src: base, [m for m in models if m != src][0]:
+                    base - (0.30 if src == "llama1b" else 0.0) + 0.01 * rng.normal()}
+            for pred, r in runs.items():
+                d = (tmp_path / pc.MODELS[src][1] / f"endo_N{L}.{i}_POS{pos}_gateoff_w1.0_300K"
+                     if pred == src else tmp_path / pc.CROSS_GROUP /
+                     f"cross_{pred}_from_{src}_N{L}.{i}_POS{pos}_gateoff_w1.0_300K")
+                _write(d / "endogenous_test_metrics_endogenous.json", {"corr": r, "spearman": r})
+    # a self run for a signal no cross run covers must not enter the grid
+    _write(tmp_path / pc.MODELS["llama1b"][1] / "endo_N8.9_POS-1_gateoff_w1.0_300K"
+           / "endogenous_test_metrics_endogenous.json", {"corr": 0.1, "spearman": 0.1})
+
+    df = pc.complete_columns(pc.collect(tmp_path, models), models)
+    assert len(df) == 20 and set(df.groupby("source").size()) == {10}
+    tests = pc.paired_tests(df).set_index(["source", "predictor", "metric"])
+    assert tests.loc[("llama1b", "qwen06b", "pearson"), "significant"]
+    assert not tests.loc[("qwen06b", "llama1b", "pearson"), "significant"]
+    md = pc.write_markdown(pc.summarize(df), models, tmp_path, pc.paired_tests(df))
+    qwen_row = next(l for l in md.splitlines() if l.startswith("| Qwen3-0.6B"))
+    llama_row = next(l for l in md.splitlines() if l.startswith("| Llama-3.2-1B"))
+    assert qwen_row.split("|")[2].strip().startswith("**")       # cross on llama: bold
+    assert "(self)" in llama_row.split("|")[2] and "**" not in llama_row
+    pc.plot(pc.summarize(df), models, tmp_path, pc.paired_tests(df))
+    assert (tmp_path / "cross_model_heatmap.png").exists()

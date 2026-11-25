@@ -1020,6 +1020,18 @@ def main():
         build_pair_pool(config, pool_dir)
         return
 
+    # A cross-model config (predictor != the model its cache was built from) must never
+    # cache: this script runs config.model_name, so a missing cache would be filled with
+    # the PREDICTOR's own activations under the source model's name -- turning every
+    # cross run trained on it into a self run, silently.
+    from src.introspector.dataset_utils import is_cross_model
+    if is_cross_model(config):
+        raise SystemExit(
+            f"[cache] {config.experiment_name}: a cross-model config (predictor "
+            f"{config.model_name}, signals from {config.signal_model_name}) reads an "
+            f"EXISTING cache, {config.dataset_name}; build that cache from the source "
+            f"model's own config instead.")
+
     output_dir = config.dataset_cache_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     train_path = output_dir / "train"

@@ -185,6 +185,11 @@ class ExperimentConfig(BaseModel):
     # dataset_name to reuse one cache instead of re-caching per experiment_name.
     # None => falls back to experiment_name (backward compatible).
     dataset_name: Optional[str] = None
+    # The model whose activations the cache holds, when it is NOT model_name: a
+    # CROSS-MODEL run, where model_name only reads the text and predicts another model's
+    # neuron (the privileged-access baseline). None => model_name's own activations,
+    # i.e. every run before this field existed. See dataset_utils.is_cross_model.
+    signal_model_name: Optional[str] = None
 
     @property
     def dataset_cache_dir(self) -> Path:

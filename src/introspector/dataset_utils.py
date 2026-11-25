@@ -225,6 +225,25 @@ def canonical_dataset_name(config) -> str:
     ])
 
 
+def cache_signal_model(config) -> Optional[str]:
+    """The model a FINISHED cache was built from (metadata.json identity.model_name,
+    written by cache_signals once all three splits exist), or None."""
+    from pathlib import Path
+    meta = Path(config.dataset_cache_dir) / "metadata.json"
+    if not meta.exists():
+        return None
+    return json.loads(meta.read_text()).get("identity", {}).get("model_name")
+
+
+def is_cross_model(config) -> bool:
+    """True for a CROSS-MODEL run: the predictor (config.model_name) is trained on
+    ANOTHER model's activations (config.signal_model_name) -- the privileged-access
+    baseline, another model reading this model's neuron from text alone. Declared in
+    the config rather than inferred, so no dataset naming convention can flip it."""
+    src = getattr(config, "signal_model_name", None)
+    return src is not None and src != config.model_name
+
+
 def subsample_key(seed: int, signal_type: str, layer: int, index: int, text: str) -> float:
     """Deterministic uniform draw in [0, 1) for one (signal, text) row.
 

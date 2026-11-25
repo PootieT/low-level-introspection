@@ -73,6 +73,7 @@ def preprocess_example(
     detection_active_word="active",
     detection_inactive_word="inactive",
     separator=INTROSPECTION_SEPARATOR,
+    cross_model=False,
 ):
     """
     preprocess dataset for training or prediction
@@ -89,6 +90,10 @@ def preprocess_example(
         runs use the added special token; the untrained prompt baseline
         (evals/score_prompt_baseline.py) passes plain text, because to a model that never
         trained on it the special token is a random, frozen embedding.
+    :param cross_model: the row's activation belongs to ANOTHER model (a cross-model
+        run, see dataset_utils.is_cross_model), so `token_position` counts that model's
+        tokens, not this tokenizer's, and the position check below is replaced by a
+        prompt-fits check. See the comment there for why the position is not remapped.
     :return:
     """
     # Argument list depends on the signal type (attention names a source token as well
@@ -173,7 +178,27 @@ def preprocess_example(
     # long-context runs, where max_length must cover text + prompt + target, not just
     # the text. Flagged per row so the caller can refuse to train on a poisoned split
     # rather than discovering it in the results.
-    if return_position_valid:
+    if return_position_valid and cross_model:
+        # CROSS-MODEL run: the cached token_position counts the SOURCE model's tokens, so
+        # comparing it with this tokenizer's length is meaningless (Llama vs Qwen3 it
+        # fails for ~70% of t=31 rows). It is deliberately NOT remapped into this
+        # tokenizer's coordinates. A cross run is SFT only: it is never intervened on and
+        # nothing in it is expected to be a causal mechanism, so the index does not
+        # matter -- what matters is which TOKEN the external predictor thinks the source
+        # model is processing, and the prompt names that token by its string (the
+        # tokenizations agree: the Llama t=4 token is the same token at the same text
+        # index in Qwen3 for ~96% of rows, the last token for ~99%). Predicting another
+        # model's activation from text can only lean on semantics, i.e. it invites
+        # exactly the bypass the interventional eval detects in self runs -- acceptable
+        # here, since nothing could enforce mechanistic faithfulness across models anyway.
+        # What CAN still silently corrupt a row is truncation: max_length cuts from the
+        # END, i.e. the prompt, and the readout then sits mid-prompt. So a row is valid
+        # iff the whole prompt fits.
+        n_full = len(tokenizer(full_text, add_special_tokens=True)["input_ids"])
+        fits = n_full <= max_length
+        out["position_valid"] = fits
+        out["text_truncated"] = not fits     # drop_invalid_positions: "raise max_length"
+    elif return_position_valid:
         n_text = len(input_tokens["input_ids"])
         valid = int(example["token_position"]) < n_text
         # An attention row addresses TWO tokens. The source is always at or before the

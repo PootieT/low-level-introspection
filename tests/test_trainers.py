@@ -83,3 +83,31 @@ def test_fit_ridge_recovers_a_linear_readout():
     torch.testing.assert_close(probe.coef, w, atol=1e-3, rtol=0)
     assert abs(probe.intercept - 0.5) < 1e-3
     torch.testing.assert_close(probe.predict(X[:5]), X[:5] @ w + 0.5, atol=1e-3, rtol=0)
+
+
+def test_cross_model_rows_are_valid_iff_the_prompt_fits():
+    """preprocess_example(cross_model=True): the cached token_position counts ANOTHER
+    model's tokens, so it is not checked against this tokenizer (it is deliberately not
+    remapped either -- see the comment in preprocess_example); a row is dropped only when
+    max_length would cut the prompt, which would move the readout."""
+    try:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B", local_files_only=True)
+    except Exception:
+        pytest.skip("Llama-3.2-1B tokenizer not in the local HF cache")
+    from trainers.train_introspector import INTROSPECTION_SEPARATOR, preprocess_example
+    from src.introspector.prompts import PROMPT_REGISTRY
+
+    tok.add_special_tokens({"additional_special_tokens": [INTROSPECTION_SEPARATOR]})
+    ex = {"text": "The cat sat on the mat.", "signal_type": "mlp", "signal_layer": 2,
+          "signal_index": 7, "token_position": 31, "token": ".", "activation": 0.1,
+          "target": "0.100"}
+    kw = dict(tokenizer=tok, prompt_fn=PROMPT_REGISTRY["prompt_no_token_index"],
+              return_position_valid=True, for_prediction=True)
+    # a source position past this tokenization's text is fatal for a self run ...
+    assert not preprocess_example(ex, max_length=128, **kw)["position_valid"]
+    # ... and irrelevant for a cross run, whose rows fail only on a truncated prompt
+    out = preprocess_example(ex, max_length=128, cross_model=True, **kw)
+    assert out["position_valid"] and not out["text_truncated"]
+    cut = preprocess_example(ex, max_length=12, cross_model=True, **kw)
+    assert not cut["position_valid"] and cut["text_truncated"]

@@ -68,3 +68,35 @@ def test_layer_gen_index_prefers_the_index_with_no_dead_layer():
     assert rank.set_index("index").loc[7, "n_dead"] == 1
     assert rank.set_index("index").loc[7, "weakest_layer"] == 2
     assert len(per) == 8
+
+
+def test_cross_model_config_keeps_source_rows_and_predictor_training(tmp_path):
+    """data_prep/make_cross_model_configs.py: a cross config is the SOURCE run's data
+    (cache, signal, splits -- so self vs cross is paired row by row) with the PREDICTOR's
+    model and training_config, marked by signal_model_name; and is_cross_model reads it."""
+    from src.introspector.config import ExperimentConfig
+    from src.introspector.dataset_utils import is_cross_model
+    from data_prep.make_cross_model_configs import cross_name, make_cross_config
+
+    src_path = REPO_ROOT / "experiment_configs/mlp_endo_sweep_layer_token/endo_N2.1447_POS-1_gateoff_w1.0_300K.json"
+    if not src_path.exists():
+        pytest.skip("Llama SFT grid configs not present")
+    source = ExperimentConfig.model_validate_json(src_path.read_text())
+    predictor = source.model_copy(update={
+        "model_name": "Qwen/Qwen3-0.6B-Base",
+        "training_config": source.training_config.model_copy(update={"learning_rate": 1e-4})})
+
+    name = cross_name(source.experiment_name, "llama1b", "qwen06b")
+    assert name == "cross_qwen06b_from_llama1b_N2.1447_POS-1_gateoff_w1.0_300K"
+    cfg = make_cross_config(source, predictor, name=name, output_dir="outputs/runs/x",
+                            max_seq_length=128)
+    assert (cfg.model_name, cfg.signal_model_name) == ("Qwen/Qwen3-0.6B-Base", source.model_name)
+    assert (cfg.dataset_name, cfg.signal_filter) == (source.dataset_name, source.signal_filter)
+    assert cfg.test_dataset == source.test_dataset and cfg.seed == source.seed
+    assert cfg.training_config.learning_rate == 1e-4          # the predictor's own LR
+    assert cfg.training_config.max_seq_length == 128          # room for re-tokenized text
+    assert is_cross_model(cfg) and not is_cross_model(source)
+    # round-trips through JSON the way the trainer reads it
+    assert ExperimentConfig.model_validate_json(cfg.model_dump_json()).signal_model_name == source.model_name
+    with pytest.raises(SystemExit):                            # self is not a cross run
+        make_cross_config(source, source, name="x", output_dir="o", max_seq_length=128)
