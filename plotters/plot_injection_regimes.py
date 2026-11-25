@@ -19,11 +19,26 @@ joint runs of the panel). The endogenous correlation is printed in each panel ti
 Only neurons present in BOTH arms are drawn (the SFT sweep has more per cell), so the
 two lines in a panel always average over the same neurons.
 
+SIGNIFICANCE (the bold joint cells of the markdown tables). Per cell and regime, joint vs
+SFT is a two-sided PAIRED t-test over the cell's neurons -- the same unit the mean +/- std
+is taken over; the pairs share the neuron, the test rows and the injected values -- on
+the correlations as shown. NOT on Fisher z: that stabilizes the SAMPLING variance of one
+r, but the variance tested here is BETWEEN neurons, and z stretches the joint runs'
+near-1 values apart (0.97 vs 0.999 is a z gap of 1.7, more than 0.2 vs 0.6), which buries
+a large joint-SFT gap in noise. p-values are Holm-corrected across every comparison in
+the file (--correction none for raw). With 5 neurons a
+signed-rank test cannot reach p < 0.05 at all (its smallest two-sided p is 0.0625), which
+is why the test is parametric. A pair whose difference is identical for every neuron
+(e.g. both arms scored 0) is untestable and never bolded.
+
 Outputs (outputs/plots/injection_regimes/ by default):
   injection_regimes_runs.csv     every run x arm row
   injection_regimes_summary.csv  mean / std / n per method x cell x arm
+  injection_regimes_tests.csv    joint vs SFT per cell x arm: n pairs, mean difference,
+                                 t, p, Holm-adjusted p, significant
   injection_regimes_tables.md    the same numbers as one markdown table per cell (the
-                                 rebuttal allows no images)
+                                 rebuttal allows no images), joint bold where it differs
+                                 significantly from SFT
   injection_regimes.png / .pdf
 
 Usage
@@ -41,6 +56,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scipy.stats import ttest_rel
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -67,6 +83,10 @@ def parse_args():
     p.add_argument("--sft", default="mlp_endo_sweep_layer_token:endo_*_gateoff_w1.0_300K",
                    help="'<group>:<run glob>' of the SFT arm.")
     p.add_argument("--out-dir", type=Path, default=ROOT / "outputs" / "plots" / "injection_regimes")
+    p.add_argument("--alpha", type=float, default=0.05,
+                   help="Significance level for bolding a joint cell.")
+    p.add_argument("--correction", choices=("holm", "none"), default="holm",
+                   help="Multiple-comparison correction across every cell x regime test.")
     return p.parse_args()
 
 
@@ -116,6 +136,48 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     return s
 
 
+def holm(p) -> np.ndarray:
+    """Holm-Bonferroni adjusted p-values. NaNs (untestable pairs) pass through and do not
+    count towards the number of comparisons."""
+    p = np.asarray(p, dtype=float)
+    out = np.full_like(p, np.nan)
+    ok = np.where(np.isfinite(p))[0]
+    m = len(ok)
+    if m == 0:
+        return out
+    order = ok[np.argsort(p[ok], kind="stable")]
+    adj = np.minimum(1.0, (m - np.arange(m)) * p[order])
+    out[order] = np.maximum.accumulate(adj)
+    return out
+
+
+def paired_tests(df: pd.DataFrame, alpha: float = 0.05, correction: str = "holm") -> pd.DataFrame:
+    """Joint vs SFT per (layer, t, arm): two-sided paired t-test over the cell's neurons on
+    the raw correlations, then corrected across every test returned."""
+    rows = []
+    for (L, t, a), g in df.groupby(["layer", "t", "arm"]):
+        w = g.pivot_table(index="index", columns="method", values="corr", aggfunc="first")
+        if not {"joint", "sft"} <= set(w.columns):
+            continue
+        w = w[["joint", "sft"]].dropna()
+        d = (w["joint"] - w["sft"]).to_numpy()
+        if len(d) < 2 or np.std(d, ddof=1) < 1e-12:
+            stat, p = np.nan, np.nan       # one pair, or a constant shift: untestable
+        else:
+            stat, p = (float(v) for v in ttest_rel(w["joint"], w["sft"]))
+        rows.append({"layer": L, "t": t, "arm": a, "n_pairs": len(w),
+                     "mean_joint": float(w["joint"].mean()), "mean_sft": float(w["sft"].mean()),
+                     "mean_diff": float((w["joint"] - w["sft"]).mean()),
+                     "t_stat": stat, "p": p})
+    res = pd.DataFrame(rows, columns=["layer", "t", "arm", "n_pairs", "mean_joint", "mean_sft",
+                                      "mean_diff", "t_stat", "p"])
+    res["p_adj"] = holm(res["p"]) if correction == "holm" else res["p"]
+    res["significant"] = res["p_adj"] < alpha          # NaN compares False
+    res.attrs.update(alpha=alpha, correction=correction,
+                     n_tests=int(np.isfinite(res["p"]).sum()))
+    return res
+
+
 def table_order(arms) -> list[str]:
     """Rows of the markdown tables: endogenous, gaussian by scale, local by delta (largest
     first, so the table reads from the paper's eval outwards)."""
@@ -136,10 +198,19 @@ def table_row_label(arm: str, frac_out: float) -> str:
     return label
 
 
-def write_markdown(summary: pd.DataFrame, out_dir: Path) -> str:
+def write_markdown(summary: pd.DataFrame, out_dir: Path, tests: pd.DataFrame | None = None) -> str:
     """One markdown table per (layer, token) cell: rows = regimes, one column per method,
-    each 'mean ± std' over the cell's neurons."""
-    fmt = lambda r: "–" if r is None else f"{r['mean']:.2f} ± {r['std']:.2f}"
+    each 'mean ± std' over the cell's neurons. A joint cell is bold when `tests` marks it
+    significantly different from SFT."""
+    sig = (set() if tests is None or tests.empty else
+           set(map(tuple, tests.loc[tests["significant"], ["layer", "t", "arm"]].to_numpy())))
+
+    def fmt(r, bold=False):
+        if r is None:
+            return "–"
+        s = f"{r['mean']:.2f} ± {r['std']:.2f}"
+        return f"**{s}**" if bold else s
+
     methods = [m for m in METHODS if m in set(summary["method"])]
     blocks = []
     for (L, t), cell in summary.groupby(["layer", "t"]):
@@ -153,12 +224,19 @@ def write_markdown(summary: pd.DataFrame, out_dir: Path) -> str:
             f = (joint["frac_outside_median"].get(a, np.nan)
                  if "frac_outside_median" in joint else np.nan)
             lines.append(f"| {table_row_label(a, f)} | "
-                         + " | ".join(fmt(by.get((m, a))) for m in methods) + " |")
+                         + " | ".join(fmt(by.get((m, a)),
+                                          bold=(m == "joint" and (L, t, a) in sig))
+                                      for m in methods) + " |")
         blocks.append("\n".join(lines))
     note = ("Gaussian N×: the neuron is replaced by v ~ N(μ, (Nσ)²) of its natural "
             "activations; corr(prediction, v). Local ±Dσ: each example's own value plus "
             "δ ~ N(0, (Dσ)²); corr(change in prediction, δ) within example. Joint-loss "
             "training replaced the neuron with values uniform over 10× its natural range.")
+    if tests is not None and not tests.empty:
+        corr_txt = (f"Holm-corrected over all {tests.attrs.get('n_tests')} comparisons"
+                    if tests.attrs.get("correction") == "holm" else "uncorrected")
+        note += (f" Bold: Joint differs from SFT (two-sided paired t-test over neurons, "
+                 f"{corr_txt}, p < {tests.attrs.get('alpha'):g}).")
     md = "\n\n".join(blocks) + "\n\n" + note + "\n"
     (out_dir / "injection_regimes_tables.md").write_text(md)
     return md
@@ -241,7 +319,9 @@ def main():
     df.to_csv(args.out_dir / "injection_regimes_runs.csv", index=False)
     summary = summarize(df)
     summary.to_csv(args.out_dir / "injection_regimes_summary.csv", index=False)
-    print(write_markdown(summary, args.out_dir))
+    tests = paired_tests(df, alpha=args.alpha, correction=args.correction)
+    tests.to_csv(args.out_dir / "injection_regimes_tests.csv", index=False)
+    print(write_markdown(summary, args.out_dir, tests))
     plot(summary, args.out_dir)
     print(f"[plot] wrote {args.out_dir}")
 

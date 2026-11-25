@@ -98,3 +98,31 @@ def test_attention_sweep_plotter_end_to_end(tmp_path):
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert len(pd.read_csv(out / "summary.csv")) == 12
     assert list(out.glob("*.png")) or list(out.glob("*.pdf"))
+
+
+def test_injection_regime_tables_bold_only_significant_joint_cells(tmp_path):
+    """plotters/plot_injection_regimes.py: Holm adjustment, the paired joint-vs-SFT test
+    over neurons, and that only significant JOINT cells come out bold."""
+    from plotters.plot_injection_regimes import holm, paired_tests, summarize, write_markdown
+
+    adj = holm([0.01, 0.04, np.nan, 0.03])              # m = 3: NaN does not count
+    assert np.allclose(adj[[0, 3, 1]], [0.03, 0.06, 0.06]) and np.isnan(adj[2])
+
+    corr = {("joint", "endogenous"): [0.97, 0.99, 0.98, 0.96, 0.99],
+            ("sft", "endogenous"): [0.98, 0.97, 0.99, 0.98, 0.97],   # no systematic gap
+            ("joint", "x1"): [0.95, 0.97, 0.93, 0.96, 0.94],
+            ("sft", "x1"): [0.20, 0.25, 0.15, 0.22, 0.18],          # large, consistent gap
+            ("joint", "local@1s"): [0.0] * 5, ("sft", "local@1s"): [0.0] * 5}  # untestable
+    df = pd.DataFrame([{"method": m, "arm": a, "layer": 2, "t": 31, "index": i, "corr": r}
+                       for (m, a), rs in corr.items() for i, r in enumerate(rs)])
+    tests = paired_tests(df).set_index("arm")
+    assert tests.loc["x1", "significant"] and not tests.loc["endogenous", "significant"]
+    assert np.isnan(tests.loc["local@1s", "p"]) and not tests.loc["local@1s", "significant"]
+    assert tests.attrs["n_tests"] == 2
+
+    md = write_markdown(summarize(df), tmp_path, paired_tests(df))
+    rows = {line.split("|")[1].strip(): line for line in md.splitlines() if line.startswith("| ")}
+    assert rows["Gaussian 1×"].count("**") == 2                  # joint bold, SFT not
+    assert rows["Gaussian 1×"].split("|")[2].strip().startswith("**0.95")
+    assert "**" not in rows["Endogenous (no injection)"] and "**" not in rows["Local ±1σ"]
+    assert "Holm-corrected over all 2 comparisons" in md
