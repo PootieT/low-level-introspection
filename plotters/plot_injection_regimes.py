@@ -22,6 +22,8 @@ two lines in a panel always average over the same neurons.
 Outputs (outputs/plots/injection_regimes/ by default):
   injection_regimes_runs.csv     every run x arm row
   injection_regimes_summary.csv  mean / std / n per method x cell x arm
+  injection_regimes_tables.md    the same numbers as one markdown table per cell (the
+                                 rebuttal allows no images)
   injection_regimes.png / .pdf
 
 Usage
@@ -114,6 +116,54 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     return s
 
 
+def table_order(arms) -> list[str]:
+    """Rows of the markdown tables: endogenous, gaussian by scale, local by delta (largest
+    first, so the table reads from the paper's eval outwards)."""
+    glob = sorted((a for a in arms if a.startswith("x")), key=lambda a: float(a[1:]))
+    local = sorted((a for a in arms if a.startswith("local@")),
+                   key=lambda a: -float(a[len("local@"):].rstrip("s")))
+    return (["endogenous"] if "endogenous" in set(arms) else []) + glob + local
+
+
+def table_row_label(arm: str, frac_out: float) -> str:
+    if arm == "endogenous":
+        return "Endogenous (no injection)"
+    if arm.startswith("local@"):
+        return f"Local ±{arm[len('local@'):].rstrip('s')}σ"
+    label = f"Gaussian {arm[1:]}×"
+    if np.isfinite(frac_out) and frac_out >= OUTSIDE_SHADE_MIN:
+        label += f" ({100 * frac_out:.0f}% outside training range)"
+    return label
+
+
+def write_markdown(summary: pd.DataFrame, out_dir: Path) -> str:
+    """One markdown table per (layer, token) cell: rows = regimes, one column per method,
+    each 'mean ± std' over the cell's neurons."""
+    fmt = lambda r: "–" if r is None else f"{r['mean']:.2f} ± {r['std']:.2f}"
+    methods = [m for m in METHODS if m in set(summary["method"])]
+    blocks = []
+    for (L, t), cell in summary.groupby(["layer", "t"]):
+        by = {(r["method"], r["arm"]): r for _, r in cell.iterrows()}
+        n = int(cell["count"].max())
+        joint = cell[cell["method"] == "joint"].set_index("arm")
+        lines = [f"**Layer {L}, token t={t}** ({n} neurons, mean ± std)", "",
+                 "| Regime | " + " | ".join(METHODS[m][0] for m in methods) + " |",
+                 "|---|" + "---|" * len(methods)]
+        for a in table_order(cell["arm"].unique()):
+            f = (joint["frac_outside_median"].get(a, np.nan)
+                 if "frac_outside_median" in joint else np.nan)
+            lines.append(f"| {table_row_label(a, f)} | "
+                         + " | ".join(fmt(by.get((m, a))) for m in methods) + " |")
+        blocks.append("\n".join(lines))
+    note = ("Gaussian N×: the neuron is replaced by v ~ N(μ, (Nσ)²) of its natural "
+            "activations; corr(prediction, v). Local ±Dσ: each example's own value plus "
+            "δ ~ N(0, (Dσ)²); corr(change in prediction, δ) within example. Joint-loss "
+            "training replaced the neuron with values uniform over 10× its natural range.")
+    md = "\n\n".join(blocks) + "\n\n" + note + "\n"
+    (out_dir / "injection_regimes_tables.md").write_text(md)
+    return md
+
+
 def plot(summary: pd.DataFrame, out_dir: Path):
     layers, ts = sorted(summary["layer"].unique()), sorted(summary["t"].unique())
     arms = arm_order(summary["arm"].unique())
@@ -191,8 +241,7 @@ def main():
     df.to_csv(args.out_dir / "injection_regimes_runs.csv", index=False)
     summary = summarize(df)
     summary.to_csv(args.out_dir / "injection_regimes_summary.csv", index=False)
-    print(summary.pivot_table(index=["layer", "t", "arm"], columns="method",
-                              values="mean").round(3).to_string())
+    print(write_markdown(summary, args.out_dir))
     plot(summary, args.out_dir)
     print(f"[plot] wrote {args.out_dir}")
 

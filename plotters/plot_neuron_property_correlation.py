@@ -33,7 +33,8 @@ CIs       Fisher z, 95%.
 Outputs (outputs/plots/sft_vs_joint/neuron_property_correlation/)
   neuron_property_correlation.csv        long table: feature x model x eval x scope
   neuron_property_correlation_data.csv   one row per neuron
-  neuron_property_correlation.md         rebuttal-ready markdown tables
+  neuron_property_correlation.md         the short rebuttal table (variance, firing rate,
+                                         layer), then the full pooled / within-layer tables
   neuron_property_correlation.png        r with 95% CI, pooled and within-layer
 
 Usage
@@ -164,12 +165,11 @@ def correlations(neu):
 # ======================================================================
 def markdown(stats, neu):
     def cell(s):
-        star = "*" if s.p < 0.05 else ""
-        return f"{s.r:+.2f}{star}"
+        return f"**{s.r:+.2f}**" if s.p < 0.05 else f"{s.r:+.2f}"
 
     out = [f"Pearson r between base-model neuron properties and introspection performance "
            f"(n = {len(neu)} randomly drawn neurons, 5 per layer x 8 layers, each averaged "
-           f"over 8 token positions; * p < 0.05).", ""]
+           f"over 8 token positions; **bold** = p < 0.05, two-sided t-test on r).", ""]
     for scope, title in (("pooled", "Pooled across layers"),
                          ("within", "Within layer (layer means removed)")):
         out += [f"**{title}**", "",
@@ -184,6 +184,36 @@ def markdown(stats, neu):
                 cell(s.loc[(f, m, e)]) for m in MODELS for e in EVALS) + " |")
         out.append("")
     return "\n".join(out)
+
+
+COMPACT_ROWS = [   # (feature, scope, row label) of the short rebuttal table
+    ("log_std", "pooled", "Variance (log std), pooled"),
+    ("log_std", "within", "Variance (log std), within layer"),
+    ("frac_positive", "pooled", "Firing rate, pooled"),
+    ("frac_positive", "within", "Firing rate, within layer"),
+    ("layer", "pooled", "Layer (reference), pooled"),
+]
+COMPACT_COLS = [("SFT", "endogenous", "SFT Endo."), ("SFT", "gaussian", "SFT Interv."),
+                ("Joint", "endogenous", "Ours Endo."), ("Joint", "gaussian", "Ours Interv."),
+                ("Gain", "gaussian", "Gain Interv.")]
+
+
+def compact_markdown(stats, neu):
+    """The short table for the rebuttal text: variance and firing rate only, both scopes,
+    layer as the reference row. Typographic minus, bold = p < 0.05."""
+    s = stats.set_index(["feature", "scope", "model", "eval"])
+
+    def cell(row):
+        v = f"{row.r:+.2f}".replace("-", "−")
+        return f"**{v}**" if row.p < 0.05 else v
+
+    out = [f"Significant values in bold (p < 0.05, n = {len(neu)} neurons):", "",
+           "| Property | " + " | ".join(c[2] for c in COMPACT_COLS) + " |",
+           "|---|" + "---|" * len(COMPACT_COLS)]
+    for f, scope, lab in COMPACT_ROWS:
+        out.append(f"| {lab} | " + " | ".join(cell(s.loc[(f, scope, m, e)])
+                                             for m, e, _ in COMPACT_COLS) + " |")
+    return "\n".join(out) + "\n"
 
 
 def plot(stats, out_png):
@@ -242,7 +272,8 @@ def main():
     stats = correlations(neu)
     neu.to_csv(args.out_dir / "neuron_property_correlation_data.csv", index=False)
     stats.to_csv(args.out_dir / "neuron_property_correlation.csv", index=False)
-    md = markdown(stats, neu)
+    md = ("## Rebuttal table\n\n" + compact_markdown(stats, neu)
+          + "\n## Full tables\n\n" + markdown(stats, neu))
     (args.out_dir / "neuron_property_correlation.md").write_text(md)
     plot(stats, args.out_dir / "neuron_property_correlation.png")
     print(md)
