@@ -13,8 +13,16 @@ mean over its layer- and size-matched random controls. Bars mark the median over
   Natural | Injection    corr(prediction, a) under x1 injection: the report following
                          the natural value although the site carries v (context bypass)
 
-Also writes head_set_ablation_runs.csv (every row of every run) and
-head_set_ablation_summary.csv (median and IQR over runs per cell x condition x control).
+Also writes head_set_ablation_runs.csv (every row of every run),
+head_set_ablation_summary.csv (median and IQR over runs per cell x condition x control) and
+head_set_ablation_tables.md: per head set definition, one pooled table (mean +/- std over
+runs, random control in parentheses) and one per-cell table, for text-only replies.
+
+The tables end with an SFT reference row: the matching SFT runs (--sft-group, same
+neurons and positions, gate off), unablated, read from their own eval CSVs on the full
+test split. Their endogenous and interventional prediction files cover the same rows in
+the same order, so corr(injected-run prediction, natural activation) needs no GPU. SFT
+bypasses the site, so this row shows what the natural-value column looks like when it does.
 
 Usage
 -----
@@ -61,6 +69,8 @@ def parse_args():
                    help="Glob over run directory names within the group.")
     p.add_argument("--out-dir", type=Path, default=None,
                    help="Default: outputs/plots/<group>/head_set_ablation/")
+    p.add_argument("--sft-group", default="mlp_endo_sweep_layer_token",
+                   help="Group of the matching SFT runs for the reference row ('' to omit).")
     return p.parse_args()
 
 
@@ -155,20 +165,177 @@ def plot_head_def(df: pd.DataFrame, head_def: str, out: Path):
     print(f"[plot] wrote {out}")
 
 
+# ======================================================================
+# Markdown tables (text-only replies)
+# ======================================================================
+TABLE_LABEL = {"none": "None",
+               "endo_only": "Endogenous-only heads (E∖I)",
+               "interv_only": "Interventional-only heads (I∖E)",
+               "joint": "Shared heads (E∩I)",
+               "keep_endo": "All but endogenous heads (keep E)",
+               "keep_interv": "All but interventional heads (keep I)"}
+TABLE_COLS = ["Endogenous r(pred, a)", "Interventional r(pred, v)",
+              "Under injection r(pred, a)"]
+SFT_LABEL = "SFT, no ablation (reference)"
+
+
+def _corr(x, y) -> float:
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    return float(np.corrcoef(x, y)[0, 1]) if x.std() > 0 and y.std() > 0 else np.nan
+
+
+def sft_reference(df: pd.DataFrame, runs_root: Path, sft_group: str) -> pd.DataFrame:
+    """The matching SFT run of every locale in `df`, unablated, from its eval CSVs."""
+    rows, missing = [], []
+    locs = df[["signal", "position", "cell"]].drop_duplicates()
+    for _, r in locs.iterrows():
+        pairs = [(d / "endogenous_test_predictions_endogenous.csv",
+                  d / "interventional_test_predictions_gaussian.csv")
+                 for d in sorted((runs_root / sft_group).glob(
+                     f"endo_{r['signal']}_POS{r['position']}_gateoff_*"))]
+        pairs = [p for p in pairs if p[0].exists() and p[1].exists()]
+        if not pairs:
+            missing.append(f"{r['signal']} POS{r['position']}")
+            continue
+        e, i = pd.read_csv(pairs[0][0]), pd.read_csv(pairs[0][1])
+        if len(e) != len(i):
+            raise SystemExit(f"{pairs[0][0].parent.name}: {len(e)} endogenous vs {len(i)} "
+                             f"interventional rows; the files are not row-aligned")
+        rows.append({"cell": r["cell"], "signal": r["signal"], "run": pairs[0][0].parent.name,
+                     "corr_endogenous": _corr(e["predictions"], e["activation"]),
+                     "corr_interv": _corr(i["predictions"], i["injected"]),
+                     "corr_natural_under_injection": _corr(i["predictions"], e["activation"])})
+    if missing:
+        print(f"[table] no SFT eval CSVs under {runs_root / sft_group} for {len(missing)} "
+              f"locale(s), e.g. {missing[:3]}")
+    return pd.DataFrame(rows)
+
+
+def _pm(v: pd.Series) -> str:
+    v = v.dropna()
+    if not len(v):
+        return "–"
+    return f"{v.mean():.2f} ± {(v.std() if len(v) > 1 else 0.0):.2f}"
+
+
+def _definition(head_def: str) -> str:
+    if head_def.startswith("mass"):
+        return (f"the fewest heads holding {100 * float(head_def[4:]):g}% of the summed "
+                f"single-head knockout drop")
+    return f"the {head_def[3:]} heads with the largest single-head knockout drop"
+
+
+def pooled_table(df: pd.DataFrame, head_def: str, sft: pd.DataFrame, meta: dict) -> str:
+    r = per_run(df, head_def)
+    n_runs = r["run"].nunique()
+    lines = ["| Heads ablated | # ablated | " + " | ".join(TABLE_COLS) + " |",
+             "|---|---:|---:|---:|---:|"]
+    empties = []
+    for cond in CONDITIONS:
+        real = r[(r["condition"] == cond) & (r["control"] == "real")]
+        rand = r[(r["condition"] == cond) & (r["control"] == "random")]
+        n_empty = int((real["empty"] > 0).sum())
+        if n_empty:
+            empties.append(f"{TABLE_LABEL[cond].split(' (')[-1].rstrip(')')} in "
+                           f"{n_empty}/{n_runs}")
+        live = real[real["empty"] == 0]
+        cells = []
+        for c, _ in READOUTS:
+            s = _pm(live[c])
+            if cond != "none" and rand[c].notna().any():
+                s += f" ({rand[c].mean():.2f})"
+            cells.append(s)
+        n_abl = int(live["n_ablated"].median()) if len(live) else 0
+        dagger = " †" if n_empty else ""    # outside the f-string: py<3.12 rejects \ there
+        lines.append(f"| {TABLE_LABEL[cond]}{dagger} | {n_abl} | " + " | ".join(cells) + " |")
+    if len(sft):
+        lines.append(f"| {SFT_LABEL} | – | "
+                     + " | ".join(_pm(sft[c]) for c, _ in READOUTS) + " |")
+    layers = sorted(r["signal_layer"].unique())
+    ts = sorted(r["t"].unique())
+    notes = [
+        f"Mean ± std over {n_runs} joint-loss models (KL = 0.1; layers "
+        f"{', '.join(map(str, layers))} × token positions {', '.join(map(str, ts))}; "
+        f"one model per neuron), on the {meta.get('n_eval_rows', '~2.8K')} held-out C4 test "
+        f"rows not used to rank heads. E / I: {_definition(head_def)} for the endogenous / "
+        f"interventional correlation (Sec. 6.2); heads are mean-ablated from the signal token "
+        f"onward. a: natural activation; v: injected value (Gaussian at the neuron's own "
+        f"mean and std, as in the interventional eval). The last column correlates the "
+        f"prediction under injection with the a that the injection replaced. In "
+        f"parentheses: the same number of heads per layer chosen at random (mean over "
+        f"{meta.get('n_random', 5)} draws)."]
+    if empties:
+        notes.append(f"† Empty set in some models ({'; '.join(empties)}); those models "
+                     f"are left out of that row.")
+    if len(sft):
+        notes.append(f"SFT row: the same {len(sft)} locales trained with SFT only, no "
+                     f"ablation, on the full test split.")
+    return "\n".join(lines) + "\n\n" + "\n\n".join(notes)
+
+
+def per_cell_table(df: pd.DataFrame, head_def: str, sft: pd.DataFrame) -> str:
+    r = per_run(df, head_def)
+    real = r[r["control"] == "real"]
+    cells = (real[["signal_layer", "t", "cell"]].drop_duplicates()
+             .sort_values(["signal_layer", "t"])["cell"].tolist())
+
+    def trio(g):
+        m = [g[c].mean() for c, _ in READOUTS]
+        return " / ".join("–" if np.isnan(x) else f"{x:.2f}" for x in m)
+
+    lines = ["| Heads ablated | " + " | ".join(cells) + " |",
+             "|---|" + "---:|" * len(cells)]
+    for cond in CONDITIONS:
+        g = real[(real["condition"] == cond) & (real["empty"] == 0)]
+        lines.append(f"| {TABLE_LABEL[cond]} | "
+                     + " | ".join(trio(g[g["cell"] == c]) for c in cells) + " |")
+    if len(sft):
+        lines.append(f"| {SFT_LABEL} | "
+                     + " | ".join(trio(sft[sft["cell"] == c]) for c in cells) + " |")
+    return ("\n".join(lines) + "\n\nEach entry: endogenous r(pred, a) / interventional "
+            "r(pred, v) / under-injection r(pred, a), mean over the neurons of that locale.")
+
+
+def write_tables(df: pd.DataFrame, sft: pd.DataFrame, meta: dict, out: Path):
+    parts = []
+    for hd in sorted(set(df["head_def"]) - {"none"}):
+        parts += [f"## Head sets: {hd}", pooled_table(df, hd, sft, meta),
+                  "### By locale", per_cell_table(df, hd, sft)]
+    text = "\n\n".join(parts) + "\n"
+    out.write_text(text)
+    print(text)
+    print(f"[table] wrote {out}")
+
+
+def run_meta(group_dir: Path, run_glob: str) -> dict:
+    """Held-out row count and random draws, as the runs recorded them."""
+    import json
+    metas = [json.loads(p.read_text()) for p in
+             sorted(group_dir.glob(f"{run_glob}/head_set_ablation/head_set_ablation_meta.json"))]
+    if not metas:
+        return {}
+    rows = sorted({m["n_eval_rows"] for m in metas})
+    return {"n_eval_rows": f"{rows[0]:,}" if len(rows) == 1 else f"{rows[0]:,}–{rows[-1]:,}",
+            "n_random": max(m["n_random"] for m in metas)}
+
+
 def main():
     args = parse_args()
-    df = load(args.runs_root / args.group, args.run_glob)
+    group_dir = args.runs_root / args.group
+    df = load(group_dir, args.run_glob)
     out_dir = args.out_dir or ROOT / "outputs" / "plots" / args.group / "head_set_ablation"
     out_dir.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_dir / "head_set_ablation_runs.csv", index=False)
     summary = summarize(df)
     summary.to_csv(out_dir / "head_set_ablation_summary.csv", index=False)
-    real = summary[summary["control"] == "real"]
-    show = ["head_def", "cell", "condition", "n_runs", "n_empty", "n_ablated_median"] + \
-        [f"{c}_median" for c, _ in READOUTS]
-    print(real[show].round(3).to_string(index=False))
     for hd in sorted(set(df["head_def"]) - {"none"}):
         plot_head_def(df, hd, out_dir / f"head_set_ablation_{hd}.png")
+    sft = (sft_reference(df, args.runs_root, args.sft_group) if args.sft_group
+           else pd.DataFrame())
+    if len(sft):
+        sft.to_csv(out_dir / "head_set_ablation_sft_reference.csv", index=False)
+    write_tables(df, sft, run_meta(group_dir, args.run_glob),
+                 out_dir / "head_set_ablation_tables.md")
 
 
 if __name__ == "__main__":
