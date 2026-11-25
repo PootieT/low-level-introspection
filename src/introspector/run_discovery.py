@@ -406,7 +406,10 @@ def pretty_run_name(name: str, seq_len: int = 32) -> str:
         k = kl.group(1) if kl else None
         arm = f"Joint Loss (KL={'None' if k in (None, 'none', 'inf') else k})"
     elif name.startswith(("endo", "sft")) or w_val == 1.0:       # endogenous loss only
-        arm = "SFT" + (f" (Gate-{gate.group(1).capitalize()})" if gate else "")
+        k = kl.group(1) if kl else None
+        tags = ([f"Gate-{gate.group(1).capitalize()}"] if gate else []) + \
+               ([f"KL={k}"] if k not in (None, "none", "inf") else [])
+        arm = "SFT" + (f" ({', '.join(tags)})" if tags else "")
     elif name.startswith("prompt"):
         arm = "Prompt Baseline"
     else:

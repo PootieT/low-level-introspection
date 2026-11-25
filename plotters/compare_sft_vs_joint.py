@@ -483,6 +483,9 @@ def pretty_arm(label: str) -> str:
             kl = m["kl"] if m else "?"
         return f"Joint Loss (KL={kl})"
     if label.startswith("sft"):
+        m = KL_RE.search(label)
+        if m and m["kl"] != "none":
+            return f"SFT (KL={m['kl']})"
         gate = "on" if "gateon" in label else "off" if "gateoff" in label else "?"
         return f"SFT (Gate-{gate})"
     return label
@@ -708,7 +711,14 @@ if __name__ == "__main__":
     ap.add_argument("--replot-ladders", action="store_true",
                     help="only redraw ood_ladder.png / ood_ladder_vertical.png from the "
                          "ood_ladder_*.csv already in the output dir (no run dirs needed)")
+    ap.add_argument("--include-sft-kl", action="store_true",
+                    help="add the SFT + KL=0.1 arm (mlp_sft_kl_grid_layer_token, rebuttal "
+                         "baseline). Only once its grid is COMPLETE: the OOD ladder keeps the "
+                         "runs common to every arm, so a partial arm shrinks every bar")
     a = ap.parse_args()
+    if a.include_sft_kl:
+        ARMS["sft_kl0.1"] = dict(group="mlp_sft_kl_grid_layer_token",
+                                 filters=dict(gate="off", w=1.0, kl="0.1"))
     if a.model_suffix:
         for spec in ARMS.values():
             spec["group"] = spec["group"] + a.model_suffix
