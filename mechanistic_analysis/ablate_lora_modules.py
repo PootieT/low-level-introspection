@@ -13,7 +13,14 @@ Reading each cell as Delta = corr(ablated) - corr(baseline):
   * Delta_endogenous     >> 0  -> the module was SUPPRESSING context that helps
     endogenous prediction (a "blocker").
 
-Baseline (nothing ablated) and all-LoRA-off rows are included as references.
+Baseline (nothing ablated) and all-LoRA-off rows are included as references. Each pass
+also records corr(prediction under injection, natural activation): the report following
+the value the injection replaced (a context path around the site).
+
+GRANULARITY. `module` (default) zeroes one (layer, module) at a time; `block` zeroes a
+layer's whole attention LoRA (q,k,v,o) or whole MLP LoRA (gate,up,down) at once -- the
+units Fig. 7's norm profile is drawn in, and the causal counterpart of "the update norm
+is largest at the signal layer's MLP and the next layer's attention"; `both` does both.
 WHICH INJECTION REGIME THE DELTA IS MEASURED IN matters more than it looks. This
 used to score the interventional arm at gaussian scale=1 always. For a run trained
 with a 10x injection that is the wrong operating point: its own scale sweep puts the
@@ -31,6 +38,11 @@ Example
 python mechanistic_analysis/ablate_lora_modules.py \
     --config experiment_configs/.../<run>.json \
     --n-examples 512 --layers 7,8,9,10,11,12
+# rebuttal: whole test split, x1 gaussian, modules and blocks, 4 cells of the joint grid
+python mechanistic_analysis/ablate_lora_modules.py --group mlp_joint_grid_layer_token \
+    --run-glob 'joint_*_kl0.1_*' --cells 2:-1,2:-28,8:-1,8:-28 --no-success-filter \
+    --n-examples 100000 --interv-distribution gaussian --interv-scale 1 \
+    --granularity both --analysis-name lora_ablation_x1 --skip-existing
 """
 from __future__ import annotations
 
@@ -55,10 +67,13 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root
 from src.introspector.config import ExperimentConfig
 from src.introspector.analysis_loading import load_run_for_analysis, run_per_locale
-from src.introspector.run_discovery import add_discovery_args, runs_from_args, resolve_run_action
+from src.introspector.run_discovery import (
+    add_discovery_args, discover_runs, filter_cells, load_run, resolve_run_action, shard)
 from mechanistic_analysis.trace_introspection_circuit import endogenous_predictions, select_success_indices
 
 MODULE_ORDER = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+BLOCKS = {"attn": ("q_proj", "k_proj", "v_proj", "o_proj"),
+          "mlp": ("gate_proj", "up_proj", "down_proj")}
 LAYER_RE = re.compile(r"layers\.(\d+)\.")
 MODULE_RE = re.compile(r"\.((?:q|k|v|o|gate|up|down)_proj)$")
 
@@ -79,15 +94,25 @@ def parse_args():
                    help="Comma-separated layer indices to ablate (default: all).")
     p.add_argument("--modules", type=str, default=None,
                    help="Comma-separated module names to ablate (default: all present).")
-    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--batch-size", type=int, default=None,
+                   help="Eval batch size (default: the run's own eval_batch_size).")
     p.add_argument("--interv-distribution", type=str, default="auto",
                    help="Injection distribution for the interventional arm. 'auto' (default) "
                         "uses the one the run was TRAINED with -- see the module docstring "
                         "for why the old fixed gaussian@1 hid real effects.")
     p.add_argument("--interv-scale", type=float, default=None,
                    help="Injection scale for the interventional arm (default: the run's own).")
+    p.add_argument("--granularity", choices=("module", "block", "both"), default="module",
+                   help="Zero one (layer, module) at a time, a layer's whole attention / MLP "
+                        "LoRA at once, or both (see the module docstring).")
+    p.add_argument("--cells", type=str, default=None,
+                   help="Comma list of 'layer:position' cells kept after discovery, e.g. "
+                        "'2:-1,8:-28'. Default: every run --run-glob matches.")
+    p.add_argument("--analysis-name", type=str, default="lora_ablation",
+                   help="Output subfolder <run>/<name>/. Give non-default settings their own "
+                        "name, or --skip-existing will keep results computed under others.")
     p.add_argument("--output-dir", type=Path, default=None,
-                   help="Single-run override; a sweep always writes to <run>/lora_ablation/.")
+                   help="Single-run override; a sweep always writes to <run>/<analysis-name>/.")
     add_discovery_args(p)
     return p.parse_args()
 
@@ -124,7 +149,8 @@ def restore_lora(saved):
 @torch.no_grad()
 def predict_and_target(model, dataset, collator, batch_size, do_intervention):
     """
-    Regression-head prediction at the last token and its target, over the dataset.
+    Regression-head prediction at the last token, its target and the row's natural
+    (cached) activation, over the dataset.
     do_intervention=True: inject the signal (via the model's own forward hook,
     reproducible under the current distribution/scale/rng) -> target = injected
     value. do_intervention=False: no injection -> target = true activation.
@@ -133,7 +159,7 @@ def predict_and_target(model, dataset, collator, batch_size, do_intervention):
     """
     dl = DataLoader(dataset, batch_size=batch_size, collate_fn=collator, shuffle=False)
     head = model.regression_head
-    preds, targets = [], []
+    preds, targets, acts = [], [], []
     for batch in dl:
         batch = batch.to(model.device)
         activation = batch.pop("activation")
@@ -149,7 +175,8 @@ def predict_and_target(model, dataset, collator, batch_size, do_intervention):
         preds.append(pred.float().cpu())
         targets.append(out.intervention_values.float().cpu() if do_intervention
                        else activation.float().cpu())
-    return torch.cat(preds), torch.cat(targets)
+        acts.append(activation.float().cpu())
+    return torch.cat(preds), torch.cat(targets), torch.cat(acts)
 
 
 def _corr(pred, target):
@@ -170,31 +197,39 @@ def resolve_injection_regime(config, distribution="auto", scale=None):
     return distribution, float(scale)
 
 
-def eval_corrs(model, dataset, collator, config, distribution="gaussian", scale=1.0):
-    """(interventional corr at the given regime, endogenous corr) for current state."""
-    bs = config.training_config.eval_batch_size
+def eval_corrs(model, dataset, collator, config, distribution="gaussian", scale=1.0,
+               batch_size=None):
+    """(interventional corr at the given regime, endogenous corr, corr of the injected-run
+    prediction with the natural activation) for the current state."""
+    bs = batch_size or config.training_config.eval_batch_size
     # reproducibly seeded so every ablated variant sees the SAME injected values --
     # otherwise the delta would include the sampler's noise
     prev_dist, prev_scale = model.intervention_distribution, model.intervention_scale
     model.intervention_distribution, model.intervention_scale = distribution, scale
     model.seed_intervention_rng(config.seed)
-    p_iv, y_iv = predict_and_target(model, dataset, collator, bs, do_intervention=True)
+    p_iv, y_iv, a_iv = predict_and_target(model, dataset, collator, bs, do_intervention=True)
     model.intervention_distribution, model.intervention_scale = prev_dist, prev_scale
     # endogenous
-    p_en, y_en = predict_and_target(model, dataset, collator, bs, do_intervention=False)
-    return _corr(p_iv, y_iv), _corr(p_en, y_en)
+    p_en, y_en, _ = predict_and_target(model, dataset, collator, bs, do_intervention=False)
+    return _corr(p_iv, y_iv), _corr(p_en, y_en), _corr(p_iv, a_iv)
 
 
 def main():
     args = parse_args()
-    runs = runs_from_args(args)
+    if args.config:
+        runs = [load_run(args.config, output_root=args.output_root)]
+    else:
+        runs = discover_runs(group=args.group, run_glob=args.run_glob,
+                             config_root=args.config_root, output_root=args.output_root)
+        runs = shard(filter_cells(runs, args.cells, log="[ablate]"),
+                     args.task_index, args.n_tasks)
     if not runs:
         raise SystemExit("No runs with checkpoints matched.")
-    run_per_locale(args, runs, "lora_ablation", "lora_ablation.csv",
-                   analyze=lambda run, spec, out_dir: ablate_one_run(run, args, out_dir),
+    run_per_locale(args, runs, args.analysis_name, "lora_ablation.csv",
+                   analyze=lambda run, spec, out_dir: ablate_one_run(run, spec, args, out_dir),
                    replot=replot_ablation, log="[ablate]")
 
-def ablate_one_run(run, args, out_dir: Path):
+def ablate_one_run(run, spec, args, out_dir: Path):
     config, checkpoint = run.config, run.checkpoint
     model, test_dataset, collator = run.model, run.dataset, run.collator
     distribution, scale = resolve_injection_regime(
@@ -205,7 +240,8 @@ def ablate_one_run(run, args, out_dir: Path):
         dataset = test_dataset.select(range(min(args.n_examples, len(test_dataset))))
     else:
         # ---- select endogenous-success examples ----
-        preds, acts = endogenous_predictions(model, test_dataset, collator, args.batch_size)
+        preds, acts = endogenous_predictions(model, test_dataset, collator,
+                                             args.batch_size or config.training_config.eval_batch_size)
         idx = select_success_indices(preds, acts, args.success_threshold, args.n_examples, args.max_scan)
         if not idx:
             raise SystemExit("No success examples selected; loosen --success-threshold.")
@@ -223,51 +259,68 @@ def ablate_one_run(run, args, out_dir: Path):
     print(f"[ablate] layers={layer_filter} modules={module_filter} n={len(dataset)}")
 
     # ---- references ----
-    base_iv, base_en = eval_corrs(model, dataset, collator, config, distribution, scale)
-    print(f"[ablate] BASELINE          interv={base_iv:.4f}  endo={base_en:.4f}")
+    base_iv, base_en, base_na = eval_corrs(model, dataset, collator, config, distribution, scale, args.batch_size)
+    print(f"[ablate] BASELINE          interv={base_iv:.4f}  endo={base_en:.4f}  "
+          f"natural|inj={base_na:.4f}")
     saved = zero_lora(list(lora.values()))
-    off_iv, off_en = eval_corrs(model, dataset, collator, config, distribution, scale)
+    off_iv, off_en, off_na = eval_corrs(model, dataset, collator, config, distribution, scale, args.batch_size)
     restore_lora(saved)
-    print(f"[ablate] ALL-LoRA-OFF      interv={off_iv:.4f}  endo={off_en:.4f}")
+    print(f"[ablate] ALL-LoRA-OFF      interv={off_iv:.4f}  endo={off_en:.4f}  "
+          f"natural|inj={off_na:.4f}")
 
-    # ---- per-(layer, module) ablation ----
-    rows = [{"layer": "baseline", "module": "-", "interv": base_iv, "endo": base_en,
-             "d_interv": 0.0, "d_endo": 0.0},
-            {"layer": "all_off", "module": "-", "interv": off_iv, "endo": off_en,
-             "d_interv": off_iv - base_iv, "d_endo": off_en - base_en}]
+    def row(L, m, granularity, iv, en, na):
+        return {"layer": L, "module": m, "granularity": granularity, "interv": iv, "endo": en,
+                "natural_inj": na, "d_interv": iv - base_iv, "d_endo": en - base_en,
+                "d_natural_inj": na - base_na}
+
+    rows = [row("baseline", "-", "reference", base_iv, base_en, base_na),
+            row("all_off", "-", "reference", off_iv, off_en, off_na)]
+    # ---- ablation units: single (layer, module) and/or a layer's attention / MLP block ----
+    units = []
+    for L in layer_filter:
+        if args.granularity in ("module", "both"):
+            units += [(L, m, "module", [lora[(L, m)]]) for m in module_filter if (L, m) in lora]
+        if args.granularity in ("block", "both"):
+            for b, mods in BLOCKS.items():
+                members = [lora[(L, m)] for m in mods if (L, m) in lora]
+                if members:
+                    units.append((L, b, "block", members))
     d_iv_mat = np.full((len(layer_filter), len(module_filter)), np.nan)
     d_en_mat = np.full((len(layer_filter), len(module_filter)), np.nan)
-    for li, L in enumerate(layer_filter):
-        for mi, m in enumerate(module_filter):
-            mod = lora.get((L, m))
-            if mod is None:
-                continue
-            saved = zero_lora([mod])
-            iv, en = eval_corrs(model, dataset, collator, config, distribution, scale)
-            restore_lora(saved)
+    for L, m, granularity, mods in units:
+        saved = zero_lora(mods)
+        iv, en, na = eval_corrs(model, dataset, collator, config, distribution, scale, args.batch_size)
+        restore_lora(saved)
+        if granularity == "module":
+            li, mi = layer_filter.index(L), module_filter.index(m)
             d_iv_mat[li, mi] = iv - base_iv
             d_en_mat[li, mi] = en - base_en
-            rows.append({"layer": L, "module": m, "interv": iv, "endo": en,
-                         "d_interv": iv - base_iv, "d_endo": en - base_en})
-            print(f"[ablate] L{L:<2} {m:<9} interv={iv:.4f} (d={iv-base_iv:+.4f})  "
-                  f"endo={en:.4f} (d={en-base_en:+.4f})")
+        rows.append(row(L, m, granularity, iv, en, na))
+        print(f"[ablate] L{L:<2} {m:<9} interv={iv:.4f} (d={iv-base_iv:+.4f})  "
+              f"endo={en:.4f} (d={en-base_en:+.4f})  natural|inj={na:.4f}")
 
     abl_df = pd.DataFrame(rows)
     abl_df.insert(0, "run", config.experiment_name)
     abl_df.insert(1, "signal_layer", run.layer)
     abl_df.insert(2, "signal_index", run.index)
+    abl_df.insert(3, "position", getattr(spec, "position", None))
     abl_df.to_csv(out_dir / "lora_ablation.csv", index=False)
-    _plot_delta(d_iv_mat, layer_filter, module_filter, base_iv,
-                "Δ interventional corr when module ablated", out_dir / "ablation_delta_interventional.png")
-    _plot_delta(d_en_mat, layer_filter, module_filter, base_en,
-                "Δ endogenous corr when module ablated", out_dir / "ablation_delta_endogenous.png")
+    if args.granularity != "block":          # the heatmaps are per (layer, module)
+        _plot_delta(d_iv_mat, layer_filter, module_filter, base_iv,
+                    "Δ interventional corr when module ablated",
+                    out_dir / "ablation_delta_interventional.png")
+        _plot_delta(d_en_mat, layer_filter, module_filter, base_en,
+                    "Δ endogenous corr when module ablated",
+                    out_dir / "ablation_delta_endogenous.png")
     with open(out_dir / "ablation_meta.json", "w") as f:
         json.dump({"run": config.experiment_name, "checkpoint": str(checkpoint),
                    "signal": f"N{run.layer}.{run.index}",
                    "interv_distribution": distribution, "interv_scale": scale,
                    "baseline_interv": base_iv,
                    "baseline_endo": base_en, "all_off_interv": off_iv,
-                   "all_off_endo": off_en, "n_examples": len(dataset)}, f, indent=2)
+                   "all_off_endo": off_en, "n_examples": len(dataset),
+                   "success_filter": not args.no_success_filter,
+                   "granularity": args.granularity}, f, indent=2)
     print(f"[ablate] wrote results to {out_dir}")
 
 
@@ -292,6 +345,10 @@ def replot_ablation(spec, out_dir: Path, args) -> bool:
         return False
     df = pd.read_csv(csv)
     per = df[~df["layer"].astype(str).isin(["baseline", "all_off"])].copy()
+    if "granularity" in per:
+        per = per[per["granularity"] == "module"].copy()
+    if per.empty:                            # block-only run: no per-module heatmap
+        return True
     per["layer"] = per["layer"].astype(int)
     layers = sorted(per["layer"].unique())
     modules = [m for m in MODULE_ORDER if m in set(per["module"])]

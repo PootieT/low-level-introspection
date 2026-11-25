@@ -250,3 +250,44 @@ def test_seed_variance_separates_seed_from_neuron_spread(tmp_path):
     assert np.isclose(s["delta_mean"], 0.6)
     assert np.isclose(s["delta_seed_sd"], 0.01) and np.isclose(s["delta_neuron_sd"], 0.2 / np.sqrt(2))
     assert s["delta_positive"] == 6 and np.isclose(s["sft_seed_sd"], 0.0)
+
+
+def test_gating_tests_respect_run_and_base_head_structure(tmp_path):
+    """plotters/plot_knockout_head_gating.py: the Fig. 44 comparisons. A base head that
+    recurs across runs must count once per bootstrap draw, each run is compared to itself,
+    and the markdown table carries every comparison."""
+    from plotters.plot_knockout_head_gating import (
+        COMPARISONS, head_bootstrap, stats, tables, tests_markdown, within_run_wilcoxon)
+
+    rng = np.random.default_rng(0)
+    rows = []
+    for r in range(40):
+        # interventional-only heads are drawn from a pool of base heads that mostly gate,
+        # endogenous-only from one that mostly does not; "other" heads gate rarely
+        for cat, pool, p_gate in (("top interventional only", range(0, 6), 0.8),
+                                  ("top endogenous only", range(6, 12), 0.3),
+                                  ("top both", range(12, 15), 0.7),
+                                  ("other", range(15, 60), 0.1)):
+            n = 1 if cat != "other" else 10
+            for h in rng.choice(list(pool), n, replace=False):
+                g = rng.random() < p_gate
+                rows.append({"run": f"run{r}", "layer": 9, "head": int(h), "category": cat,
+                             "shape_tau0.3": "2-way" if g else "not gating"})
+    df = pd.DataFrame(rows)
+
+    gate = (df["shape_tau0.3"] != "not gating").astype(int)
+    io, eo = df["category"] == "top interventional only", df["category"] == "top endogenous only"
+    hb = head_bootstrap(df, gate, io, eo, n_boot=2000, seed=0)
+    assert hb["n_heads"] == 12                     # 6 + 6 distinct base heads, not 80 rows
+    assert hb["ci95"][0] > 0 and hb["diff"] > 0.3
+    wr = within_run_wilcoxon(df, gate, io, eo)
+    assert wr["n_runs"] == 40 and wr["n_up"] + wr["n_down"] + wr["n_tied"] == 40
+    assert wr["n_up"] > wr["n_down"] and wr["p"] < 0.05
+
+    t2, _ = tables(df, 0.3)
+    s = stats(df, t2, 0.3, n_boot=500, with_mixed=False)
+    assert {k for k, *_ in COMPARISONS} <= set(s)
+    assert s["interv_only_vs_endo_only"]["mixed_model"] is None
+    md = tests_markdown(s, 0.3, 2, "x10", 40)
+    assert md.count("\n| ") == 1 + len(COMPARISONS)      # header + one row per comparison
+    assert "Base-head bootstrap" in md and "40 models" in md

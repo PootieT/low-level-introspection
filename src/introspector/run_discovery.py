@@ -377,6 +377,30 @@ def plan_locales(spec: RunSpec, base_dir: Path, sentinel: str, args, replot=None
     return todo
 
 
+def parse_cells(spec: Optional[str]) -> Optional[set[tuple[int, int]]]:
+    """'2:-1,8:-28' -> {(2, -1), (8, -28)}: (signal layer, token position) cells, positions
+    as in the run names (-1 = the last of 32 tokens). None/'' -> None (no filter)."""
+    if not spec:
+        return None
+    out = set()
+    for tok in (t.strip() for t in spec.split(",")):
+        if tok:
+            L, pos = tok.split(":")
+            out.add((int(L), int(pos)))
+    return out
+
+
+def filter_cells(runs: list[RunSpec], spec: Optional[str], log: str = "[runs]") -> list[RunSpec]:
+    """Keep the runs whose (layer, position) is one of `spec`'s cells. Apply BEFORE
+    sharding, so an array splits only the runs it will analyze."""
+    cells = parse_cells(spec)
+    if cells is None:
+        return runs
+    kept = [r for r in runs if (r.layer, r.position) in cells]
+    print(f"{log} {len(kept)} run(s) in cells {sorted(cells)}")
+    return kept
+
+
 def runs_from_args(args, require_checkpoint: bool = True) -> list[RunSpec]:
     """Resolve --config / --group into the list of runs this invocation handles."""
     if args.config:

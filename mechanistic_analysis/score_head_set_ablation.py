@@ -75,7 +75,8 @@ from src.introspector.head_ablation import (
     WINDOWS, Arm, HeadAblator, build_mean_cache, eval_arm_with_activation, safe_corr,
     successful_train_examples)
 from src.introspector.knockout_stats import mass_set
-from src.introspector.run_discovery import add_discovery_args, discover_runs, load_run, shard
+from src.introspector.run_discovery import (
+    add_discovery_args, discover_runs, filter_cells, load_run, parse_cells, shard)  # noqa: F401
 
 ANALYSIS = "head_set_ablation"
 SENTINEL = "head_set_ablation_meta.json"
@@ -121,17 +122,6 @@ def parse_args():
 # ======================================================================
 # Head sets (pure; unit-tested)
 # ======================================================================
-def parse_cells(spec: str | None) -> set[tuple[int, int]] | None:
-    if not spec:
-        return None
-    out = set()
-    for tok in (t.strip() for t in spec.split(",")):
-        if tok:
-            L, pos = tok.split(":")
-            out.add((int(L), int(pos)))
-    return out
-
-
 def head_label(L: int, h: int) -> str:
     return f"L{L}H{h}"
 
@@ -370,10 +360,7 @@ def select_runs(args):
         return [load_run(args.config, output_root=args.output_root)]
     runs = discover_runs(group=args.group, run_glob=args.run_glob,
                          config_root=args.config_root, output_root=args.output_root)
-    cells = parse_cells(args.cells)
-    if cells is not None:
-        runs = [r for r in runs if (r.layer, r.position) in cells]
-        print(f"[set-ablation] {len(runs)} run(s) in cells {sorted(cells)}")
+    runs = filter_cells(runs, args.cells, log="[set-ablation]")
     return shard(runs, args.task_index, args.n_tasks)
 
 

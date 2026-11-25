@@ -147,3 +147,78 @@ def test_random_controls_match_per_layer_counts():
         assert count(r) == count(E - I)
         kept = set(range(18)) - random_control("keep_endo", set(range(18)) - E, E, I, layers, rng)
         assert count(kept) == count(E)
+
+
+def test_write_channel_ablator_partitions_the_write():
+    """At the window only: removing the native and the added write sums to removing the
+    whole write, other positions are untouched, and base_write reproduces the base model's
+    write of the neuron (base u, base W_down column)."""
+    from types import SimpleNamespace
+    from peft import LoraConfig, get_peft_model
+    from mechanistic_analysis.score_write_channel_ablation import WriteChannelAblator
+    from mechanistic_analysis.trace_introspection_circuit import effective_weight
+
+    torch.manual_seed(0)
+    d, f, j = 8, 12, 3
+
+    class MLP(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = torch.nn.Linear(d, f, bias=False)
+            self.up_proj = torch.nn.Linear(d, f, bias=False)
+            self.down_proj = torch.nn.Linear(f, d, bias=False)
+
+        def forward(self, x):
+            return self.down_proj(torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = MLP()
+
+    class Body(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([Layer()])
+
+    class Root(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Body()
+
+    root = Root()
+    get_peft_model(root, LoraConfig(r=2, lora_alpha=4, target_modules=["up_proj", "down_proj"],
+                                    init_lora_weights=False))
+    mlp = root.model.layers[0].mlp
+    ab = WriteChannelAblator(SimpleNamespace(base=root), layer=0, index=j)
+    x = torch.randn(2, 5, d)
+    window = torch.zeros(2, 5, dtype=torch.bool)
+    window[0, 2] = window[1, 4] = True
+
+    def run(cond):
+        ab.set_condition(cond)
+        ab.window = window
+        try:
+            with torch.no_grad():
+                return mlp(x)
+        finally:
+            ab.set_condition("none")
+            ab.window = None
+
+    full, nat, add, rem, bw = (run(c) for c in ("none", "remove_native_write",
+                                                "remove_added_write", "remove_write",
+                                                "base_write"))
+    torch.testing.assert_close(nat + add - full, rem, atol=1e-5, rtol=1e-5)
+    assert torch.equal(nat[~window], full[~window]) and torch.equal(bw[~window], full[~window])
+    assert not torch.allclose(nat[window], full[window])
+    with torch.no_grad():
+        a = torch.nn.functional.silu(mlp.gate_proj(x))[..., j]
+        u_eff, u_base = mlp.up_proj(x)[..., j], x @ mlp.up_proj.base_layer.weight[j]
+        w_eff = effective_weight(mlp.down_proj)[:, j]
+        w_base = mlp.down_proj.base_layer.weight[:, j]
+        expected = full - (a * u_eff)[..., None] * w_eff + (a * u_base)[..., None] * w_base
+    torch.testing.assert_close(bw[window], expected[window], atol=1e-5, rtol=1e-5)
+    with torch.no_grad():                         # outside a batch the hooks do nothing
+        ab.set_condition("remove_write")
+        assert torch.equal(mlp(x), full)
+    ab.remove_hooks()
