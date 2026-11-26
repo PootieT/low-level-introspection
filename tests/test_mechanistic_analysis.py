@@ -222,3 +222,78 @@ def test_write_channel_ablator_partitions_the_write():
         ab.set_condition("remove_write")
         assert torch.equal(mlp(x), full)
     ab.remove_hooks()
+
+
+def test_attention_lora_position_ablator_splices_lora_off_output():
+    """mechanistic_analysis/score_attention_lora_positions.py: the token groups partition
+    the real tokens, the hook swaps in the LoRA-off attention output exactly at the
+    group, "all" equals zeroing the layer's attention LoRA, and the u/h/a recorders read
+    the same neuron at the same token (h = a * u)."""
+    from types import SimpleNamespace
+    from peft import LoraConfig, get_peft_model
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from mechanistic_analysis.score_attention_lora_positions import (
+        GROUPS, AttentionLoRAPositionAblator, group_mask)
+
+    torch.manual_seed(0)
+    cfg = LlamaConfig(vocab_size=32, hidden_size=16, intermediate_size=24,
+                      num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=2,
+                      max_position_embeddings=16)
+    base = LlamaForCausalLM(cfg).eval()
+    get_peft_model(base, LoraConfig(r=2, lora_alpha=4, init_lora_weights=False,
+                                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                                    "up_proj", "down_proj"]))
+    # row 0 is left-padded once; text, then one prompt token, then the readout
+    am = torch.tensor([[0, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]])
+    buckets = torch.tensor([[-1, 0, 0, 0, 1, 2], [0, 0, 0, 0, 1, 2]])
+    t_mask = torch.zeros(2, 6, dtype=torch.bool)
+    t_mask[0, 2] = t_mask[1, 3] = True
+    real = buckets >= 0
+    parts = torch.stack([group_mask(g, buckets, t_mask) for g in GROUPS]).long().sum(0)
+    assert torch.equal(parts.bool(), real) and int(parts.max()) == 1
+    assert torch.equal(group_mask("all_but_t", buckets, t_mask), real & ~t_mask)
+    assert not group_mask("none", buckets, t_mask).any()
+    assert not group_mask("text_after_t", buckets, t_mask)[1].any()    # t is the last text token
+
+    ids = torch.randint(0, 32, (2, 6))
+    attn = base.model.layers[0].self_attn
+    ab = AttentionLoRAPositionAblator(SimpleNamespace(base=base), attn_layer=0,
+                                      signal_layer=1, index=3)
+    seen = {}
+    cap = attn.register_forward_hook(lambda m, a, out: seen.__setitem__("attn", out[0].clone()))
+
+    def run(cond, lora_off=False):
+        ab.condition, ab.buckets, ab.window = cond, buckets, t_mask
+        saved = [lin.weight.data.clone() for lin in ab.lora_B]
+        if lora_off:
+            for lin in ab.lora_B:
+                lin.weight.data.zero_()
+        try:
+            with torch.no_grad():
+                logits = base(input_ids=ids, attention_mask=am, use_cache=False).logits
+        finally:
+            for lin, w in zip(ab.lora_B, saved):
+                lin.weight.data = w
+            ab.condition, ab.buckets, ab.window = "none", None, None
+        return seen["attn"], logits
+
+    try:
+        on_attn, on_logits = run("none")
+        off_attn, off_logits = run("none", lora_off=True)
+        assert not torch.allclose(on_attn[real], off_attn[real])          # the LoRA matters
+        for cond in ("t", "prompt", "text_before_t", "all_but_t"):
+            mixed, _ = run(cond)
+            m = group_mask(cond, buckets, t_mask)
+            torch.testing.assert_close(mixed[m], off_attn[m])
+            torch.testing.assert_close(mixed[~m], on_attn[~m])
+        _, all_logits = run("all")
+        torch.testing.assert_close(all_logits[real], off_logits[real])
+        torch.testing.assert_close(run("none")[1], on_logits)              # hooks restore LoRA
+        ab.reset_records()
+        run("none")
+        rec = ab.records()
+        assert len(rec["u"]) == 2
+        np.testing.assert_allclose(rec["h"], rec["a"] * rec["u"], rtol=1e-5, atol=1e-6)
+    finally:
+        cap.remove()
+        ab.remove_hooks()
